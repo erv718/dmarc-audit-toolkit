@@ -1,0 +1,16 @@
+// Genuine DMARC failures, deduplicated by Message-ID.
+// A message counts as failing only when NO copy of it passed.
+// Without this dedupe, relay and forwarding legs inflate the number - often by 2x or more.
+EmailEvents
+| where Timestamp > ago(7d)
+| where EmailDirection == "Inbound"
+| where SenderFromDomain =~ "example.com"
+| extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC)
+| summarize anypass = max(iff(dmarc =~ "pass", 1, 0)),
+            anyfail = max(iff(dmarc =~ "fail", 1, 0)),
+            env     = min(SenderMailFromDomain),
+            addr    = min(SenderFromAddress)
+  by InternetMessageId
+| where anyfail > 0 and anypass == 0
+| summarize genuine_failures = count() by env, addr
+| order by genuine_failures desc

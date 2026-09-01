@@ -1,0 +1,18 @@
+// Every envelope domain sending as your domain, with pass/fail split.
+// Use this to build the sender inventory - the list of services you must fix
+// before enforcement. Anything with a high fail count and real volume is a
+// business system nobody told you about.
+EmailEvents
+| where Timestamp > ago(30d)
+| where EmailDirection == "Inbound"
+| where SenderFromDomain =~ "example.com"
+| extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC)
+| summarize anypass = max(iff(dmarc =~ "pass", 1, 0)),
+            anyfail = max(iff(dmarc =~ "fail", 1, 0)),
+            env     = min(SenderMailFromDomain)
+  by InternetMessageId
+| summarize total = count(),
+            passing = countif(anypass == 1),
+            genuine_failures = countif(anyfail > 0 and anypass == 0)
+  by env
+| order by total desc

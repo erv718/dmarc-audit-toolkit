@@ -1,0 +1,16 @@
+// Mail that FAILED DMARC and was delivered anyway.
+// These are your local overrides - allow rules, exception lists, trusted
+// forwarders. They mask failures that external receivers will not forgive,
+// which is why a domain can look healthy internally and still be junked by
+// Gmail. Check OrgLevelAction to see whether an org-level allow was applied.
+EmailEvents
+| where Timestamp > ago(30d)
+| where EmailDirection == "Inbound"
+| extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC)
+| where dmarc =~ "fail"
+| where DeliveryAction == "Delivered"
+| summarize msgs = dcount(InternetMessageId),
+            recipients = dcount(RecipientEmailAddress),
+            org_action = any(tostring(OrgLevelAction))
+  by SenderFromDomain
+| order by msgs desc

@@ -1,0 +1,17 @@
+// Subdomain health. Subdomains inherit sp= from the parent, so they are easy
+// to forget - and attackers find them. A subdomain at a 100% failure rate is
+// usually not a broken sender; it is inbound spoofing of a domain nobody
+// protected.
+EmailEvents
+| where Timestamp > ago(30d)
+| where EmailDirection == "Inbound"
+| where SenderFromDomain endswith ".example.com"
+| extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC)
+| summarize anypass = max(iff(dmarc =~ "pass", 1, 0)),
+            anyfail = max(iff(dmarc =~ "fail", 1, 0)),
+            fromdom = min(SenderFromDomain)
+  by InternetMessageId
+| summarize total = count(),
+            genuine_failures = countif(anyfail > 0 and anypass == 0)
+  by fromdom
+| order by genuine_failures desc, total desc

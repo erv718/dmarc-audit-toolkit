@@ -1,0 +1,17 @@
+# credentials
+.env
+*.env
+!.env.example
+
+# tenant and customer data
+*.csv
+!samples/*.csv
+exports/
+audit-output/
+*.jsonl
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
