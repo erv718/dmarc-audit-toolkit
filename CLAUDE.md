@@ -11,8 +11,10 @@ because skipping it produced a wrong conclusion at least once.
    configuration, or vendor settings without the human explicitly approving
    the specific change. Draft the change, show it, wait.
 2. **Never handle credentials in chat.** Secrets live in `.env` (gitignored).
-   If a tool needs a credential that is missing, name the variable and stop.
-   Never echo, log, or commit a secret.
+   Pull tenant data with `src/run_hunting.py`, which reads them itself; never
+   hand-build an auth flow or paste a token into the conversation. If a
+   credential is missing, name the variable and stop. Never echo, log, or
+   commit a secret.
 3. **Redact before anything leaves the machine.** Company domains, employee
    names, IPs, account numbers and ticket IDs stay out of anything published,
    pasted externally, or committed to a public repo. Grep before you push.

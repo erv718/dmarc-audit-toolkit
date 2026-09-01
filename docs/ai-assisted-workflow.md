@@ -51,6 +51,8 @@ dashboard numbers.
 
 Point your agent at this repo and tell it to read `CLAUDE.md` first (Claude
 Code and compatible agents load it automatically). Fill in the placeholders.
-Keep `.env` out of the repo. Give the agent read access to your mail-log
-exports and query console output, and keep write access to DNS and tenant
-config behind your own hands.
+Set up the read-only app registration (`docs/app-registration.md`) and put
+its credentials in `.env`, kept out of the repo: the agent then pulls fresh
+query results through `src/run_hunting.py` without the secret ever entering
+the conversation. Keep write access to DNS and tenant config behind your own
+hands.

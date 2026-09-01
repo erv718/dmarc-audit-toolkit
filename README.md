@@ -65,6 +65,7 @@ counting rows would report 30 failures; the true count is 18.
 | `src/spf_lookups.py` | Recursively expands an SPF record and counts DNS-querying mechanisms against the RFC 7208 limit of ten. |
 | `src/dns_audit.py` | Multi-domain posture sweep: SPF strength and lookup budget, DMARC policy gaps, DKIM selector presence, MX. Finds the subdomain nobody remembered. |
 | `src/audit_rules.ps1` | Read-only Exchange Online transport-rule audit: allow rules without authentication conditions, forgeable header matches, audit-mode blocks, oversized exception lists, dead rules. |
+| `src/run_hunting.py` | Runs the saved KQL by API through a read-only App Registration and writes CSV. The intended data plane - no portal copy-paste. |
 | `queries/` | Advanced-hunting queries for Microsoft 365 Defender. Deduplicated failures, sender census, subdomain health, and what your local overrides are masking. |
 | `samples/` | Synthetic mail log containing clean passes, echo pairs, genuine spoofing, and relay-only delivery. |
 | `docs/` | Methodology and the reasoning behind each tool. |
@@ -88,8 +89,10 @@ This project used Valimail; dmarcian or a raw rua parser gives the same lens.
 Your tenant logs only cover mail that touches your tenant - aggregate reports
 are the only way to see the rest.
 
-**For the queries:** Microsoft 365 Defender or Sentinel with Advanced Hunting
-access.
+**For the queries:** an Entra ID App Registration with the read-only
+`ThreatHunting.Read.All` permission, run through `src/run_hunting.py` (setup:
+`docs/app-registration.md`). Pasting them into Defender Advanced Hunting by
+hand works too, but the app registration is the intended path.
 
 ## Safety
 
@@ -98,6 +101,11 @@ configuration. Credentials, if you use any, come from environment variables and
 are never written to disk by these tools. See `.env.example`.
 
 ## Using this with an AI agent
+
+The intended end state: the app registration is the data plane and the agent
+is the analysis layer. The agent pulls fresh results through
+`src/run_hunting.py`, the script reads credentials from `.env`, and the
+secret never appears in the conversation.
 
 The repo ships a `CLAUDE.md` with agent ground rules distilled from running
 this exact project agent-assisted, including the verification habits that
