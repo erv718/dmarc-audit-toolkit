@@ -7,6 +7,8 @@ Built while taking two domains from `p=none` to enforcement across roughly
 thirty sending services. Every tool here exists because something went wrong
 that a report did not show.
 
+The full story: [Your DMARC Failure Count Is Wrong](https://blog.soarsystems.cc/your-dmarc-failure-count-is-wrong/)
+
 ## Why
 
 Most DMARC guidance stops at "publish a record, read the reports, ratchet the
