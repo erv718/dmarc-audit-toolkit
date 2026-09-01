@@ -65,5 +65,7 @@ at every step, then DKIM-before-reject, always.
 Replace before use:
 
 - `YOUR_DOMAIN` - the apex domain under enforcement
-- `YOUR_TENANT_QUERY_TOOL` - where the KQL runs (Defender Advanced Hunting)
+- `YOUR_TENANT_QUERY_TOOL` - where the hunting queries run (Defender
+  Advanced Hunting for Microsoft 365, Gmail logs in BigQuery for Google
+  Workspace - see `docs/google-workspace.md`)
 - `YOUR_AGGREGATE_REPORTING` - Valimail, dmarcian, or raw rua parsing

@@ -4,7 +4,9 @@ The order these questions get asked in matters more than the tools.
 
 ## 1. Turn on reporting before changing anything
 
-Publish a DMARC record at `p=none` with a `rua` address. That is monitoring
+Publish a DMARC record at `p=none` with a `rua` address pointed at your
+aggregate reporting tool (Valimail, dmarcian, or your own rua parser - any of
+them work; this project used Valimail). That is monitoring
 only: it changes nothing about delivery and starts receivers reporting what
 they see. Without it you are guessing.
 

@@ -66,6 +66,7 @@ counting rows would report 30 failures; the true count is 18.
 | `src/dns_audit.py` | Multi-domain posture sweep: SPF strength and lookup budget, DMARC policy gaps, DKIM selector presence, MX. Finds the subdomain nobody remembered. |
 | `src/audit_rules.ps1` | Read-only Exchange Online transport-rule audit: allow rules without authentication conditions, forgeable header matches, audit-mode blocks, oversized exception lists, dead rules. |
 | `queries/` | Advanced-hunting queries for Microsoft 365 Defender. Deduplicated failures, sender census, subdomain health, and what your local overrides are masking. |
+| `queries/bigquery/` | The same four questions as SQL for Gmail logs in BigQuery (Google Workspace). |
 | `samples/` | Synthetic mail log containing clean passes, echo pairs, genuine spoofing, and relay-only delivery. |
 | `docs/` | Methodology and the reasoning behind each tool. |
 
@@ -83,8 +84,15 @@ which means RUA data alone cannot be deduplicated this way.
 
 **For `spf_lookups.py`:** a domain name. Nothing else.
 
+**For the outside view:** an aggregate reporting service on your `rua` address.
+This project used Valimail; dmarcian or a raw rua parser gives the same lens.
+Your tenant logs only cover mail that touches your tenant - aggregate reports
+are the only way to see the rest.
+
 **For the queries:** Microsoft 365 Defender or Sentinel with Advanced Hunting
-access.
+access, or a Google Workspace tenant with the BigQuery logs export enabled.
+The Exchange rule auditor has no Google API equivalent; the manual checklist
+is in `docs/google-workspace.md`.
 
 ## Safety
 
