@@ -66,6 +66,7 @@ counting rows would report 30 failures; the true count is 18.
 | `src/dns_audit.py` | Multi-domain posture sweep: SPF strength and lookup budget, DMARC policy gaps, DKIM selector presence, MX. Finds the subdomain nobody remembered. |
 | `src/audit_rules.ps1` | Read-only Exchange Online transport-rule audit: allow rules without authentication conditions, forgeable header matches, audit-mode blocks, oversized exception lists, dead rules. |
 | `src/run_hunting.py` | Runs the saved KQL by API through a read-only App Registration and writes CSV. The intended data plane - no portal copy-paste. |
+| `src/mcp_server.py` | Exposes the tools above to any MCP client (Claude Code, Claude Desktop, others). One registration command; nothing to deploy. |
 | `queries/` | Advanced-hunting queries for Microsoft 365 Defender. Deduplicated failures, sender census, subdomain health, and what your local overrides are masking. |
 | `samples/` | Synthetic mail log containing clean passes, echo pairs, genuine spoofing, and relay-only delivery. |
 | `docs/` | Methodology and the reasoning behind each tool. |
@@ -106,6 +107,22 @@ The intended end state: the app registration is the data plane and the agent
 is the analysis layer. The agent pulls fresh results through
 `src/run_hunting.py`, the script reads credentials from `.env`, and the
 secret never appears in the conversation.
+
+Two ways to wire that up. Claude Code needs nothing: it reads `CLAUDE.md`
+and runs the scripts directly. Clients without shell access (Claude
+Desktop, or any MCP client) use the bundled MCP server instead - you do
+not build or deploy anything, the client launches it on demand:
+
+```
+pip install -r requirements-mcp.txt
+claude mcp add dmarc-provenance -- python src/mcp_server.py
+```
+
+The server exposes `audit_dns`, `walk_spf`, `dedupe_maillog`, and
+`run_hunting_query`. The protocol surface is the permission boundary: no
+tool can write to DNS, mail rules, or tenant config. The only write any
+tool performs is the local CSV export you explicitly request via
+`out_csv`, and that path is confined to the repo folder.
 
 The repo ships a `CLAUDE.md` with agent ground rules distilled from running
 this exact project agent-assisted, including the verification habits that

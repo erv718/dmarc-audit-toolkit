@@ -50,7 +50,10 @@ dashboard numbers.
 ## Setup
 
 Point your agent at this repo and tell it to read `CLAUDE.md` first (Claude
-Code and compatible agents load it automatically). Fill in the placeholders.
+Code and compatible agents load it automatically). Agents without shell
+access connect through the bundled MCP server instead - see the README's
+AI-agent section; it is one registration command, not something each user
+builds. Fill in the placeholders.
 Set up the read-only app registration (`docs/app-registration.md`) and put
 its credentials in `.env`, kept out of the repo: the agent then pulls fresh
 query results through `src/run_hunting.py` without the secret ever entering
