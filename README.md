@@ -66,7 +66,6 @@ counting rows would report 30 failures; the true count is 18.
 | `src/dns_audit.py` | Multi-domain posture sweep: SPF strength and lookup budget, DMARC policy gaps, DKIM selector presence, MX. Finds the subdomain nobody remembered. |
 | `src/audit_rules.ps1` | Read-only Exchange Online transport-rule audit: allow rules without authentication conditions, forgeable header matches, audit-mode blocks, oversized exception lists, dead rules. |
 | `queries/` | Advanced-hunting queries for Microsoft 365 Defender. Deduplicated failures, sender census, subdomain health, and what your local overrides are masking. |
-| `queries/bigquery/` | The same four questions as SQL for Gmail logs in BigQuery (Google Workspace). |
 | `samples/` | Synthetic mail log containing clean passes, echo pairs, genuine spoofing, and relay-only delivery. |
 | `docs/` | Methodology and the reasoning behind each tool. |
 
@@ -90,9 +89,7 @@ Your tenant logs only cover mail that touches your tenant - aggregate reports
 are the only way to see the rest.
 
 **For the queries:** Microsoft 365 Defender or Sentinel with Advanced Hunting
-access, or a Google Workspace tenant with the BigQuery logs export enabled.
-The Exchange rule auditor has no Google API equivalent; the manual checklist
-is in `docs/google-workspace.md`.
+access.
 
 ## Safety
 
@@ -108,6 +105,18 @@ prevent the classic wrong conclusions: echo miscounts, resolver-path
 misdiagnosis, and deleting keys something still signs with. See
 `docs/ai-assisted-workflow.md` for the human and agent split that worked, and
 the failure modes to watch for.
+
+## Planned
+
+Everything in this repo was used on a real enforcement rollout before it was
+published. Support for other platforms ships the same way: written, then
+validated against a real tenant, then released.
+
+- **Google Workspace** - the method ports (Gmail logs in BigQuery carry a
+  Message-ID and per-row SPF/DKIM/DMARC verdicts, so deduplication works
+  identically), and `dedupe.py`, `spf_lookups.py`, and `dns_audit.py` are
+  already platform-neutral. SQL query equivalents and a rules checklist land
+  here once they have been proven against a live tenant.
 
 ## License
 
