@@ -63,6 +63,8 @@ counting rows would report 30 failures; the true count is 18.
 |---|---|
 | `src/dedupe.py` | Collapses mail-log rows into logical messages by Message-ID and classifies each one. Works on any CSV export; column names are configurable. |
 | `src/spf_lookups.py` | Recursively expands an SPF record and counts DNS-querying mechanisms against the RFC 7208 limit of ten. |
+| `src/dns_audit.py` | Multi-domain posture sweep: SPF strength and lookup budget, DMARC policy gaps, DKIM selector presence, MX. Finds the subdomain nobody remembered. |
+| `src/audit_rules.ps1` | Read-only Exchange Online transport-rule audit: allow rules without authentication conditions, forgeable header matches, audit-mode blocks, oversized exception lists, dead rules. |
 | `queries/` | Advanced-hunting queries for Microsoft 365 Defender. Deduplicated failures, sender census, subdomain health, and what your local overrides are masking. |
 | `samples/` | Synthetic mail log containing clean passes, echo pairs, genuine spoofing, and relay-only delivery. |
 | `docs/` | Methodology and the reasoning behind each tool. |
@@ -89,6 +91,15 @@ access.
 Everything here is read-only. Nothing modifies DNS, mail flow rules, or tenant
 configuration. Credentials, if you use any, come from environment variables and
 are never written to disk by these tools. See `.env.example`.
+
+## Using this with an AI agent
+
+The repo ships a `CLAUDE.md` with agent ground rules distilled from running
+this exact project agent-assisted, including the verification habits that
+prevent the classic wrong conclusions: echo miscounts, resolver-path
+misdiagnosis, and deleting keys something still signs with. See
+`docs/ai-assisted-workflow.md` for the human and agent split that worked, and
+the failure modes to watch for.
 
 ## License
 
