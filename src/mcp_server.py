@@ -10,7 +10,7 @@ transit the conversation.
 
 Register once and the client launches this file on demand:
 
-  claude mcp add dmarc-provenance -- python src/mcp_server.py
+  claude mcp add dmarc-audit-toolkit -- python src/mcp_server.py
 
 Requires: pip install -r requirements-mcp.txt
 """
@@ -40,9 +40,9 @@ except ImportError:
     sys.exit("the MCP SDK is not installed - run: pip install -r requirements-mcp.txt")
 
 server = MCPServer(
-    name="dmarc-provenance",
+    name="dmarc-audit-toolkit",
     instructions=(
-        "Read-only DMARC auditing tools. Follow the repo's CLAUDE.md: report "
+        "Read-only DMARC auditing tools. Follow the repo's AGENTS.md: report "
         "deduplicated numbers with the naive count alongside, never diagnose "
         "DNS from a single resolver path, and treat dashboard toggles as "
         "claims, not proof. No tool here can change DNS, mail rules, or "

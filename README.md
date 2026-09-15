@@ -1,4 +1,4 @@
-# provenance
+# dmarc-audit-toolkit
 
 Tools for auditing a DMARC rollout using real mail data instead of dashboard
 guesswork.
@@ -108,14 +108,16 @@ is the analysis layer. The agent pulls fresh results through
 `src/run_hunting.py`, the script reads credentials from `.env`, and the
 secret never appears in the conversation.
 
-Two ways to wire that up. Claude Code needs nothing: it reads `CLAUDE.md`
-and runs the scripts directly. Clients without shell access (Claude
-Desktop, or any MCP client) use the bundled MCP server instead - you do
-not build or deploy anything, the client launches it on demand:
+Two ways to wire that up. Claude Code needs nothing: it is pointed at
+`AGENTS.md` from `CLAUDE.md` and runs the scripts directly. Agents that read
+`AGENTS.md` natively (most coding agents) need even less. Clients without
+shell access (Claude Desktop, or any MCP client) use the bundled MCP server
+instead - you do not build or deploy anything, the client launches it on
+demand:
 
 ```
 pip install -r requirements-mcp.txt
-claude mcp add dmarc-provenance -- python src/mcp_server.py
+claude mcp add dmarc-audit-toolkit -- python src/mcp_server.py
 ```
 
 The server exposes `audit_dns`, `walk_spf`, `dedupe_maillog`, and
@@ -124,10 +126,11 @@ tool can write to DNS, mail rules, or tenant config. The only write any
 tool performs is the local CSV export you explicitly request via
 `out_csv`, and that path is confined to the repo folder.
 
-The repo ships a `CLAUDE.md` with agent ground rules distilled from running
+The repo ships an `AGENTS.md` with agent ground rules distilled from running
 this exact project agent-assisted, including the verification habits that
 prevent the classic wrong conclusions: echo miscounts, resolver-path
-misdiagnosis, and deleting keys something still signs with. See
+misdiagnosis, and deleting keys something still signs with. (`CLAUDE.md`
+points Claude Code at it.) See
 `docs/ai-assisted-workflow.md` for the human and agent split that worked, and
 the failure modes to watch for.
 

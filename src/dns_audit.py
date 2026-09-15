@@ -103,7 +103,7 @@ def audit_domain(domain, resolver):
 
     # Wildcard guard: if a random selector "resolves", every probe below is
     # meaningless and DKIM presence cannot be inferred from DNS at all.
-    canary = "zz-provenance-canary-zz"
+    canary = "zz-audit-canary-zz"
     wildcarded = bool(resolve(resolver, f"{canary}._domainkey.{domain}", "CNAME") or
                       resolve(resolver, f"{canary}._domainkey.{domain}", "TXT"))
     selectors = []
