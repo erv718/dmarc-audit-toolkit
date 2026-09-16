@@ -1,0 +1,9 @@
+# Copy this file to `.denylist` (gitignored) and replace the placeholders
+# with the terms that must never appear in a public commit: your company
+# name and aliases, product names, employee names, account numbers, ticket
+# prefixes. One term per line. Matching is case-insensitive substring.
+#
+#   cp .denylist.example .denylist
+#
+yourcompany.example
+contoso

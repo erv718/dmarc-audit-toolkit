@@ -8,7 +8,14 @@
 !samples/*.csv
 exports/
 audit-output/
+audit-out/
 *.jsonl
+
+# your domain-edited query copies (keep the shipped templates pristine)
+queries/live/
+
+# your private pre-push deny list (ship only the .example)
+.denylist
 
 # python
 __pycache__/

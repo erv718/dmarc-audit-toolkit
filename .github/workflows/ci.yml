@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Compile
+        run: python -m py_compile src/*.py
+      - name: Tests
+        run: python -m pytest tests/ -q
+      - name: Offline audit smoke test
+        run: python src/audit.py example.com --offline --rua samples/rua --maillog samples/sample_maillog.csv --headers samples/headers --out audit-out-ci
+      - name: PowerShell syntax
+        run: |
+          foreach ($f in Get-ChildItem src/*.ps1) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+            if ($errs) { Write-Error "$f : $($errs.Count) parse errors"; exit 1 }
+          }
+        shell: pwsh
+      - name: Public-repo gate
+        run: python scripts/check_public.py
