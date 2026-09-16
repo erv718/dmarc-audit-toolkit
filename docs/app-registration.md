@@ -9,7 +9,7 @@ to your tenant.
 ## Create the registration (about five minutes)
 
 1. Entra admin center > App registrations > **New registration**. Name it
-   something honest like `dmarc-provenance-readonly`. Single tenant. No
+   something honest like `dmarc-audit-toolkit-readonly`. Single tenant. No
    redirect URI - this is app-only, nothing signs in interactively.
 2. **API permissions** > Add a permission > Microsoft Graph >
    **Application permissions** > `ThreatHunting.Read.All`. Remove the
@@ -33,7 +33,7 @@ AZURE_CLIENT_SECRET=<the secret value, shown once at creation>
 else - it cannot read mailboxes, change transport rules, or touch DNS. That
 is the entire point: the blast radius of a leaked secret is "someone can
 read our mail-flow telemetry," not "someone can reconfigure mail flow."
-It matches ground rule 1 in `CLAUDE.md`: everything here is read-only.
+It matches ground rule 1 in `AGENTS.md`: everything here is read-only.
 
 ## Run a query
 
