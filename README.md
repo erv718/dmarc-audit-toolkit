@@ -33,7 +33,9 @@ notices until the record breaks.
 
 ## Quick start
 
-No credentials needed for either tool.
+The DNS and file tools need nothing installed but Python (they fall back to
+DNS-over-HTTPS when port 53 is in the way). Pulling tenant data by API needs
+the read-only app registration described below.
 
 ```bash
 pip install -r requirements.txt
@@ -43,57 +45,74 @@ python src/spf_lookups.py example.com
 
 # What is the real failure count in a mail log export?
 python src/dedupe.py samples/sample_maillog.csv --sender-domain example.com --auth-column DMARC
+
+# The whole sweep - DNS posture, rua reports, mail log, headers - ending in a gate verdict
+python src/audit.py example.com --offline --rua samples/rua --maillog samples/sample_maillog.csv --headers samples/headers
 ```
 
 The sample output shows the whole point:
 
 ```
-logical messages            : 76
+rows read                   : 93
+logical messages            : 81
   with more than one leg    : 12
-  GENUINE failures          : 18   <-- the real number
-  failing legs w/ a pass    : 12   <-- echoes, not failures
+  GENUINE failures          : 21   <-- the real number
+  messages with an echo leg : 12   <-- echoes, not failures
   delivered only via relay  : 6
 
-counting rows would report 30 failures; the true count is 18.
+4 findings, 2 major or blocking
+  [major] MAILFLOW-001 21 logical messages failed with no passing copy, from 6 senders
+  [major] MAILFLOW-002 3 messages failed authentication but reached a mailbox
 ```
+
+Counting rows would report 33 failures; the true count is 21.
 
 ## Contents
 
 | Path | What it does |
 |---|---|
-| `src/dedupe.py` | Collapses mail-log rows into logical messages by Message-ID and classifies each one. Works on any CSV export; column names are configurable. |
-| `src/spf_lookups.py` | Recursively expands an SPF record and counts DNS-querying mechanisms against the RFC 7208 limit of ten. |
-| `src/dns_audit.py` | Multi-domain posture sweep: SPF strength and lookup budget, DMARC policy gaps, DKIM selector presence, MX. Finds the subdomain nobody remembered. |
+| `src/audit.py` | The orchestrator: runs the whole sweep (DNS posture, rua reports, mail log, headers) and writes `report.md` + `report.json` with severity-ranked findings and a go / no-go gate verdict for the next policy step. Works `--offline` from saved files. |
+| `src/dedupe.py` | Collapses mail-log rows into logical messages by (Message-ID, recipient) and classifies each one. Reports failed-but-delivered and passed-but-blocked separately, and dies loudly on a misspelled column instead of returning a silent zero. |
+| `src/spf_lookups.py` | Recursively expands an SPF record and counts DNS-querying mechanisms against the RFC 7208 limit of ten. Falls back to DNS-over-HTTPS; reports lookup errors as errors, never as "no record". |
+| `src/dns_audit.py` | Multi-domain posture sweep: SPF strength and lookup budget, DMARC policy and subdomain inheritance, DKIM selectors (incl. dangling CNAMEs), MX. One findings list per domain with evidence. |
+| `src/rua_parse.py` | Turns rua aggregate XML (plain, .gz, or .zip) into answers: selectors still in use, unknown senders, failing streams, SPF-only senders who break at reject. |
+| `src/headers.py` | Parses one live message header and calls SPF/DKIM/DMARC alignment explicitly - the proof behind rule 9 (a toggle is not a working feature). |
 | `src/audit_rules.ps1` | Read-only Exchange Online transport-rule audit: allow rules without authentication conditions, forgeable header matches, audit-mode blocks, oversized exception lists, dead rules. |
+| `src/audit_bypasses.ps1` / `src/audit_groups.ps1` | Read-only companions: who can bypass filtering (connectors, safe lists) and which groups expand to external forwarding. |
 | `src/run_hunting.py` | Runs the saved KQL by API through a read-only App Registration and writes CSV. The intended data plane - no portal copy-paste. |
 | `src/mcp_server.py` | Exposes the tools above to any MCP client (Claude Code, Claude Desktop, others). One registration command; nothing to deploy. |
-| `queries/` | Advanced-hunting queries for Microsoft 365 Defender. Deduplicated failures, sender census, subdomain health, and what your local overrides are masking. |
-| `samples/` | Synthetic mail log containing clean passes, echo pairs, genuine spoofing, and relay-only delivery. |
+| `queries/` | Eight advanced-hunting queries for Microsoft 365 Defender: deduplicated census and failures, subdomain health, override audit, echo-vs-loss twins, pre-reject DKIM alignment, impersonation, and a raw per-leg export that pipes straight into `dedupe.py`. |
+| `samples/` | Synthetic mail log (clean passes, echo pairs, genuine spoofing, relay-only delivery), sample rua reports, and four annotated message headers. |
 | `docs/` | Methodology and the reasoning behind each tool. |
 
 ## What you need to supply
 
 **For `dedupe.py`:** a mail log export containing a **Message-ID**, a recipient,
-and a delivery action. An authentication verdict column is strongly preferred;
-without one the tool falls back to delivery outcome, which answers "was it
-blocked" rather than "did it fail authentication." Microsoft 365 Defender's
-"All email" export works with the default column names; other tools need the
-`--*-column` flags.
+and a delivery action. The easiest source is your own tenant:
+`queries/raw_maillog.kql` projects exactly the columns `dedupe.py` expects, so
+`src/run_hunting.py queries/raw_maillog.kql --out maillog.csv` followed by
+`src/dedupe.py maillog.csv --auth-column DMARC` needs no column flags. A
+Microsoft 365 Defender "All email" export works the same way; other tools need
+the `--*-column` flags. Misspell a column name and the tool exits with the
+list of columns it can see rather than reporting a silent zero.
 
 Message-ID is not optional. Most DMARC aggregate reports do not include it,
 which means RUA data alone cannot be deduplicated this way.
 
 **For `spf_lookups.py`:** a domain name. Nothing else.
 
-**For the outside view:** an aggregate reporting service on your `rua` address.
-This project used Valimail; dmarcian or a raw rua parser gives the same lens.
-Your tenant logs only cover mail that touches your tenant - aggregate reports
-are the only way to see the rest.
+**For the outside view:** the rua reports your DMARC record already asks
+receivers for. Download the XML (any reporter, plain or zipped) and point
+`src/rua_parse.py` at the files - no account or API key needed. Your tenant
+logs only cover mail that touches your tenant; aggregate reports are the only
+way to see the rest.
 
 **For the queries:** an Entra ID App Registration with the read-only
 `ThreatHunting.Read.All` permission, run through `src/run_hunting.py` (setup:
-`docs/app-registration.md`). Pasting them into Defender Advanced Hunting by
-hand works too, but the app registration is the intended path.
+`docs/app-registration.md`). Edit the `let sender_domain` line at the top of
+each `.kql` file to your domain (keep your edited copies in gitignored
+`queries/live/`). Pasting them into Defender Advanced Hunting by hand works
+too, but the app registration is the intended path.
 
 ## Safety
 
@@ -117,14 +136,18 @@ demand:
 
 ```
 pip install -r requirements-mcp.txt
-claude mcp add dmarc-audit-toolkit -- python src/mcp_server.py
+claude mcp add dmarc-audit-toolkit -- python "C:\path\to\dmarc-audit-toolkit\src\mcp_server.py"
 ```
 
-The server exposes `audit_dns`, `walk_spf`, `dedupe_maillog`, and
-`run_hunting_query`. The protocol surface is the permission boundary: no
-tool can write to DNS, mail rules, or tenant config. The only write any
-tool performs is the local CSV export you explicitly request via
-`out_csv`, and that path is confined to the repo folder.
+(The registration needs the absolute path to your clone; the server confines
+its file reads and CSV writes to that folder.)
+
+The server exposes `audit_dns`, `walk_spf`, `dedupe_maillog`,
+`run_hunting_query`, `parse_rua`, `parse_headers`, and `run_audit`. The
+protocol surface is the permission boundary: no tool can write to DNS, mail
+rules, or tenant config. The only writes any tool performs are the local CSV
+or report files you explicitly request, and those paths are confined to the
+repo folder.
 
 The repo ships an `AGENTS.md` with agent ground rules distilled from running
 this exact project agent-assisted, including the verification habits that

@@ -62,7 +62,7 @@ DOH_TYPES = {"A": 1, "CNAME": 5, "MX": 15, "TXT": 16, "AAAA": 28}
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocking": 3}
 P53_SKIP_AFTER = 2      # names that timed out on port 53 in a row before it is skipped
 P53_SKIP_SECONDS = 600  # how long port 53 stays skipped (long-lived MCP process)
-CANARY = "zz-provenance-canary-zz"
+CANARY = "zz-audit-canary-zz"
 
 # Process-wide resolver-path state: one-time notices, port-53 skip window.
 _net = {"doh_notice": False, "p53_timeouts": 0, "p53_skip_until": 0.0}
