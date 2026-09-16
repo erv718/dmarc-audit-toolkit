@@ -28,6 +28,7 @@ import dedupe as dedupe_mod
 import dns_audit
 import spf_lookups
 import run_hunting
+import audit as audit_mod
 
 try:
     import dns.resolver
@@ -291,6 +292,158 @@ def run_hunting_query(
                 reply["csv"] = str(opath)
             except OSError as err:
                 reply["csv_error"] = str(err)
+    return reply
+
+
+def _cap_list(items, key):
+    """A capped, clipped preview of a list of dicts, plus a truncation flag."""
+    rows = [_clip_row(i) if isinstance(i, dict) else i for i in items[:ROW_PREVIEW_CAP]]
+    return {key: rows, key + "_truncated": len(items) > ROW_PREVIEW_CAP,
+            key + "_total": len(items)}
+
+
+def _trim_message(m):
+    """The decision-relevant fields of one headers.analyze document; the full
+    document stays on disk via run_audit's report.json."""
+    spf = m.get("spf")
+    return _clip_row({
+        "file": m["file"], "from": m["from"], "from_domain": m["from_domain"],
+        "return_path_domain": m["return_path_domain"],
+        "ar_trusted": m["ar_trusted"], "ar_reason": m["ar_reason"],
+        "spf": ({"result": spf["result"], "domain": spf.get("domain"),
+                 "aligned_relaxed": spf.get("aligned_relaxed")} if spf else None),
+        "dkim_signatures": [{"d": s["d"], "s": s["s"], "ar_result": s["ar_result"],
+                             "aligned_relaxed": s["aligned_relaxed"]}
+                            for s in m["dkim_signatures"]],
+        "dmarc": m["dmarc"], "dmarc_would_pass_via": m["dmarc_would_pass_via"],
+        "first_external_ip": m["first_external_ip"],
+        "platform": (m.get("fingerprint") or {}).get("vendor"),
+        "findings": m["findings"],
+    })
+
+
+@server.tool()
+def parse_rua(
+    paths: list[str],
+    known: str | None = None,
+    min_volume: int = 20,
+    fail_threshold: float = 0.5,
+    since: str | None = None,
+    until: str | None = None,
+    expect_policy: str | None = None,
+) -> dict:
+    """Parse DMARC aggregate (rua) reports - .xml, .xml.gz, .zip, directories
+    recursed - into the receiver-side view: totals, failing streams, SPF-only
+    senders, unknown senders, policy seen by reporters. Counts are
+    receiver-reported and include forwarded copies; cross-check any failure
+    number against the tenant log with dedupe_maillog before reporting it.
+    known: comma-separated sender domains/IP prefixes you recognise.
+    Relative paths resolve from the repo root."""
+    if not paths:
+        return {"error": "no paths given"}
+    if expect_policy is not None and expect_policy not in ("none", "quarantine", "reject"):
+        return {"error": "expect_policy must be one of none, quarantine, reject"}
+    try:
+        doc = audit_mod.run_rua(paths, known=known, min_volume=min_volume,
+                                fail_threshold=fail_threshold, since=since,
+                                until=until, expect_policy=expect_policy)
+    except audit_mod.UsageError as err:
+        return {"error": str(err)}
+    reply = {
+        "totals": doc["totals"],
+        "policy_check": doc["policy_check"],
+        "selectors": doc["selectors"][:ROW_PREVIEW_CAP],
+        "findings": doc["findings"],
+        "warnings": doc["warnings"],
+        "summary": doc["summary"],
+        "exit_code": doc["exit_code"],
+        "note": ("receiver-reported counts include forwarded copies and cannot "
+                 "be deduplicated (no Message-ID); the likely_* labels are a "
+                 "heuristic, not a verdict. Redact domains and IPs before any "
+                 "of this is published or pasted externally."),
+    }
+    for key in ("failing_streams", "spf_only_senders", "unknown_senders",
+                "retiring_selectors", "by_header_from", "by_reporter"):
+        reply.update(_cap_list(doc[key], key))
+    return reply
+
+
+@server.tool()
+def parse_headers(
+    files: list[str],
+    authserv_id: str | None = None,
+    strict: bool = False,
+) -> dict:
+    """Analyse raw header blocks or .eml files (directories recursed for
+    .txt/.eml): the Authentication-Results worth trusting, every DKIM
+    signature's d=/s= and alignment, what DMARC would pass via, the Received
+    chain, and a sending-platform fingerprint. Pass authserv_id (the id your
+    receiving host writes, e.g. example.com or mail.protection.outlook.com) -
+    without it the topmost AR header is trusted unverified, and senders can
+    inject that header. Relative paths resolve from the repo root."""
+    if not files:
+        return {"error": "no files given"}
+    try:
+        doc = audit_mod.run_headers(files, authserv_id=authserv_id, strict=strict)
+    except audit_mod.UsageError as err:
+        return {"error": str(err)}
+    messages = doc["messages"]
+    return {
+        "messages": [_trim_message(m) for m in messages[:ROW_PREVIEW_CAP]],
+        "messages_truncated": len(messages) > ROW_PREVIEW_CAP,
+        "messages_total": len(messages),
+        "findings": doc["findings"],
+        "ar_note": doc["ar_note"],
+        "summary": {"messages": len(messages), "findings": len(doc["findings"]),
+                    "worst": audit_mod.worst_severity(doc["findings"])},
+    }
+
+
+@server.tool()
+def run_audit(
+    domains: list[str] | None = None,
+    rua: list[str] | None = None,
+    maillog: str | None = None,
+    header_files: list[str] | None = None,
+    out_dir: str = "audit-out",
+    offline: bool = False,
+    known: str | None = None,
+    sender_domain: str | None = None,
+    authserv_id: str | None = None,
+) -> dict:
+    """Run the full audit: DNS posture (live, unless offline), aggregate
+    reports, deduplicated mail log, and message headers, ending in a gate
+    verdict (go / no_go / insufficient_data) for the DMARC policy ratchet.
+    Writes report.md and report.json into out_dir, which must resolve inside
+    the repo folder - those two files are the only writes. The reply carries
+    the verdict, a capped findings preview, and the report paths."""
+    opath = Path(out_dir)
+    opath = (opath if opath.is_absolute() else ROOT / opath).resolve()
+    if not opath.is_relative_to(ROOT):
+        return {"error": "out_dir must stay inside the repo folder; "
+                         "got a path resolving outside it"}
+    try:
+        report = audit_mod.build_report(
+            domains=domains or (), rua_paths=rua or (), maillog=maillog,
+            header_files=header_files or (), offline=offline, known=known,
+            sender_domain=sender_domain, authserv_id=authserv_id)
+    except audit_mod.UsageError as err:
+        return {"error": str(err)}
+    reply = {
+        "gate": report["gate"],
+        "summary": report["summary"],
+        "offline": report["offline"],
+        "note": ("full detail is in the two report files on this machine; the "
+                 "preview below may contain tenant data now in the conversation "
+                 "- redact before publishing (CLAUDE.md rule 3)."),
+    }
+    reply.update(_cap_list(report["findings"], "findings"))
+    try:
+        jpath, mpath = audit_mod.write_reports(report, opath)
+        reply["report_json"] = str(jpath)
+        reply["report_md"] = str(mpath)
+    except OSError as err:
+        reply["write_error"] = str(err)
     return reply
 
 
