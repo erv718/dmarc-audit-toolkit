@@ -19,6 +19,13 @@ to your tenant.
 4. **Certificates & secrets** > New client secret. Set the shortest expiry
    your rotation habits can live with. For anything long-lived, prefer a
    certificate over a secret.
+
+That is the whole setup. No group memberships, no directory roles, no
+mailbox or site access: the one application permission above is all the
+data plane needs, and every step after it runs locally on your machine.
+(Granting the app broader access so it could configure things itself is
+possible and deliberately not recommended - read-only is the point.)
+
 5. Record three values into your local `.env` (gitignored, never committed):
 
 ```

@@ -127,6 +127,11 @@ is the analysis layer. The agent pulls fresh results through
 `src/run_hunting.py`, the script reads credentials from `.env`, and the
 secret never appears in the conversation.
 
+AI access is opt-in, off by default: nothing in this repo lets an AI client
+touch your data until `.env` contains `AI_ANALYSIS_ENABLED=true`. The MCP
+server refuses to start without it, and `AGENTS.md` instructs every agent
+to stop without it. Running the Python tools yourself needs no toggle.
+
 Two ways to wire that up. Claude Code needs nothing: it is pointed at
 `AGENTS.md` from `CLAUDE.md` and runs the scripts directly. Agents that read
 `AGENTS.md` natively (most coding agents) need even less. Clients without

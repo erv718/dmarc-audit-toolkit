@@ -75,6 +75,11 @@ into one question at a time.
 
 ## Analyzing pulled exports
 
+**Check the AI switch before anything else.** If `.env` does not contain
+`AI_ANALYSIS_ENABLED=true`, the human has not opted in to AI analysis: name
+the setting, stop, and let them flip it deliberately. Do not work around it,
+and do not set it yourself.
+
 The data plane is `src/run_hunting.py` (setup: `docs/app-registration.md`).
 First run for a tenant: prove the plumbing with the validation step in that
 doc before trusting any number the API returns.
