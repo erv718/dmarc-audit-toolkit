@@ -31,8 +31,8 @@ authenticated. That is invisible until you fingerprint.
 
 ## 3. Deduplicate before you believe any number
 
-Group by Message-ID. A message is a genuine failure only when **no copy of it
-passed**. See `src/dedupe.py`.
+Group by (Message-ID, recipient). A message is a genuine failure only when
+**no copy of it passed**. See `src/dedupe.py`.
 
 Skipping this step produces false emergencies. It is the single most common
 reason people conclude enforcement broke something when it did not.
@@ -111,3 +111,18 @@ But DMARC does nothing about lookalike domains or display-name impersonation.
 An attacker who registers a similar domain and puts your executive's name in
 the From header passes their own authentication perfectly. Pair enforcement
 with impersonation protection and out-of-band verification for payment changes.
+
+## The tool for each step
+
+| Step | Tool |
+|---|---|
+| 1. Reporting | any rua destination; `src/rua_parse.py` reads the XML directly |
+| 2. Sender inventory | `queries/sender_census.kql`; `src/rua_parse.py` unknown-sender report |
+| 3. Deduplication | `src/dedupe.py`; `queries/genuine_failures.kql`; `queries/raw_maillog.kql` feeds it from the API |
+| 4. Delivery vs authentication | `src/dedupe.py` two-way split; `queries/delivered_despite_failure.kql` names the override |
+| 5. Allow-rule audit | `src/audit_rules.ps1`, `src/audit_bypasses.ps1`, `src/audit_groups.ps1` |
+| 6. SPF budget | `src/spf_lookups.py`; `src/dns_audit.py` for every domain at once |
+| 7. Ratchet gates | `queries/genuine_failures.kql` at each step; `src/audit.py` gives the verdict |
+| 8. DKIM before reject | `queries/dkim_alignment.kql` for the fleet; `src/headers.py` for one live proof |
+| 9. Vendors without DKIM | the subdomain bounce-address pattern above; verify with `src/headers.py` |
+| 10. What DMARC misses | `queries/impersonation.kql` |

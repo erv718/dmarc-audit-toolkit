@@ -44,10 +44,23 @@ python src/run_hunting.py queries/genuine_failures.kql --timespan P7D --out fail
 
 The script exchanges the credentials for a token, POSTs the KQL to the
 Microsoft Graph `security/runHuntingQuery` endpoint, and writes the result
-as CSV. Edit `example.com` in the query files to your domain first; the
-script warns if you forget. Advanced hunting looks back at most 30 days,
-and the API enforces execution-time, result-size, and rate caps - narrow
-the time window or the projection if a query gets truncated or throttled.
+as CSV. Edit the `let sender_domain` line at the top of each query file to
+your domain first; the script warns if you forget. Advanced hunting looks
+back at most 30 days, and the API enforces execution-time, result-size, and
+rate caps - narrow the time window or the projection if a query gets
+truncated or throttled.
+
+The pipeline worth knowing: `queries/raw_maillog.kql` projects exactly the
+columns `src/dedupe.py` expects, so
+
+```
+python src/run_hunting.py queries/raw_maillog.kql --out maillog.csv
+python src/dedupe.py maillog.csv --auth-column DMARC
+```
+
+takes you from tenant data to a deduplicated failure count with no portal
+export and no column flags. One API call returns at most 100,000 rows; if a
+busy domain hits the cap, narrow the window and run twice.
 
 ## Validation
 
