@@ -126,6 +126,16 @@ def _read_env(path):
     return values
 
 
+def ai_analysis_enabled():
+    """The AI master switch (.env.example): an environment variable wins over
+    .env, and only the exact value "true" opts in. Everything else - missing,
+    blank, "yes", "1" - means off, because the default must be safe."""
+    val = os.environ.get("AI_ANALYSIS_ENABLED")
+    if val is None:
+        val = _read_env(ENV_PATH).get("AI_ANALYSIS_ENABLED", "")
+    return str(val).strip().lower() == "true"
+
+
 @server.tool()
 def audit_dns(domains: list[str], resolver: str = "8.8.8.8") -> dict:
     """Audit the DNS authentication posture of one or more domains: SPF
@@ -448,4 +458,8 @@ def run_audit(
 
 
 if __name__ == "__main__":
+    if not ai_analysis_enabled():
+        sys.exit("AI analysis is off: no tool here runs for an AI client until"
+                 " .env contains AI_ANALYSIS_ENABLED=true (see .env.example)."
+                 " That is a deliberate opt-in, not a bug.")
     server.run()
