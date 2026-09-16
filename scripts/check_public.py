@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DENYLIST = ROOT / ".denylist"
 SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules"}
 SKIP_SUFFIXES = {".gz", ".zip", ".pyc", ".png", ".jpg", ".pdf"}
-DASHES = {"—": "em dash", "–": "en dash"}
+DASHES = {"\u2014": "em dash", "\u2013": "en dash"}  # escapes, so this file passes its own scan
 BUILTIN_TERMS: list[str] = []  # built-ins stay empty on purpose; your terms go in .denylist
 
 
