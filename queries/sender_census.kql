@@ -2,17 +2,26 @@
 // Use this to build the sender inventory - the list of services you must fix
 // before enforcement. Anything with a high fail count and real volume is a
 // business system nobody told you about.
+// Deduplicated at the src/dedupe.py grain: (Message-ID, recipient). Inbound
+// and Intra-org legs both feed the dedupe so a passing original rescues its
+// relayed echo. Columns: total = logical messages, passing = at least one
+// copy passed, genuine_failures = no copy passed, no_verdict = neither pass
+// nor fail on any leg (typical for intra-org mail that was never evaluated).
+let sender_domain = "example.com";      // apex under enforcement
 EmailEvents
 | where Timestamp > ago(30d)
-| where EmailDirection == "Inbound"
-| where SenderFromDomain =~ "example.com"
+| where EmailDirection in ("Inbound", "Intra-org")
+| where SenderFromDomain =~ sender_domain
+| where isnotempty(InternetMessageId)
 | extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC)
+| extend rcpt = tolower(RecipientEmailAddress)
 | summarize anypass = max(iff(dmarc =~ "pass", 1, 0)),
             anyfail = max(iff(dmarc =~ "fail", 1, 0)),
             env     = min(SenderMailFromDomain)
-  by InternetMessageId
+  by InternetMessageId, rcpt
 | summarize total = count(),
             passing = countif(anypass == 1),
-            genuine_failures = countif(anyfail > 0 and anypass == 0)
+            genuine_failures = countif(anyfail > 0 and anypass == 0),
+            no_verdict = countif(anypass == 0 and anyfail == 0)
   by env
 | order by total desc

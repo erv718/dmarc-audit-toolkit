@@ -1,0 +1,30 @@
+Return-Path: <bounces+7654321-0e1f-alice=example.com@u7654321.wl180.sendgrid.net>
+Received: from mail.example.com (192.0.2.5) by mbx01.example.com (192.0.2.6) with
+ Microsoft SMTP Server (version=TLS1_2, cipher=TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384) id 15.20.9999.1;
+ Mon, 14 Sep 2026 10:15:33 +0000
+Authentication-Results: mail.example.com; spf=pass (sender IP is 198.51.100.24)
+ smtp.mailfrom=u7654321.wl180.sendgrid.net; dkim=pass (signature was verified)
+ header.d=example.com header.s=sg1 header.i=@example.com; dmarc=pass action=none
+ header.from=example.com; compauth=pass reason=100
+Received: from u7654321.wl180.sendgrid.net (u7654321.wl180.sendgrid.net [198.51.100.24])
+ by mail.example.com (Postfix) with ESMTPS id 4c8Rz1yB0Kz2xQ
+ for <alice@example.com>; Mon, 14 Sep 2026 10:15:32 +0000 (UTC)
+Received: by filterdrecv-5f9d7b6c4-x2kqp with SMTP id filterdrecv-5f9d7b6c4-x2kqp-1-68C6A2D3-1F
+ 2026-09-14 10:15:31.812077 +0000 UTC m=+1234.567
+Received: from MTUwNzQ2 (unknown) by geopod-ismtpd-12 (SG) with HTTP
+ id yA7xPqRsT2m0L5nVwZ3BcQ; Mon, 14 Sep 2026 10:15:31.582 +0000 (UTC)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com;
+ h=content-type:from:mime-version:subject:to:cc:content-type:from:subject:to;
+ s=sg1; t=1789380931; x=1789985731; bh=frcCV1k9oG9oKj3dpUqdJg1PxRT2RSN/XKdLCPjaYaY=;
+ b=Q0xFQU4gU0lHTkFUVVJFIFBMQUNFSE9MREVSIC0gTk9UIEEgUkVBTCBLRVkgLSBTQU1QTEUgT05MWSBmb3
+ IgZG1hcmMtcHJvdmVuYW5jZSBoZWFkZXJzLnB5IHNtb2tlIHRlc3RzLiBUaGlzIGlzIG5vdCBhIHZhbGlkIHNp
+ Z25hdHVyZSBhbmQgY2Fubm90IHZlcmlmeS4=
+X-SG-EID: =?us-ascii?Q?u001=2EQjTz8xL1c4pHbnL0F8vRkz9Yw2XmA7pLq3vBn0cTe6Rg1?=
+X-Entity-ID: sample-entity-01
+From: Example Notifications <notify@example.com>
+To: alice@example.com
+Subject: [TEST] SendGrid DKIM proof
+Message-ID: <yA7xPqRsT2m0L5nVwZ3BcQ@geopod-ismtpd-12>
+Date: Mon, 14 Sep 2026 10:15:31 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8

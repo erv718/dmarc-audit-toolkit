@@ -1,0 +1,80 @@
+// Display-name impersonation: external mail whose From display name is the
+// name of one of your own people. DMARC does nothing about this (rule 10) -
+// the attacker sends from a domain they control, passes their own
+// authentication perfectly, and puts your executive's name in the From
+// header. Enforcement stops spoofing of your domain; this finds what is left.
+// Matching is exact on the display name after lower-casing and trimming
+// whitespace. Mail from your own domains is excluded (including subdomains up
+// to two labels deep), so a vendor sending as a named employee from
+// example.com does not show up here; the queries next to this one cover that.
+// Common names produce legitimate matches from unrelated people - look first
+// at rows with a recent first_seen, few recipients and a domain nobody has
+// mailed with before.
+// Columns: display_name / from_address / from_domain = the external sender,
+// msgs = logical messages, recipients = distinct mailboxes targeted,
+// delivered = legs that reached a mailbox, inbox = legs that reached the
+// inbox itself, own_auth_pass = legs where the sender's OWN domain passed
+// DMARC (expect most of them - that is the point), first_seen / last_seen,
+// sample_subject = one subject line to eyeball.
+//
+// Variant A (live): internal names come from IdentityInfo.AccountDisplayName.
+// IdentityInfo needs a licence that populates it (Defender for Identity or
+// an equivalent); if the query is rejected on that table name, use variant B.
+let org_domains  = dynamic(["example.com", "example.net"]);   // every domain you own
+let window_start = ago(30d);                                  // 30d is the retention maximum
+let internal_names = IdentityInfo
+| where isnotempty(AccountDisplayName)
+| summarize by name_key = tolower(trim(@"\s+", AccountDisplayName));
+internal_names                                                // smaller table on the left, the Kusto rule for join
+| join kind=inner (
+    EmailEvents
+    | where Timestamp > window_start
+    | where EmailDirection == "Inbound"
+    | where isnotempty(SenderDisplayName)
+    | extend from_dom = tolower(SenderFromDomain)
+    | extend parent1 = substring(from_dom, indexof(from_dom, ".") + 1)
+    | extend parent2 = substring(parent1, indexof(parent1, ".") + 1)
+    | where not(from_dom in~ (org_domains) or parent1 in~ (org_domains) or parent2 in~ (org_domains))
+    | extend name_key = tolower(trim(@"\s+", SenderDisplayName))
+    | extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC)
+  ) on name_key
+| summarize msgs           = dcount(InternetMessageId),
+            recipients     = dcount(tolower(RecipientEmailAddress)),
+            delivered      = countif(DeliveryAction == "Delivered"),
+            inbox          = countif(DeliveryLocation == "Inbox/folder"),
+            own_auth_pass  = countif(dmarc =~ "pass"),
+            first_seen     = min(Timestamp),
+            last_seen      = max(Timestamp),
+            sample_subject = any(Subject)
+  by display_name = SenderDisplayName, from_address = SenderFromAddress, from_domain = from_dom
+| order by msgs desc, first_seen desc
+//
+// ---- Variant B: no IdentityInfo, you supply the names ---------------------
+// Fill internal_names with the display names to protect (executives, finance,
+// HR, anyone who approves payments). Copy the block into a fresh query and
+// remove the leading "// ".
+//
+// let org_domains    = dynamic(["example.com", "example.net"]);   // every domain you own
+// let window_start   = ago(30d);
+// let internal_names = dynamic(["Jane Example", "Sam Example"]);   // display names exactly as the GAL shows them
+// EmailEvents
+// | where Timestamp > window_start
+// | where EmailDirection == "Inbound"
+// | where isnotempty(SenderDisplayName)
+// | extend from_dom = tolower(SenderFromDomain)
+// | extend parent1 = substring(from_dom, indexof(from_dom, ".") + 1)
+// | extend parent2 = substring(parent1, indexof(parent1, ".") + 1)
+// | where not(from_dom in~ (org_domains) or parent1 in~ (org_domains) or parent2 in~ (org_domains))
+// | extend name_key = tolower(trim(@"\s+", SenderDisplayName))
+// | where name_key in~ (internal_names)
+// | extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC)
+// | summarize msgs           = dcount(InternetMessageId),
+//             recipients     = dcount(tolower(RecipientEmailAddress)),
+//             delivered      = countif(DeliveryAction == "Delivered"),
+//             inbox          = countif(DeliveryLocation == "Inbox/folder"),
+//             own_auth_pass  = countif(dmarc =~ "pass"),
+//             first_seen     = min(Timestamp),
+//             last_seen      = max(Timestamp),
+//             sample_subject = any(Subject)
+//   by display_name = SenderDisplayName, from_address = SenderFromAddress, from_domain = from_dom
+// | order by msgs desc, first_seen desc

@@ -1,0 +1,46 @@
+Return-Path: <newsletter@example.com>
+Received: from mail.example.com (192.0.2.5) by mbx01.example.com (192.0.2.6) with
+ Microsoft SMTP Server (version=TLS1_2, cipher=TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384) id 15.20.9999.1;
+ Mon, 14 Sep 2026 12:40:15 +0000
+Authentication-Results: mail.example.com; spf=fail (sender IP is 203.0.113.20)
+ smtp.mailfrom=example.com; dkim=fail (body hash did not verify) header.d=example.com
+ header.s=selector1 header.i=@example.com; dmarc=fail action=oreject header.from=example.com;
+ compauth=fail reason=000
+ARC-Seal: i=1; a=rsa-sha256; s=arcselector; d=partner.example; cv=none;
+ b=QVJDIFNFQUwgUExBQ0VIT0xERVIgLSBTQU1QTEUgT05MWSAtIE5PVCBBIFJFQUwgU0lHTkFUVVJFIGZvciBk
+ bWFyYy1wcm92ZW5hbmNlIHNhbXBsZXMu
+ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed; d=partner.example; s=arcselector;
+ h=from:to:subject:date:message-id:mime-version:content-type;
+ bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=;
+ b=QVJDIE1FU1NBR0UgU0lHTkFUVVJFIFBMQUNFSE9MREVSIC0gU0FNUExFIE9OTFkgLSBOT1QgQSBSRUFMIFNJ
+ R05BVFVSRS4=
+ARC-Authentication-Results: i=1; mx.partner.example; spf=pass (sender IP is 198.51.100.98)
+ smtp.mailfrom=example.com; dkim=pass header.d=example.com header.s=selector1;
+ dmarc=pass action=none header.from=example.com
+Received: from fwd.partner.example (fwd.partner.example [203.0.113.20])
+ by mail.example.com (Postfix) with ESMTPS id 4c8VmP5qW1z2zT
+ for <alice@example.com>; Mon, 14 Sep 2026 12:40:14 +0000 (UTC)
+X-Forwarded-To: alice@example.com
+X-Forwarded-For: bob@partner.example alice@example.com
+Authentication-Results: mx.partner.example; spf=pass (sender IP is 198.51.100.98)
+ smtp.mailfrom=example.com; dkim=pass header.d=example.com header.s=selector1;
+ dmarc=pass action=none header.from=example.com
+Received: from mx.partner.example (mx.partner.example [203.0.113.10])
+ by fwd.partner.example (Postfix) with ESMTP id 7f2a1c9e0b
+ for <bob@partner.example>; Mon, 14 Sep 2026 12:40:12 +0000 (UTC)
+Received: from ZZ1-NAM99-obe.outbound.protection.outlook.com (mail-zz1nam99on0001.outbound.protection.outlook.com [198.51.100.98])
+ by mx.partner.example (Postfix) with ESMTPS id 3e9d0b7a41
+ for <bob@partner.example>; Mon, 14 Sep 2026 12:40:11 +0000 (UTC)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=selector1;
+ h=From:Date:Subject:Message-ID:Content-Type:MIME-Version:X-MS-Exchange-SenderADCheck;
+ bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=;
+ b=TTM2NSBTSUdOQVRVUkUgUExBQ0VIT0xERVIgLSBTQU1QTEUgT05MWSAtIE5PVCBBIFJFQUwgU0lHTkFUVVJF
+ IGZvciBkbWFyYy1wcm92ZW5hbmNlIHNhbXBsZXMuIENhbm5vdCB2ZXJpZnku
+From: Example Newsletter <newsletter@example.com>
+To: Bob <bob@partner.example>
+Subject: [TEST] September update
+Message-ID: <ZZ1PR99MB0001ABCDEF0123456789@ZZ1PR99MB0001.namprd99.prod.outlook.com>
+Date: Mon, 14 Sep 2026 12:40:10 +0000
+X-MS-Exchange-CrossTenant-Id: 11111111-2222-3333-4444-555555555555
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8

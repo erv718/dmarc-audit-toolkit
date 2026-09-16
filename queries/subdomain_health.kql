@@ -2,16 +2,24 @@
 // to forget - and attackers find them. A subdomain at a 100% failure rate is
 // usually not a broken sender; it is inbound spoofing of a domain nobody
 // protected.
+// Deduplicated at the src/dedupe.py grain: (Message-ID, recipient), over
+// Inbound and Intra-org legs, so a passing original rescues its relayed echo.
+// Columns: fromdom = the From subdomain, total = logical messages,
+// genuine_failures = no copy passed, fail_pct = the share that is genuine.
+let sender_domain = "example.com";      // apex; every subdomain below it is included
 EmailEvents
 | where Timestamp > ago(30d)
-| where EmailDirection == "Inbound"
-| where SenderFromDomain endswith ".example.com"
+| where EmailDirection in ("Inbound", "Intra-org")
+| where SenderFromDomain endswith strcat(".", sender_domain)
+| where isnotempty(InternetMessageId)
 | extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC)
+| extend rcpt = tolower(RecipientEmailAddress)
 | summarize anypass = max(iff(dmarc =~ "pass", 1, 0)),
             anyfail = max(iff(dmarc =~ "fail", 1, 0)),
-            fromdom = min(SenderFromDomain)
-  by InternetMessageId
+            fromdom = min(tolower(SenderFromDomain))
+  by InternetMessageId, rcpt
 | summarize total = count(),
             genuine_failures = countif(anyfail > 0 and anypass == 0)
   by fromdom
+| extend fail_pct = round(100.0 * genuine_failures / total, 1)
 | order by genuine_failures desc, total desc

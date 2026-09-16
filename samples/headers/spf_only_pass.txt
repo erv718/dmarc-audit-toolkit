@@ -1,0 +1,27 @@
+Return-Path: <0102019a1b2c3d4e-5f6a7b8c-9d0e-1f2a-3b4c-5d6e7f8a9b0c-000000@bounce.example.com>
+Received: from mail.example.com (192.0.2.5) by mbx01.example.com (192.0.2.6) with
+ Microsoft SMTP Server (version=TLS1_2, cipher=TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384) id 15.20.9999.1;
+ Mon, 14 Sep 2026 11:02:10 +0000
+Authentication-Results: mail.example.com; spf=pass (sender IP is 198.51.100.31)
+ smtp.mailfrom=bounce.example.com; dkim=pass (signature was verified)
+ header.d=amazonses.com header.s=224i4yxa5dv7c2xz3womw6peuasteono header.i=@amazonses.com;
+ dmarc=pass action=none header.from=example.com; compauth=pass reason=100
+Received: from a8-31.smtp-out.amazonses.com (a8-31.smtp-out.amazonses.com [198.51.100.31])
+ by mail.example.com (Postfix) with ESMTPS id 4c8T0q3mV7z2yR
+ for <alice@example.com>; Mon, 14 Sep 2026 11:02:09 +0000 (UTC)
+DKIM-Signature: v=1; a=rsa-sha256; q=dns/txt; c=relaxed/simple;
+ s=224i4yxa5dv7c2xz3womw6peuasteono; d=amazonses.com; t=1789383729;
+ h=From:Reply-To:To:Subject:MIME-Version:Content-Type:Message-ID:Date:Feedback-ID;
+ bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=;
+ b=U0FNUExFIFNJR05BVFVSRSAtIE5PVCBBIFJFQUwgS0VZIC0gcGxhY2Vob2xkZXIgYnl0ZXMgZm9yIHRoZSBk
+ bWFyYy1wcm92ZW5hbmNlIGhlYWRlcnMucHkgc2FtcGxlcy4gQ2Fubm90IHZlcmlmeS4=
+X-SES-Outgoing: 2026.09.14-198.51.100.31
+Feedback-ID: ::1.us-east-1.U0FNUExFRkVFREJBQ0tJRFBMQUNFSE9MREVSMDAwMDAw=:AmazonSES
+From: Example Billing <billing@example.com>
+Reply-To: Example Support <support@esp.example>
+To: alice@example.com
+Subject: [TEST] SES SPF-only proof
+Message-ID: <0102019a1b2c3d4e-5f6a7b8c-9d0e-1f2a-3b4c-5d6e7f8a9b0c-000000@email.amazonses.com>
+Date: Mon, 14 Sep 2026 11:02:09 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8

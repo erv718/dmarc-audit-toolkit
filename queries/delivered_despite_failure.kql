@@ -1,16 +1,47 @@
-// Mail that FAILED DMARC and was delivered anyway.
-// These are your local overrides - allow rules, exception lists, trusted
-// forwarders. They mask failures that external receivers will not forgive,
-// which is why a domain can look healthy internally and still be junked by
-// Gmail. Check OrgLevelAction to see whether an org-level allow was applied.
+// Mail that FAILED DMARC (no copy passed) and was delivered anyway, and WHAT
+// let it through. These are your local overrides - allow rules, exception
+// lists, trusted forwarders, Microsoft's implicit authentication. They mask
+// failures that external receivers will not forgive, which is why a domain
+// can look healthy internally and still be junked by Gmail.
+// Deduplicated at the src/dedupe.py grain: (Message-ID, recipient), over
+// Inbound and Intra-org legs. A message is counted only when NO copy passed
+// and at least one copy was Delivered. The override columns come from the
+// delivered leg:
+//   org_action  = OrgLevelAction   - what an org-level policy or rule did
+//   org_policy  = OrgLevelPolicy   - which policy or transport rule that was
+//   user_action = UserLevelAction  - a user safe-sender or mailbox rule
+//   compauth    = composite authentication verdict on that leg; "pass" or
+//                 "softpass" with DMARC fail means implicit authentication
+//                 carried it, "none" means the override alone did
+// Empty override columns with delivered > 0 mean the platform delivered a
+// failing message with no recorded override - a p=none policy does exactly
+// that, and is the baseline you are trying to move away from.
+// Columns: msgs = logical messages, senders = distinct From addresses,
+// recipients = distinct mailboxes, sample_sender = one From address to trace.
+let sender_domain = "example.com";      // apex under enforcement
 EmailEvents
 | where Timestamp > ago(30d)
-| where EmailDirection == "Inbound"
-| extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC)
-| where dmarc =~ "fail"
-| where DeliveryAction == "Delivered"
-| summarize msgs = dcount(InternetMessageId),
-            recipients = dcount(RecipientEmailAddress),
-            org_action = any(tostring(OrgLevelAction))
-  by SenderFromDomain
+| where EmailDirection in ("Inbound", "Intra-org")
+| where SenderFromDomain =~ sender_domain
+| where isnotempty(InternetMessageId)
+| extend auth = parse_json(AuthenticationDetails)
+| extend dmarc = tostring(auth.DMARC), ca = tostring(auth.CompAuth)
+| extend rcpt = tolower(RecipientEmailAddress)
+| extend on_delivered = DeliveryAction == "Delivered"
+| summarize anypass     = max(iff(dmarc =~ "pass", 1, 0)),
+            anyfail     = max(iff(dmarc =~ "fail", 1, 0)),
+            delivered   = max(iff(on_delivered, 1, 0)),
+            env         = min(SenderMailFromDomain),
+            addr        = min(SenderFromAddress),
+            org_action  = max(iff(on_delivered, tostring(OrgLevelAction), "")),
+            org_policy  = max(iff(on_delivered, tostring(OrgLevelPolicy), "")),
+            user_action = max(iff(on_delivered, tostring(UserLevelAction), "")),
+            compauth    = max(iff(on_delivered, ca, ""))
+  by InternetMessageId, rcpt
+| where anyfail > 0 and anypass == 0 and delivered == 1
+| summarize msgs = count(),
+            senders = dcount(addr),
+            recipients = dcount(rcpt),
+            sample_sender = any(addr)
+  by env, org_action, org_policy, user_action, compauth
 | order by msgs desc

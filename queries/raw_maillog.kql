@@ -1,0 +1,47 @@
+// Raw per-row mail log for one domain, shaped so src/dedupe.py reads it with
+// no column flags:
+//   python src/run_hunting.py queries/raw_maillog.kql --out maillog.csv
+//   python src/dedupe.py maillog.csv --sender-domain example.com --auth-column DMARC
+// Nothing is aggregated here on purpose: dedupe.py does the (Message-ID,
+// recipient) grouping, so every leg of every message must be present.
+// Output column names are the Defender "All email" export names that dedupe.py
+// defaults to (quoted identifiers carry the spaces), plus the three
+// authentication verdicts parsed out of AuthenticationDetails:
+//   Internet message ID       = InternetMessageId, the dedupe key with Recipients
+//   Recipients                = RecipientEmailAddress, one recipient per row
+//   Sender address / domain   = From header address and its domain
+//   Delivery action           = Delivered, Junked, Blocked, Replaced
+//   Latest delivery location  = Inbox/folder, Junk, Quarantine, On-premises/external, ...
+//   DMARC / SPF / DKIM        = the receiver-side verdicts on this leg
+//   Sender mail from domain   = SenderMailFromDomain, the MAIL FROM domain (vendor
+//                               fingerprint); dedupe.py --envelope-column defaults to it
+//   Envelope domain           = the same value under the name the API contract uses
+//   Sender IP, Timestamp, Direction = SenderIPv4, Timestamp, EmailDirection
+// Limits: Advanced Hunting keeps 30 days, so ago(30d) is the maximum window
+// and the API caps a single result set (100,000 rows). If a busy domain hits
+// the cap, narrow the window or split by subdomain and run twice.
+let sender_domain = "example.com";                    // apex; subdomains are included, like dedupe.py --sender-domain
+let window_start  = ago(30d);                         // 30d is the retention maximum
+let window_end    = now();
+let directions    = dynamic(["Inbound", "Intra-org"]); // add "Outbound" to see the outbound leg of a relay hop; it carries no receiver-side verdict
+EmailEvents
+| where Timestamp between (window_start .. window_end)
+| where EmailDirection in (directions)
+| where SenderFromDomain =~ sender_domain or SenderFromDomain endswith strcat(".", sender_domain)
+| where isnotempty(InternetMessageId)
+| extend auth = parse_json(AuthenticationDetails)
+| project ['Internet message ID']      = InternetMessageId,
+          ['Recipients']               = RecipientEmailAddress,
+          ['Sender address']           = SenderFromAddress,
+          ['Sender domain']            = SenderFromDomain,
+          ['Sender mail from domain']  = SenderMailFromDomain,
+          ['Delivery action']          = tostring(DeliveryAction),
+          ['Latest delivery location'] = tostring(DeliveryLocation),
+          ['Subject']                  = Subject,
+          ['DMARC']                    = tostring(auth.DMARC),
+          ['SPF']                      = tostring(auth.SPF),
+          ['DKIM']                     = tostring(auth.DKIM),
+          ['Envelope domain']          = SenderMailFromDomain,
+          ['Sender IP']                = SenderIPv4,
+          ['Timestamp']                = Timestamp,
+          ['Direction']                = tostring(EmailDirection)

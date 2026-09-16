@@ -1,16 +1,27 @@
-// Genuine DMARC failures, deduplicated by Message-ID.
-// A message counts as failing only when NO copy of it passed.
-// Without this dedupe, relay and forwarding legs inflate the number - often by 2x or more.
+// Genuine DMARC failures, deduplicated at the same grain as src/dedupe.py:
+// one logical message = (Message-ID, recipient). A message counts as failing
+// only when NO copy of it passed for that recipient. Without this dedupe,
+// relay and forwarding legs inflate the number - often by 2x or more.
+// Intra-org legs are in the base so an original that passed inside the tenant
+// rescues its relayed echo; the sender domain filter still applies.
+// Columns: env = envelope (MAIL FROM) domain, addr = From address,
+// genuine_failures = logical messages with no passing copy, recipients = how
+// many distinct mailboxes those failures were addressed to.
+let sender_domain = "example.com";      // apex under enforcement
 EmailEvents
 | where Timestamp > ago(7d)
-| where EmailDirection == "Inbound"
-| where SenderFromDomain =~ "example.com"
+| where EmailDirection in ("Inbound", "Intra-org")
+| where SenderFromDomain =~ sender_domain
+| where isnotempty(InternetMessageId)
 | extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC)
+| extend rcpt = tolower(RecipientEmailAddress)
 | summarize anypass = max(iff(dmarc =~ "pass", 1, 0)),
             anyfail = max(iff(dmarc =~ "fail", 1, 0)),
             env     = min(SenderMailFromDomain),
             addr    = min(SenderFromAddress)
-  by InternetMessageId
+  by InternetMessageId, rcpt
 | where anyfail > 0 and anypass == 0
-| summarize genuine_failures = count() by env, addr
+| summarize genuine_failures = count(),
+            recipients = dcount(rcpt)
+  by env, addr
 | order by genuine_failures desc

@@ -1,89 +1,94 @@
-Email date (UTC),Internet message ID,Sender address,Sender domain,Recipients,Subject,Delivery action,Latest delivery location,DMARC
-2026-05-01 09:10:00,<656c4f3e9ec0323dd0992a24@smtp.esp.example>,noreply@example.com,example.com,user0@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-02 09:11:00,<1f6cb8e8f59a43b865874832@smtp.esp.example>,noreply@example.com,example.com,user1@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-03 09:12:00,<f80eb63ab603c5b79eb021e7@smtp.esp.example>,noreply@example.com,example.com,user2@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-04 09:13:00,<7a55cf16ea4a1e43efdc2d18@smtp.esp.example>,noreply@example.com,example.com,user3@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-05 09:14:00,<35a2cfe5b1407d22c3e4e130@smtp.esp.example>,noreply@example.com,example.com,user4@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-06 09:15:00,<1a4c24285ee32b4a9acd831d@smtp.esp.example>,noreply@example.com,example.com,user5@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-07 09:10:00,<67c1313c0b4ec6849a3a41de@smtp.esp.example>,noreply@example.com,example.com,user6@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-08 09:11:00,<34339683ef5c74a7aae960f6@smtp.esp.example>,noreply@example.com,example.com,user7@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-09 09:12:00,<115332e4c7322492076365b6@smtp.esp.example>,noreply@example.com,example.com,user8@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-01 09:13:00,<dc8d4f40700bec082a5f232e@smtp.esp.example>,noreply@example.com,example.com,user9@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-02 09:14:00,<044cd74857af1e840bb3fc7e@smtp.esp.example>,noreply@example.com,example.com,user10@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-03 09:15:00,<7e665f933e97797436798ffe@smtp.esp.example>,noreply@example.com,example.com,user11@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-04 09:10:00,<25c9cf7cf08385631bc4ab1f@smtp.esp.example>,noreply@example.com,example.com,user12@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-05 09:11:00,<7bdb401c8412013cf4fdcdeb@smtp.esp.example>,noreply@example.com,example.com,user13@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-06 09:12:00,<df1e96c91408cd61766d7a37@smtp.esp.example>,noreply@example.com,example.com,user14@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-07 09:13:00,<0b182f0b56bcb8e7030a8629@smtp.esp.example>,noreply@example.com,example.com,user15@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-08 09:14:00,<dc434bd80384d0214264603b@smtp.esp.example>,noreply@example.com,example.com,user16@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-09 09:15:00,<9efb086d44538e34db5f88e7@smtp.esp.example>,noreply@example.com,example.com,user17@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-01 09:10:00,<a3e432a968879d66e94b19af@smtp.esp.example>,noreply@example.com,example.com,user18@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-02 09:11:00,<7b9e8a4f7b1d4bbfc539bf87@smtp.esp.example>,noreply@example.com,example.com,user19@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-03 09:12:00,<6fc393f9de9207584123c6db@smtp.esp.example>,noreply@example.com,example.com,user20@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-04 09:13:00,<5ef9ca942fe518010726bdcf@smtp.esp.example>,noreply@example.com,example.com,user21@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-05 09:14:00,<4331e630acdf0ac8ce44d113@smtp.esp.example>,noreply@example.com,example.com,user22@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-06 09:15:00,<52c32141d81d229fa3f28531@smtp.esp.example>,noreply@example.com,example.com,user23@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-07 09:10:00,<7b05b2a76304982db5339052@smtp.esp.example>,noreply@example.com,example.com,user24@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-08 09:11:00,<e9859ff44da1120a32b57810@smtp.esp.example>,noreply@example.com,example.com,user25@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-09 09:12:00,<705b92c2acbbb4d669631d47@smtp.esp.example>,noreply@example.com,example.com,user26@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-01 09:13:00,<46cb4471c1c14415af1273a5@smtp.esp.example>,noreply@example.com,example.com,user27@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-02 09:14:00,<b35e80670440a80852b80316@smtp.esp.example>,noreply@example.com,example.com,user28@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-03 09:15:00,<94110fb7be5a2cd182a8a400@smtp.esp.example>,noreply@example.com,example.com,user29@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-04 09:10:00,<e8c877d9c6517b13d21a105d@smtp.esp.example>,noreply@example.com,example.com,user30@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-05 09:11:00,<8fd9152379a59af943c9b109@smtp.esp.example>,noreply@example.com,example.com,user31@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-06 09:12:00,<3b3a8e6769e5d3165d3476ad@smtp.esp.example>,noreply@example.com,example.com,user32@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-07 09:13:00,<de38c665a63bd78be306c37c@smtp.esp.example>,noreply@example.com,example.com,user33@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-08 09:14:00,<919887082071b6360b413415@smtp.esp.example>,noreply@example.com,example.com,user34@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-09 09:15:00,<64e8a71995eedda5f7595783@smtp.esp.example>,noreply@example.com,example.com,user35@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-01 09:10:00,<9783ea406aa68092c14b629f@smtp.esp.example>,noreply@example.com,example.com,user36@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-02 09:11:00,<5416903536529b494de19e4a@smtp.esp.example>,noreply@example.com,example.com,user37@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-03 09:12:00,<a8449b6b16c5a1c766e68076@smtp.esp.example>,noreply@example.com,example.com,user38@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-04 09:13:00,<312ceb7aa9d0ae1e05fe5010@smtp.esp.example>,noreply@example.com,example.com,user39@example.com,Your monthly statement,Delivered,Inbox/folder,pass
-2026-05-01 14:20:10,<1326989d4e18888709af722a@smtp.esp.example>,reports@example.com,example.com,staff0@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-01 14:20:15,<1326989d4e18888709af722a@smtp.esp.example>,reports@example.com,example.com,staff0@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-02 14:21:10,<066316151b0013dc98b07479@smtp.esp.example>,reports@example.com,example.com,staff1@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-02 14:21:15,<066316151b0013dc98b07479@smtp.esp.example>,reports@example.com,example.com,staff1@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-03 14:22:10,<7705c883f1276a042349f258@smtp.esp.example>,reports@example.com,example.com,staff2@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-03 14:22:15,<7705c883f1276a042349f258@smtp.esp.example>,reports@example.com,example.com,staff2@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-04 14:23:10,<fd8c2fe75ddfe61fd5a80675@smtp.esp.example>,reports@example.com,example.com,staff3@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-04 14:23:15,<fd8c2fe75ddfe61fd5a80675@smtp.esp.example>,reports@example.com,example.com,staff3@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-05 14:24:10,<13d30f1231ce93f1d0bd400a@smtp.esp.example>,reports@example.com,example.com,staff4@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-05 14:24:15,<13d30f1231ce93f1d0bd400a@smtp.esp.example>,reports@example.com,example.com,staff4@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-06 14:25:10,<7dd108f57fc1bea9e3f9f622@smtp.esp.example>,reports@example.com,example.com,staff5@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-06 14:25:15,<7dd108f57fc1bea9e3f9f622@smtp.esp.example>,reports@example.com,example.com,staff5@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-07 14:20:10,<de958c35ab8296ce97b9661b@smtp.esp.example>,reports@example.com,example.com,staff6@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-07 14:20:15,<de958c35ab8296ce97b9661b@smtp.esp.example>,reports@example.com,example.com,staff6@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-08 14:21:10,<fc9ee30157103e57bfe6bda2@smtp.esp.example>,reports@example.com,example.com,staff7@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-08 14:21:15,<fc9ee30157103e57bfe6bda2@smtp.esp.example>,reports@example.com,example.com,staff7@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-09 14:22:10,<c00b6e5bb2ce775b64b8ddc8@smtp.esp.example>,reports@example.com,example.com,staff8@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-09 14:22:15,<c00b6e5bb2ce775b64b8ddc8@smtp.esp.example>,reports@example.com,example.com,staff8@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-01 14:23:10,<899678a833176a0aa67062ce@smtp.esp.example>,reports@example.com,example.com,staff9@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-01 14:23:15,<899678a833176a0aa67062ce@smtp.esp.example>,reports@example.com,example.com,staff9@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-02 14:24:10,<89532380149ff89fe79b98d4@smtp.esp.example>,reports@example.com,example.com,staff10@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-02 14:24:15,<89532380149ff89fe79b98d4@smtp.esp.example>,reports@example.com,example.com,staff10@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-03 14:25:10,<9eab22c106cf87c5a17de90a@smtp.esp.example>,reports@example.com,example.com,staff11@example.com,Weekly operations report,Delivered,Inbox/folder,pass
-2026-05-03 14:25:15,<9eab22c106cf87c5a17de90a@smtp.esp.example>,reports@example.com,example.com,staff11@example.com,Weekly operations report,Blocked,Quarantine,fail
-2026-05-01 03:00:44,<45519a415bab970710a2b4bf@smtp.esp.example>,finance.lead0@example.com,example.com,ap0@example.com,Invoice #A8813 past due,Blocked,Quarantine,fail
-2026-05-02 03:01:44,<f8e7fb17fc9213696b16eeba@smtp.esp.example>,finance.lead1@example.com,example.com,ap1@example.com,You have (2) unread voicemails,Blocked,Quarantine,fail
-2026-05-03 03:02:44,<d7e78819eb2f94d375610d0a@smtp.esp.example>,finance.lead2@example.com,example.com,ap2@example.com,ACH Payment Notification,Blocked,Quarantine,fail
-2026-05-04 03:03:44,<54edcbb77d424a08c84de6da@smtp.esp.example>,finance.lead3@example.com,example.com,ap3@example.com,Please DocuSign: Direct Deposit Authorization,Blocked,Quarantine,fail
-2026-05-05 03:04:44,<d7c51d7322ed31392b44f6ae@smtp.esp.example>,finance.lead4@example.com,example.com,ap0@example.com,Invoice #A8813 past due,Blocked,Quarantine,fail
-2026-05-06 03:05:44,<30fc6fc21461da0c426eb147@smtp.esp.example>,finance.lead0@example.com,example.com,ap1@example.com,You have (2) unread voicemails,Blocked,Quarantine,fail
-2026-05-07 03:00:44,<da1ad1db2ea9f8427ff6eadd@smtp.esp.example>,finance.lead1@example.com,example.com,ap2@example.com,ACH Payment Notification,Blocked,Quarantine,fail
-2026-05-08 03:01:44,<24e2a0a6e6c19b7145d38c08@smtp.esp.example>,finance.lead2@example.com,example.com,ap3@example.com,Please DocuSign: Direct Deposit Authorization,Blocked,Quarantine,fail
-2026-05-09 03:02:44,<be25ac7a40ac3a41bcc0a1e8@smtp.esp.example>,finance.lead3@example.com,example.com,ap0@example.com,Invoice #A8813 past due,Blocked,Quarantine,fail
-2026-05-01 03:03:44,<166598cadb10d33a2966ea5e@smtp.esp.example>,finance.lead4@example.com,example.com,ap1@example.com,You have (2) unread voicemails,Blocked,Quarantine,fail
-2026-05-02 03:04:44,<65cf745b00b558eb918741f5@smtp.esp.example>,finance.lead0@example.com,example.com,ap2@example.com,ACH Payment Notification,Blocked,Quarantine,fail
-2026-05-03 03:05:44,<aef463722938981382e94f36@smtp.esp.example>,finance.lead1@example.com,example.com,ap3@example.com,Please DocuSign: Direct Deposit Authorization,Blocked,Quarantine,fail
-2026-05-04 03:00:44,<0d468c3b4b5701ad66458174@smtp.esp.example>,finance.lead2@example.com,example.com,ap0@example.com,Invoice #A8813 past due,Blocked,Quarantine,fail
-2026-05-05 03:01:44,<0485f4a2759540bdc548d0e5@smtp.esp.example>,finance.lead3@example.com,example.com,ap1@example.com,You have (2) unread voicemails,Blocked,Quarantine,fail
-2026-05-06 03:02:44,<55fa8b75cd89f719be529e52@smtp.esp.example>,finance.lead4@example.com,example.com,ap2@example.com,ACH Payment Notification,Blocked,Quarantine,fail
-2026-05-07 03:03:44,<3deb83dab2536f5ff4c4f078@smtp.esp.example>,finance.lead0@example.com,example.com,ap3@example.com,Please DocuSign: Direct Deposit Authorization,Blocked,Quarantine,fail
-2026-05-08 03:04:44,<51d17fa13d82b559a03f52be@smtp.esp.example>,finance.lead1@example.com,example.com,ap0@example.com,Invoice #A8813 past due,Blocked,Quarantine,fail
-2026-05-09 03:05:44,<145f9e7694defdc71bc1a355@smtp.esp.example>,finance.lead2@example.com,example.com,ap1@example.com,You have (2) unread voicemails,Blocked,Quarantine,fail
-2026-05-01 11:00:02,<6849fcef27e7443f76dcc54f@smtp.esp.example>,monitor@example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
-2026-05-02 11:01:02,<9d3844547a7547f37377033c@smtp.esp.example>,monitor@example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
-2026-05-03 11:02:02,<1c961a9690f1fa1824126f6e@smtp.esp.example>,monitor@example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
-2026-05-04 11:03:02,<63616eade5e5cea0cb1045d0@smtp.esp.example>,monitor@example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
-2026-05-05 11:04:02,<72e3b527cb237a87b54c6c81@smtp.esp.example>,monitor@example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
-2026-05-06 11:05:02,<afb29be4337beeb276a13711@smtp.esp.example>,monitor@example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
+Email date (UTC),Internet message ID,Sender address,Sender domain,Sender mail from domain,Recipients,Subject,Delivery action,Latest delivery location,DMARC
+2026-05-01 09:10:00,<656c4f3e9ec0323dd0992a24@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user0@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-02 09:11:00,<1f6cb8e8f59a43b865874832@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user1@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-03 09:12:00,<f80eb63ab603c5b79eb021e7@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user2@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-04 09:13:00,<7a55cf16ea4a1e43efdc2d18@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user3@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-05 09:14:00,<35a2cfe5b1407d22c3e4e130@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user4@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-06 09:15:00,<1a4c24285ee32b4a9acd831d@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user5@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-07 09:10:00,<67c1313c0b4ec6849a3a41de@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user6@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-08 09:11:00,<34339683ef5c74a7aae960f6@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user7@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-09 09:12:00,<115332e4c7322492076365b6@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user8@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-01 09:13:00,<dc8d4f40700bec082a5f232e@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user9@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-02 09:14:00,<044cd74857af1e840bb3fc7e@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user10@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-03 09:15:00,<7e665f933e97797436798ffe@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user11@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-04 09:10:00,<25c9cf7cf08385631bc4ab1f@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user12@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-05 09:11:00,<7bdb401c8412013cf4fdcdeb@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user13@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-06 09:12:00,<df1e96c91408cd61766d7a37@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user14@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-07 09:13:00,<0b182f0b56bcb8e7030a8629@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user15@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-08 09:14:00,<dc434bd80384d0214264603b@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user16@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-09 09:15:00,<9efb086d44538e34db5f88e7@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user17@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-01 09:10:00,<a3e432a968879d66e94b19af@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user18@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-02 09:11:00,<7b9e8a4f7b1d4bbfc539bf87@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user19@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-03 09:12:00,<6fc393f9de9207584123c6db@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user20@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-04 09:13:00,<5ef9ca942fe518010726bdcf@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user21@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-05 09:14:00,<4331e630acdf0ac8ce44d113@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user22@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-06 09:15:00,<52c32141d81d229fa3f28531@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user23@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-07 09:10:00,<7b05b2a76304982db5339052@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user24@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-08 09:11:00,<e9859ff44da1120a32b57810@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user25@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-09 09:12:00,<705b92c2acbbb4d669631d47@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user26@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-01 09:13:00,<46cb4471c1c14415af1273a5@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user27@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-02 09:14:00,<b35e80670440a80852b80316@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user28@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-03 09:15:00,<94110fb7be5a2cd182a8a400@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user29@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-04 09:10:00,<e8c877d9c6517b13d21a105d@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user30@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-05 09:11:00,<8fd9152379a59af943c9b109@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user31@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-06 09:12:00,<3b3a8e6769e5d3165d3476ad@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user32@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-07 09:13:00,<de38c665a63bd78be306c37c@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user33@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-08 09:14:00,<919887082071b6360b413415@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user34@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-09 09:15:00,<64e8a71995eedda5f7595783@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user35@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-01 09:10:00,<9783ea406aa68092c14b629f@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user36@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-02 09:11:00,<5416903536529b494de19e4a@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user37@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-03 09:12:00,<a8449b6b16c5a1c766e68076@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user38@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-04 09:13:00,<312ceb7aa9d0ae1e05fe5010@smtp.esp.example>,noreply@example.com,example.com,bounce.esp.example,user39@example.com,Your monthly statement,Delivered,Inbox/folder,pass
+2026-05-01 14:20:10,<1326989d4e18888709af722a@smtp.esp.example>,reports@example.com,example.com,example.com,staff0@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-01 14:20:15,<1326989d4e18888709af722a@smtp.esp.example>,reports@example.com,example.com,example.com,staff0@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-02 14:21:10,<066316151b0013dc98b07479@smtp.esp.example>,reports@example.com,example.com,example.com,staff1@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-02 14:21:15,<066316151b0013dc98b07479@smtp.esp.example>,reports@example.com,example.com,example.com,staff1@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-03 14:22:10,<7705c883f1276a042349f258@smtp.esp.example>,reports@example.com,example.com,example.com,staff2@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-03 14:22:15,<7705c883f1276a042349f258@smtp.esp.example>,reports@example.com,example.com,example.com,staff2@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-04 14:23:10,<fd8c2fe75ddfe61fd5a80675@smtp.esp.example>,reports@example.com,example.com,example.com,staff3@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-04 14:23:15,<fd8c2fe75ddfe61fd5a80675@smtp.esp.example>,reports@example.com,example.com,example.com,staff3@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-05 14:24:10,<13d30f1231ce93f1d0bd400a@smtp.esp.example>,reports@example.com,example.com,example.com,staff4@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-05 14:24:15,<13d30f1231ce93f1d0bd400a@smtp.esp.example>,reports@example.com,example.com,example.com,staff4@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-06 14:25:10,<7dd108f57fc1bea9e3f9f622@smtp.esp.example>,reports@example.com,example.com,example.com,staff5@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-06 14:25:15,<7dd108f57fc1bea9e3f9f622@smtp.esp.example>,reports@example.com,example.com,example.com,staff5@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-07 14:20:10,<de958c35ab8296ce97b9661b@smtp.esp.example>,reports@example.com,example.com,example.com,staff6@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-07 14:20:15,<de958c35ab8296ce97b9661b@smtp.esp.example>,reports@example.com,example.com,example.com,staff6@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-08 14:21:10,<fc9ee30157103e57bfe6bda2@smtp.esp.example>,reports@example.com,example.com,example.com,staff7@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-08 14:21:15,<fc9ee30157103e57bfe6bda2@smtp.esp.example>,reports@example.com,example.com,example.com,staff7@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-09 14:22:10,<c00b6e5bb2ce775b64b8ddc8@smtp.esp.example>,reports@example.com,example.com,example.com,staff8@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-09 14:22:15,<c00b6e5bb2ce775b64b8ddc8@smtp.esp.example>,reports@example.com,example.com,example.com,staff8@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-01 14:23:10,<899678a833176a0aa67062ce@smtp.esp.example>,reports@example.com,example.com,example.com,staff9@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-01 14:23:15,<899678a833176a0aa67062ce@smtp.esp.example>,reports@example.com,example.com,example.com,staff9@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-02 14:24:10,<89532380149ff89fe79b98d4@smtp.esp.example>,reports@example.com,example.com,example.com,staff10@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-02 14:24:15,<89532380149ff89fe79b98d4@smtp.esp.example>,reports@example.com,example.com,example.com,staff10@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-03 14:25:10,<9eab22c106cf87c5a17de90a@smtp.esp.example>,reports@example.com,example.com,example.com,staff11@example.com,Weekly operations report,Delivered,Inbox/folder,pass
+2026-05-03 14:25:15,<9eab22c106cf87c5a17de90a@smtp.esp.example>,reports@example.com,example.com,example.com,staff11@example.com,Weekly operations report,Blocked,Quarantine,fail
+2026-05-01 03:00:44,<45519a415bab970710a2b4bf@smtp.esp.example>,finance.lead0@example.com,example.com,mta7.hosting.example,ap0@example.com,Invoice #A8813 past due,Blocked,Quarantine,fail
+2026-05-02 03:01:44,<f8e7fb17fc9213696b16eeba@smtp.esp.example>,finance.lead1@example.com,example.com,mta7.hosting.example,ap1@example.com,You have (2) unread voicemails,Blocked,Quarantine,fail
+2026-05-03 03:02:44,<d7e78819eb2f94d375610d0a@smtp.esp.example>,finance.lead2@example.com,example.com,mta7.hosting.example,ap2@example.com,ACH Payment Notification,Blocked,Quarantine,fail
+2026-05-04 03:03:44,<54edcbb77d424a08c84de6da@smtp.esp.example>,finance.lead3@example.com,example.com,mta7.hosting.example,ap3@example.com,Please DocuSign: Direct Deposit Authorization,Blocked,Quarantine,fail
+2026-05-05 03:04:44,<d7c51d7322ed31392b44f6ae@smtp.esp.example>,finance.lead4@example.com,example.com,mta7.hosting.example,ap0@example.com,Invoice #A8813 past due,Blocked,Quarantine,fail
+2026-05-06 03:05:44,<30fc6fc21461da0c426eb147@smtp.esp.example>,finance.lead0@example.com,example.com,mta7.hosting.example,ap1@example.com,You have (2) unread voicemails,Blocked,Quarantine,fail
+2026-05-07 03:00:44,<da1ad1db2ea9f8427ff6eadd@smtp.esp.example>,finance.lead1@example.com,example.com,mta7.hosting.example,ap2@example.com,ACH Payment Notification,Blocked,Quarantine,fail
+2026-05-08 03:01:44,<24e2a0a6e6c19b7145d38c08@smtp.esp.example>,finance.lead2@example.com,example.com,mta7.hosting.example,ap3@example.com,Please DocuSign: Direct Deposit Authorization,Blocked,Quarantine,fail
+2026-05-09 03:02:44,<be25ac7a40ac3a41bcc0a1e8@smtp.esp.example>,finance.lead3@example.com,example.com,mta7.hosting.example,ap0@example.com,Invoice #A8813 past due,Blocked,Quarantine,fail
+2026-05-01 03:03:44,<166598cadb10d33a2966ea5e@smtp.esp.example>,finance.lead4@example.com,example.com,mta7.hosting.example,ap1@example.com,You have (2) unread voicemails,Blocked,Quarantine,fail
+2026-05-02 03:04:44,<65cf745b00b558eb918741f5@smtp.esp.example>,finance.lead0@example.com,example.com,mta7.hosting.example,ap2@example.com,ACH Payment Notification,Blocked,Quarantine,fail
+2026-05-03 03:05:44,<aef463722938981382e94f36@smtp.esp.example>,finance.lead1@example.com,example.com,mta7.hosting.example,ap3@example.com,Please DocuSign: Direct Deposit Authorization,Blocked,Quarantine,fail
+2026-05-04 03:00:44,<0d468c3b4b5701ad66458174@smtp.esp.example>,finance.lead2@example.com,example.com,mta7.hosting.example,ap0@example.com,Invoice #A8813 past due,Blocked,Quarantine,fail
+2026-05-05 03:01:44,<0485f4a2759540bdc548d0e5@smtp.esp.example>,finance.lead3@example.com,example.com,mta7.hosting.example,ap1@example.com,You have (2) unread voicemails,Blocked,Quarantine,fail
+2026-05-06 03:02:44,<55fa8b75cd89f719be529e52@smtp.esp.example>,finance.lead4@example.com,example.com,mta7.hosting.example,ap2@example.com,ACH Payment Notification,Blocked,Quarantine,fail
+2026-05-07 03:03:44,<3deb83dab2536f5ff4c4f078@smtp.esp.example>,finance.lead0@example.com,example.com,mta7.hosting.example,ap3@example.com,Please DocuSign: Direct Deposit Authorization,Blocked,Quarantine,fail
+2026-05-08 03:04:44,<51d17fa13d82b559a03f52be@smtp.esp.example>,finance.lead1@example.com,example.com,mta7.hosting.example,ap0@example.com,Invoice #A8813 past due,Blocked,Quarantine,fail
+2026-05-09 03:05:44,<145f9e7694defdc71bc1a355@smtp.esp.example>,finance.lead2@example.com,example.com,mta7.hosting.example,ap1@example.com,You have (2) unread voicemails,Blocked,Quarantine,fail
+2026-05-01 11:00:02,<6849fcef27e7443f76dcc54f@smtp.esp.example>,monitor@example.com,example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
+2026-05-02 11:01:02,<9d3844547a7547f37377033c@smtp.esp.example>,monitor@example.com,example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
+2026-05-03 11:02:02,<1c961a9690f1fa1824126f6e@smtp.esp.example>,monitor@example.com,example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
+2026-05-04 11:03:02,<63616eade5e5cea0cb1045d0@smtp.esp.example>,monitor@example.com,example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
+2026-05-05 11:04:02,<72e3b527cb237a87b54c6c81@smtp.esp.example>,monitor@example.com,example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
+2026-05-06 11:05:02,<afb29be4337beeb276a13711@smtp.esp.example>,monitor@example.com,example.com,example.com,datafeed@example.com,Nightly export complete,Delivered,On-prem/external,pass
+2026-05-05 08:30:12,<9c41e7d02b6f4a8e5d17c3b0@mail.vendor.example>,statements@example.com,example.com,example.com,procurement0@example.com,Purchase order 4471 acknowledged,Delivered,Inbox/folder,fail
+2026-05-06 08:31:12,<2fa8d51c7e09b34d6c8e1f75@mail.vendor.example>,statements@example.com,example.com,example.com,procurement1@example.com,Purchase order 4472 acknowledged,Delivered,Inbox/folder,fail
+2026-05-07 08:32:12,<7d3b0e96a4c1f28b9e5a6d04@mail.vendor.example>,statements@example.com,example.com,example.com,procurement2@example.com,Purchase order 4473 acknowledged,Delivered,Inbox/folder,fail
+2026-05-08 16:00:00,<e18c4a7f3d62b90e5f1a7c3b@smtp.esp.example>,newsletter@example.com,example.com,bounce.esp.example,staff0@example.com,Company newsletter,Quarantined,Quarantine,pass
+2026-05-09 16:01:00,<5b7e2d19c8a04f6e3d92b1a8@smtp.esp.example>,newsletter@example.com,example.com,bounce.esp.example,staff1@example.com,Company newsletter,Quarantined,Quarantine,pass

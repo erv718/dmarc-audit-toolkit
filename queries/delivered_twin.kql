@@ -1,0 +1,87 @@
+// Rule 5 as a query: a quarantined or blocked row is not a lost email until
+// you confirm there is no delivered leg with the same Message-ID for the same
+// recipient. Relay and forwarding hops produce a blocked echo seconds after
+// the original was delivered; counting the echo as a loss is the most common
+// way an enforcement step gets blamed for an outage that never happened.
+// For every lost leg (DeliveryAction Blocked, or DeliveryLocation Quarantine)
+// of mail from the domain in the window, this finds Delivered legs with the
+// same (Message-ID, recipient) - the src/dedupe.py grain - and shows the pair.
+// Columns:
+//   lost_time / lost_action / lost_location   = the row that looks like a loss
+//   twin_time / twin_action / twin_location   = the delivered leg, empty if none
+//   gap_seconds = twin_time minus lost_time; negative means the delivered leg
+//                 came first, which is the normal echo shape
+//   verdict     = "echo" (twin within twin_window, not a loss),
+//                 "twin outside window" (a delivered leg exists but far apart;
+//                 read the trace before deciding), "no delivered leg" (a real
+//                 loss for that recipient - this is the number to report)
+// Junked is delivered to the junk folder, not lost; add it to lost_actions
+// only if your organisation treats junk as a loss.
+let sender_domain = "example.com";      // apex; subdomains are included
+let window_start  = ago(30d);           // 30d is the retention maximum
+let window_end    = now();
+let twin_window   = 120;                // seconds between a lost leg and its delivered twin
+let lost_actions  = dynamic(["Blocked"]);
+let base = EmailEvents
+| where Timestamp between (window_start .. window_end)
+| where EmailDirection in ("Inbound", "Intra-org")
+| where SenderFromDomain =~ sender_domain or SenderFromDomain endswith strcat(".", sender_domain)
+| where isnotempty(InternetMessageId)
+| extend rcpt = tolower(RecipientEmailAddress)
+| extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC);
+let lost = base
+| where DeliveryAction in (lost_actions) or DeliveryLocation == "Quarantine"
+| project InternetMessageId, rcpt, SenderFromAddress, SenderMailFromDomain, Subject,
+          lost_time      = Timestamp,
+          lost_action    = tostring(DeliveryAction),
+          lost_location  = tostring(DeliveryLocation),
+          lost_dmarc     = dmarc,
+          lost_direction = tostring(EmailDirection);
+let delivered = base
+| where DeliveryAction == "Delivered"
+| project InternetMessageId, rcpt,
+          twin_time      = Timestamp,
+          twin_action    = tostring(DeliveryAction),
+          twin_location  = tostring(DeliveryLocation),
+          twin_dmarc     = dmarc,
+          twin_direction = tostring(EmailDirection);
+lost
+| join kind=leftouter delivered on InternetMessageId, rcpt
+| extend gap_seconds = datetime_diff("second", twin_time, lost_time)
+| extend verdict = case(isnull(twin_time),               "no delivered leg",
+                        abs(gap_seconds) <= twin_window, "echo",
+                                                         "twin outside window")
+| project verdict, InternetMessageId, rcpt, SenderFromAddress, SenderMailFromDomain, Subject,
+          lost_time, lost_action, lost_location, lost_dmarc, lost_direction,
+          twin_time, twin_action, twin_location, twin_dmarc, twin_direction,
+          gap_seconds
+| order by verdict asc, lost_time desc
+//
+// ---- variant: trace one message ------------------------------------------
+// Every leg of a single message, oldest first, so you can read the hop chain
+// by hand. Paste the full InternetMessageId including the angle brackets.
+// Copy the block below into a fresh query and remove the leading "// ".
+//
+// let target_id = "<0123456789abcdef@mail.sub.example.com>";
+// EmailEvents
+// | where Timestamp > ago(30d)
+// | where InternetMessageId == target_id
+// | extend auth = parse_json(AuthenticationDetails)
+// | project Timestamp, EmailDirection, NetworkMessageId, RecipientEmailAddress,
+//           SenderFromAddress, SenderMailFromDomain, SenderIPv4,
+//           DeliveryAction, DeliveryLocation,
+//           DMARC = tostring(auth.DMARC), SPF = tostring(auth.SPF), DKIM = tostring(auth.DKIM),
+//           CompAuth = tostring(auth.CompAuth),
+//           OrgLevelAction, OrgLevelPolicy, UserLevelAction, Subject
+// | order by Timestamp asc
+//
+// If the message was delivered and later moved (zero-hour auto purge), the
+// move is not in EmailEvents. Run this second block with the same target_id:
+//
+// let target_id = "<0123456789abcdef@mail.sub.example.com>";
+// EmailPostDeliveryEvents
+// | where Timestamp > ago(30d)
+// | where InternetMessageId == target_id
+// | project Timestamp, RecipientEmailAddress, Action, ActionType, ActionTrigger,
+//           ActionResult, DeliveryLocation, NetworkMessageId
+// | order by Timestamp asc

@@ -34,10 +34,29 @@ try:
 except ImportError:
     dns = None
 
+
+def _mcp_import_error():
+    """Tell a 1.x install apart from no install: both raise ImportError on
+    mcp.server.mcpserver, but the fix is different."""
+    try:
+        import mcp  # noqa: F401
+    except ImportError:
+        return "the MCP SDK is not installed - run: pip install -r requirements-mcp.txt"
+    found = ""
+    try:
+        from importlib.metadata import version
+        found = " (installed: %s)" % version("mcp")
+    except Exception:
+        pass
+    return ("mcp 1.x found%s; this server needs mcp 2.x - "
+            "pip install -r requirements-mcp.txt" % found)
+
+
 try:
     from mcp.server.mcpserver import MCPServer
 except ImportError:
-    sys.exit("the MCP SDK is not installed - run: pip install -r requirements-mcp.txt")
+    print(_mcp_import_error(), file=sys.stderr)
+    sys.exit(2)
 
 server = MCPServer(
     name="dmarc-provenance",
@@ -50,9 +69,18 @@ server = MCPServer(
     ),
 )
 
-ROW_PREVIEW_CAP = 50
+ROW_PREVIEW_CAP = 50        # hard ceiling on rows any reply may carry
+HUNT_PREVIEW_DEFAULT = 20   # run_hunting_query default; 0 disables the preview
 FIELD_CLIP = 300
 MAX_DOMAINS = 25
+
+# Every row a tool returns is copied into the client's conversation, which
+# may be logged or synced off this machine - CLAUDE.md rule 3.
+TENANT_DATA_NOTE = (
+    "preview rows are live tenant data and have now left this machine via the "
+    "conversation; redact company domains, names and IPs before any of it is "
+    "published or pasted externally (CLAUDE.md rule 3). Pass out_csv to keep "
+    "the full result set local, and preview_rows=0 to send no rows at all.")
 
 
 def _make_resolver(addr):
@@ -191,13 +219,15 @@ def run_hunting_query(
     query_file: str,
     timespan: str | None = None,
     out_csv: str | None = None,
+    preview_rows: int = HUNT_PREVIEW_DEFAULT,
 ) -> dict:
     """Run a saved KQL file from queries/ against Microsoft Graph advanced
     hunting, using the read-only App Registration credentials in the repo's
     .env (see docs/app-registration.md). Full results go to out_csv when
     given (a path inside the repo folder); the response carries the row
-    count and a capped preview so large result sets stay out of the
-    conversation."""
+    count and a preview of at most preview_rows rows (default 20, ceiling
+    50, 0 for none). Preview rows are live tenant data entering the
+    conversation - prefer out_csv plus a small preview."""
     env = _read_env(ENV_PATH)
     if "__error__" in env:
         return {"error": env["__error__"]}
@@ -206,6 +236,11 @@ def run_hunting_query(
     if missing:
         return {"error": "missing credentials: " + ", ".join(missing)
                          + " - put them in .env, see docs/app-registration.md"}
+    try:
+        limit = max(0, min(int(preview_rows), ROW_PREVIEW_CAP))
+    except (TypeError, ValueError):
+        return {"error": "preview_rows must be an integer from 0 to %d"
+                         % ROW_PREVIEW_CAP}
     qpath = Path(query_file)
     if not qpath.is_absolute():
         qpath = ROOT / qpath
@@ -223,11 +258,22 @@ def run_hunting_query(
         return {"error": str(err)}
 
     rows = result.get("results") or []
+    preview = [_clip_row(r) for r in rows[:limit]]
+    if limit == 0:
+        note = ("preview disabled (preview_rows=0): no result rows entered the "
+                "conversation; the full result set is only in out_csv, when "
+                "given, and stays on this machine.")
+    elif not rows:
+        note = "the query returned no rows; nothing entered the conversation."
+    else:
+        note = TENANT_DATA_NOTE
     reply = {
         "rows": len(rows),
         "columns": [c.get("name") for c in (result.get("schema") or []) if c.get("name")],
-        "preview": [_clip_row(r) for r in rows[:ROW_PREVIEW_CAP]],
-        "preview_truncated": len(rows) > ROW_PREVIEW_CAP,
+        "preview": preview,
+        "preview_rows": len(preview),
+        "preview_truncated": len(rows) > limit,
+        "note": note,
     }
     if "example.com" in kql:
         reply["warning"] = ("the query still targets example.com - edit the "

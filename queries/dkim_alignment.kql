@@ -1,0 +1,47 @@
+// Which passing senders are carried by DKIM and which by SPF alone.
+// SPF breaks when mail is forwarded; DKIM survives it. A sender that passes
+// DMARC on SPF alone is fine at p=quarantine (a forwarded copy lands in junk
+// and can be retrieved) and fragile at p=reject (it bounces). This makes that
+// risk a number per sender before you move to reject. EmailEvents does not
+// expose the DKIM d= domain, so alignment is inferred from the verdicts:
+//   dkim_aligned = some leg passed DMARC while SPF did not pass aligned, so
+//                  DKIM must have carried it - alignment proven
+//   spf_only     = DMARC passed and no leg ever had a DKIM pass - this sender
+//                  breaks on forwarding, fix before reject
+//   spf_and_dkim = both passed on every passing leg; DKIM alignment likely
+//                  but unproven from this table - confirm d= in one live
+//                  header before counting it as safe (rule 9)
+// Deduplicated at the src/dedupe.py grain: (Message-ID, recipient), over
+// Inbound and Intra-org legs. Relaxed SPF alignment is assumed (the DMARC
+// default): the envelope domain only has to share the organisational domain.
+// Columns: addr = From address, env = envelope domain (vendor fingerprint),
+// passing = logical messages that passed, the three buckets above,
+// spf_only_pct = share of this sender's passing mail that has no DKIM.
+let sender_domain = "example.com";      // apex; subdomains are included
+let window_start  = ago(30d);           // 30d is the retention maximum
+EmailEvents
+| where Timestamp > window_start
+| where EmailDirection in ("Inbound", "Intra-org")
+| where SenderFromDomain =~ sender_domain or SenderFromDomain endswith strcat(".", sender_domain)
+| where isnotempty(InternetMessageId)
+| extend auth = parse_json(AuthenticationDetails)
+| extend dmarc = tostring(auth.DMARC), spf = tostring(auth.SPF), dkim = tostring(auth.DKIM)
+| extend rcpt = tolower(RecipientEmailAddress), envdom = tolower(SenderMailFromDomain)
+| extend spf_aligned_pass = spf =~ "pass" and (envdom =~ sender_domain or envdom endswith strcat(".", sender_domain))
+| summarize dmarc_pass   = max(iff(dmarc =~ "pass", 1, 0)),
+            dkim_carried = max(iff(dmarc =~ "pass" and not(spf_aligned_pass), 1, 0)),
+            dkim_pass    = max(iff(dkim =~ "pass", 1, 0)),
+            addr         = min(tolower(SenderFromAddress)),
+            env          = min(envdom)
+  by InternetMessageId, rcpt
+| where dmarc_pass == 1
+| extend bucket = case(dkim_carried == 1, "dkim_aligned",
+                       dkim_pass == 0,    "spf_only",
+                                          "spf_and_dkim")
+| summarize passing      = count(),
+            dkim_aligned = countif(bucket == "dkim_aligned"),
+            spf_and_dkim = countif(bucket == "spf_and_dkim"),
+            spf_only     = countif(bucket == "spf_only")
+  by addr, env
+| extend spf_only_pct = round(100.0 * spf_only / passing, 1)
+| order by spf_only desc, passing desc
