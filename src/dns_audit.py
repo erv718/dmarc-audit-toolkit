@@ -351,6 +351,7 @@ def audit_domain(domain, resolver, extra_selectors=None):
 
     # --- DMARC (the name's own record, else the closest ancestor up to the apex)
     source, txts, inherited, dmarc_status, own_status = find_dmarc(domain, q)
+    dmarc_txt = txts[0] if txts else None   # keep it: txts is reused by the DKIM probes below
     dmarc = parse_dmarc(txts[0]) if txts else None
     effective = None
     if dmarc is not None:
@@ -453,7 +454,7 @@ def audit_domain(domain, resolver, extra_selectors=None):
     return {"domain": domain,
             "spf": spf, "spf_status": spf_status, "spf_terminator": terminator, "spf_lookups": lookups,
             "spf_lookups_failed": spf_failed, "spf_verified": spf_status != "error" and spf_failed == 0,
-            "dmarc": txts[0] if txts else None, "dmarc_source": source, "effective_policy": effective,
+            "dmarc": dmarc_txt, "dmarc_source": source, "effective_policy": effective,
             "inherited": inherited, "dmarc_status": dmarc_status,
             "dkim_selectors": selectors, "dkim_probed": probed, "dkim_dangling": dangling, "dkim_wildcard": wildcarded,
             "dkim_status": dkim_status, "dkim_unresolved": unresolved,

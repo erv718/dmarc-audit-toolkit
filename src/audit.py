@@ -1149,7 +1149,11 @@ def main():
     ap.add_argument("--bypasses-json", metavar="JSON", help="audit_bypasses.ps1 -Json export")
     ap.add_argument("--groups-json", metavar="JSON", help="audit_groups.ps1 -Json export")
     ap.add_argument("--out", default="audit-out", metavar="DIR",
-                    help="output directory for report.md and report.json (default audit-out/)")
+                    help="output directory for report.md, report.json, plan.md, plan.json (default audit-out/)")
+    ap.add_argument("--no-plan", action="store_true", help="do not write the rollout plan (plan.md, plan.json)")
+    ap.add_argument("--rua-address", metavar="MAILTO",
+                    help="reporting address the plan puts in new DMARC records (default: the one your records already use)")
+    ap.add_argument("--inventory", metavar="JSON", help="inventory.json from discover.py, for the zone host per domain")
     ap.add_argument("--offline", action="store_true",
                     help="no live DNS or network work; analyse only the files given")
     ap.add_argument("--resolver", default="8.8.8.8", help="port-53 resolver (DoH is the fallback)")
@@ -1267,6 +1271,20 @@ def main():
           f"{s['actionable']} major or blocking")
     print(f"wrote {mpath}")
     print(f"wrote {jpath}")
+    if not args.no_plan and report.get("dns"):
+        import plan as plan_mod
+        inventory = None
+        if args.inventory:
+            try:
+                inventory = json.loads(Path(args.inventory).read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError) as err:
+                print(f"note: inventory not used ({err})", file=sys.stderr)
+        try:
+            pm, pj = plan_mod.write(plan_mod.build_plan(report, inventory, args.rua_address), args.out)
+            print(f"wrote {pm}")
+            print(f"wrote {pj}")
+        except ValueError as err:
+            print(f"note: no plan written ({err})", file=sys.stderr)
     sys.exit(report["exit_code"])
 
 
