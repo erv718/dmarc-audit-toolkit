@@ -75,6 +75,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 import dedupe
 import dns_audit
+import discover
 import headers as headers_mod
 import rua_parse
 from spf_lookups import LIMIT as SPF_LIMIT
@@ -772,9 +773,9 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                  auth_column=None, vendor_domains=(), authserv_id=None, strict=False,
                  min_volume=20, fail_threshold=0.5, since=None, until=None,
                  expect_policy=None, retiring=(), columns=None, domain_file=None,
-                 rules_json=None, bypasses_json=None, groups_json=None):
+                 rules_json=None, bypasses_json=None, groups_json=None, domain_sources=None):
     """The whole audit as one document. Raises UsageError on input problems."""
-    domains = list(domains)
+    domains = [part for d in domains for part in str(d).split(",")]
     if domain_file:
         domains += read_domain_file(domain_file)
     domains = list(dict.fromkeys(d.strip().lower().rstrip(".") for d in domains if d.strip()))
@@ -801,7 +802,7 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
         "tool": "audit.py", "version": VERSION,
         "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "offline": offline,
-        "inputs": {"domains": domains,
+        "inputs": {"domains": domains, "domain_sources": domain_sources or {},
                    "domain_file": str(repo_path(domain_file)) if domain_file else None,
                    "rua": _source_list(rua_paths),
                    "maillog": str(repo_path(maillog)) if maillog else None,
@@ -1134,6 +1135,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("domains", nargs="*", help="domains to audit (live DNS unless --offline)")
     ap.add_argument("--file", metavar="PATH", help="file with one domain per line (added to the positional domains)")
+    ap.add_argument("--no-graph", action="store_true",
+                    help="do not read the tenant's domain list through the app registration")
+    ap.add_argument("--mailflow", action="store_true",
+                    help="add subdomains seen sending in the last 30 days (needs ThreatHunting.Read.All)")
+    ap.add_argument("--env-file", help="credentials file (default: <repo root>/.env)")
     ap.add_argument("--rua", nargs="+", metavar="PATH", default=[],
                     help="aggregate report files or directories (.xml .xml.gz .zip; directories recursed)")
     ap.add_argument("--maillog", metavar="CSV", help="mail-log export for dedupe (Message-ID grouping)")
@@ -1174,22 +1180,57 @@ def main():
                     help="DKIM selector you plan to delete; checked against the rua reports (repeatable)")
     args = ap.parse_args()
 
-    domains = list(args.domains)
+    # Domains: command line (comma or space separated), --file, and - unless
+    # --no-graph or --offline - the tenant's own verified domain list, merged
+    # with duplicates dropped. No domains at all means "audit the tenant".
+    domains, bad = discover.parse_domains(list(args.domains))
+    domain_sources = {d: ["cli"] for d in domains}
     if args.file:
         try:
-            domains += read_domain_file(args.file)
+            file_domains, bad_file = discover.parse_domains(read_domain_file(args.file))
         except UsageError as exc:
             die(str(exc))
-    domains = [d.strip().lower().rstrip(".") for d in domains if d.strip()]
-    bad = [d for d in domains if not re.fullmatch(r"[a-z0-9_-]+(\.[a-z0-9_-]+)*", d)]
+        bad += bad_file
+        for d in file_domains:
+            domain_sources.setdefault(d, []).append("file")
+            if d not in domains:
+                domains.append(d)
     if bad:
         die("not a domain name: " + ", ".join(bad))
+    if not args.offline and not args.no_graph:
+        tenant, note = discover.graph_domains(args.env_file)
+        if note:
+            print("note: " + note, file=sys.stderr)
+        new = 0
+        for t in tenant:
+            d = t["domain"]
+            if d.endswith(".onmicrosoft.com") or not t.get("verified"):
+                continue
+            domain_sources.setdefault(d, []).append("tenant")
+            if d not in domains:
+                domains.append(d)
+                new += 1
+        if tenant:
+            print("note: %d verified domains read from the tenant, %d not already named"
+                  % (sum(1 for t in tenant if t.get("verified")), new), file=sys.stderr)
+    if not args.offline and args.mailflow and domains:
+        orgs = sorted({discover.org_domain(d) for d in domains})
+        rows, note = discover.mailflow_subdomains(orgs, args.env_file)
+        if note:
+            print("note: " + note, file=sys.stderr)
+        for r in rows:
+            domain_sources.setdefault(r["domain"], []).append("mailflow")
+            if r["domain"] not in domains:
+                domains.append(r["domain"])
+        if rows:
+            print("note: %d sending domains under %s seen in mail flow" % (len(rows), ", ".join(orgs)),
+                  file=sys.stderr)
     columns = {key: getattr(args, f"{key}_column") for key in MAILLOG_COLUMNS
                if getattr(args, f"{key}_column")}
 
     try:
         report = build_report(
-            domains=domains, rua_paths=args.rua, maillog=args.maillog, header_files=args.headers,
+            domains=domains, domain_sources=domain_sources, rua_paths=args.rua, maillog=args.maillog, header_files=args.headers,
             offline=args.offline, resolver_addr=args.resolver,
             selectors=[s.strip() for s in args.selectors.split(",")] if args.selectors else (),
             known=args.known, sender_domain=args.sender_domain, auth_column=args.auth_column,

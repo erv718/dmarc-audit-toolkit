@@ -31,6 +31,34 @@ PERMERROR and most receivers treat that as failure, for the whole domain, every
 message. Domains drift toward the limit one vendor at a time and nobody
 notices until the record breaks.
 
+## Two ways to use this
+
+**1. Audit with no AI.** Python, an optional `.env`, one command. You get
+`report.md` (findings ranked by severity, a go / no-go gate per domain, the
+next policy step) and `report.json`. No AI, no MCP, nothing beyond
+`requirements.txt`.
+
+```bash
+pip install -r requirements.txt
+python src/verify_setup.py                       # only if you gave it an app registration
+python src/audit.py                              # domains read from your tenant
+python src/audit.py example.com,other.example    # or name them; the two lists are merged
+```
+
+Domains come from three places and are merged with duplicates dropped: the
+command line (comma or space separated), a file (`--file`), and the tenant
+itself when the app registration has `Domain.Read.All` (run with no domains
+and it audits everything the tenant has verified). `--mailflow` adds every
+subdomain seen sending in the last 30 days; `--no-graph` skips the tenant.
+
+**2. Then add the AI, if you want it.** Set `AI_ANALYSIS_ENABLED=true` in
+`.env`, point Claude Code, Codex, Cursor or any agent that reads `AGENTS.md`
+at the repo, and hand it `report.json`. The contract keeps the agent
+read-only and explicit about verified versus inferred. Clients without shell
+access use the MCP server instead (`pip install -r requirements-mcp.txt`, then
+the registration command below). The AI reads what the tools produced; it
+never touches the tenant itself.
+
 ## Quick start
 
 The DNS and file tools need nothing installed but Python (they fall back to
@@ -72,6 +100,9 @@ Counting rows would report 33 failures; the true count is 21.
 | Path | What it does |
 |---|---|
 | `src/audit.py` | The orchestrator: runs the whole sweep (DNS posture, rua reports, mail log, headers) and writes `report.md` + `report.json` with severity-ranked findings and a go / no-go gate verdict for the next policy step. Works `--offline` from saved files. |
+| `src/discover.py` | Finds the domains to audit: command line, file, the tenant (Graph), and subdomains seen in mail flow; merges and deduplicates; records each zone's DNS host (Route53, CSC, Cloudflare, ...), which decides how a change gets made. |
+| `src/verify_setup.py` | Proves the app registration: token, required roles, roles in EXCESS (write-capable ones flagged), the domain list, a hunting query, the report mailbox, and that other mailboxes are denied. |
+| `src/graph_client.py` | Shared Microsoft Graph helper (token, paging, domains, hunting, mailbox). Library only. |
 | `src/dedupe.py` | Collapses mail-log rows into logical messages by (Message-ID, recipient) and classifies each one. Reports failed-but-delivered and passed-but-blocked separately, and dies loudly on a misspelled column instead of returning a silent zero. |
 | `src/spf_lookups.py` | Recursively expands an SPF record and counts DNS-querying mechanisms against the RFC 7208 limit of ten. Falls back to DNS-over-HTTPS; reports lookup errors as errors, never as "no record". |
 | `src/dns_audit.py` | Multi-domain posture sweep: SPF strength and lookup budget, DMARC policy and subdomain inheritance, DKIM selectors (incl. dangling CNAMEs), MX. One findings list per domain with evidence. |
