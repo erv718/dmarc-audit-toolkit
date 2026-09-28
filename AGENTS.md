@@ -62,6 +62,15 @@ file only.)
 11. **State your confidence.** Separate what you verified from what you
     inferred, and say which is which. If the human challenges a claim,
     re-verify instead of defending it.
+12. **Answer from pulled data, not memory.** Every claim about a domain's
+    posture, usage, or ownership cites the artifact it came from and when
+    that artifact was pulled. If no fresh artifact exists, run the pull -
+    every tool here is read-only - or say the data is unavailable. A partial
+    export is not a population: a domain missing from one system's list
+    (accepted domains, one CSV, one portal view) is not missing from the
+    world. Build domain and sender inventories from the aggregate-reporting
+    account and DNS, cross-checked against the mail system - never from one
+    source alone.
 
 ## The working sequence
 

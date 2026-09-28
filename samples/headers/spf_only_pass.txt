@@ -13,8 +13,7 @@ DKIM-Signature: v=1; a=rsa-sha256; q=dns/txt; c=relaxed/simple;
  s=224i4yxa5dv7c2xz3womw6peuasteono; d=amazonses.com; t=1789383729;
  h=From:Reply-To:To:Subject:MIME-Version:Content-Type:Message-ID:Date:Feedback-ID;
  bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=;
- b=U0FNUExFIFNJR05BVFVSRSAtIE5PVCBBIFJFQUwgS0VZIC0gcGxhY2Vob2xkZXIgYnl0ZXMgZm9yIHRoZSBk
- bWFyYy1wcm92ZW5hbmNlIGhlYWRlcnMucHkgc2FtcGxlcy4gQ2Fubm90IHZlcmlmeS4=
+ b=cGxhY2Vob2xkZXItc2lnbmF0dXJlLWJ5dGVz
 X-SES-Outgoing: 2026.09.14-198.51.100.31
 Feedback-ID: ::1.us-east-1.U0FNUExFRkVFREJBQ0tJRFBMQUNFSE9MREVSMDAwMDAw=:AmazonSES
 From: Example Billing <billing@example.com>

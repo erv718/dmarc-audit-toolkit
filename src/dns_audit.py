@@ -2,6 +2,8 @@
 
 For every domain you give it, reports:
   - SPF: present, terminator strength, DNS lookup count vs the limit of 10
+    (an include that fails to resolve makes the count a lower bound, reported
+    as not verified, never as a clean number)
   - DMARC: the record that applies (the name's own, or inherited from the
     closest ancestor up to the organizational domain), effective policy,
     subdomain policy, sampling rate, reporting addresses
@@ -299,6 +301,7 @@ def audit_domain(domain, resolver, extra_selectors=None):
     if spf_ev:
         evidence.extend(spf_ev if isinstance(spf_ev, list) else [spf_ev])
     lookups = 0
+    spf_failed = 0
     terminator = None
     if spf_status == "error":
         add("SPF-002", "major", "spf", "SPF lookup failed - not verified",
@@ -306,22 +309,40 @@ def audit_domain(domain, resolver, extra_selectors=None):
             "re-run from a network with working DNS, or query the TXT record by another path, before concluding anything about SPF",
             verified=False)
     elif spf:
-        lookups = sum(1 for _, _, _, billable in walk(domain, resolver) if billable)
+        # walk() gets the record already fetched, so the apex is not queried
+        # twice. A nested include or redirect whose lookup fails leaves a
+        # LOOKUP FAILED row: the count is then a lower bound, never a verdict.
+        rows = walk(domain, resolver, spf=spf)
+        lookups = sum(1 for _, _, _, billable in rows if billable)
+        unresolved = [(owner, mech) for _, owner, mech, _ in rows if mech.startswith("LOOKUP FAILED")]
+        spf_failed = len(unresolved)
+        for owner, mech in unresolved:
+            evidence.append({"name": owner, "type": "TXT", "path": None, "ttl": None, "status": "error",
+                             "note": mech, "src": "spf_lookups"})
+        counted = f"{lookups} DNS-querying mechanisms after expanding includes"
+        if spf_failed:
+            counted = f"at least {counted} ({spf_failed} include(s) could not be resolved)"
         terminator = spf.split()[-1] if spf.split() else "?"
         if terminator.lower() not in ("-all", "~all") and not terminator.lower().startswith("redirect="):
             add("SPF-003", "major", "spf", f"SPF terminator is '{terminator}' - effectively no protection",
                 spf, "end the record with -all (or ~all while senders are still being inventoried)")
         if lookups > LIMIT:
             add("SPF-004", "blocking", "spf", f"SPF over the {LIMIT}-lookup limit ({lookups}) - PERMERROR",
-                f"{lookups} DNS-querying mechanisms after expanding includes",
+                counted,
                 "receivers return PERMERROR and DMARC fails on SPF for every message: remove or flatten includes now, authenticate senders with DKIM")
+        if spf_failed:
+            add("SPF-007", "major", "spf",
+                f"SPF lookup count incomplete - {spf_failed} include(s) could not be resolved, {lookups} is a lower bound",
+                "; ".join(f"{owner}: {mech}" for owner, mech in unresolved),
+                f"re-run; {spf_failed} include(s) could not be resolved, so the count is not verified - do not add another SPF sender until every include resolves",
+                verified=False)
         elif lookups == LIMIT:
             add("SPF-005", "major", "spf", f"SPF at the {LIMIT}-lookup limit - no room for another vendor",
-                f"{lookups} DNS-querying mechanisms after expanding includes",
+                counted,
                 "do not add another include; onboard new senders with DKIM and prune includes nobody uses")
         elif lookups == LIMIT - 1:
             add("SPF-006", "minor", "spf", "SPF one include away from the limit - new senders need DKIM",
-                f"{lookups} DNS-querying mechanisms after expanding includes",
+                counted,
                 "plan the next sender on DKIM, not an SPF include")
     else:
         add("SPF-001", "major", "spf", "no SPF record",
@@ -384,19 +405,35 @@ def audit_domain(domain, resolver, extra_selectors=None):
         sel = sel.strip().lower().rstrip(".")
         if sel and sel not in probed:
             probed.append(sel)
-    selectors, dangling = [], []
+    selectors, dangling, unresolved = [], [], []
     for sel in ([] if wildcarded else probed):
         name = f"{sel}._domainkey.{domain}"
         cname = q(name, "CNAME")[0]
-        keyed = any(_is_dkim(t) for t in q(name, "TXT")[0])
+        txts, txt_status = q(name, "TXT")
+        keyed = any(_is_dkim(t) for t in txts)
         if keyed:
             selectors.append(sel)
+        elif txt_status == "error":
+            unresolved.append(sel)  # no answer on any path: absence cannot be claimed
         elif cname:
             dangling.append(sel)  # CNAME exists, target has no key: removed vendor key or takeover bait
     custom = len(probed) - len(COMMON_SELECTORS)
     if wildcarded:
+        dkim_status = "wildcard"
+    elif selectors:
+        dkim_status = "found"
+    elif unresolved:
+        dkim_status = "error"  # nothing found and at least one probe failed: not verified
+    else:
+        dkim_status = "absent"
+    if wildcarded:
         add("DKIM-001", "info", "dkim", "wildcard at _domainkey - selector probing unreliable, verify DKIM from message headers",
             f"{canary} resolved", "read the s= tag from a live DKIM-Signature header and confirm that selector by hand",
+            verified=False)
+    elif dkim_status == "error":
+        add("DKIM-004", "major", "dkim", "DKIM lookup failed - not verified",
+            f"{len(unresolved)} of {len(probed)} selector probes failed on every resolver path: " + ", ".join(unresolved),
+            "re-run from a network with working DNS before concluding anything about DKIM; a _domainkey zone that does not resolve also fails verification at receivers",
             verified=False)
     elif not selectors:
         what = f"none of the {len(probed)} probed DKIM selectors found" if custom else "no common DKIM selector found"
@@ -415,9 +452,11 @@ def audit_domain(domain, resolver, extra_selectors=None):
 
     return {"domain": domain,
             "spf": spf, "spf_status": spf_status, "spf_terminator": terminator, "spf_lookups": lookups,
+            "spf_lookups_failed": spf_failed, "spf_verified": spf_status != "error" and spf_failed == 0,
             "dmarc": txts[0] if txts else None, "dmarc_source": source, "effective_policy": effective,
             "inherited": inherited, "dmarc_status": dmarc_status,
             "dkim_selectors": selectors, "dkim_probed": probed, "dkim_dangling": dangling, "dkim_wildcard": wildcarded,
+            "dkim_status": dkim_status, "dkim_unresolved": unresolved,
             "mx": mx, "mx_null": mx_null, "mx_status": mx_status,
             "flags": [f["title"] for f in findings], "findings": findings, "evidence": evidence}
 
@@ -453,6 +492,9 @@ def print_report(r):
     print(f"=== {r['domain']} ===")
     if r["spf_status"] == "error":
         spf_line = "LOOKUP FAILED - not verified"
+    elif r["spf"] and r.get("spf_lookups_failed"):
+        spf_line = (f"yes, at least {r['spf_lookups']}/{LIMIT} lookups "
+                    f"({r['spf_lookups_failed']} include(s) unresolved - count not verified), {r['spf_terminator']}")
     elif r["spf"]:
         spf_line = f"yes, {r['spf_lookups']}/{LIMIT} lookups, {r['spf_terminator']}"
     else:
@@ -472,6 +514,9 @@ def print_report(r):
 
     if r["dkim_wildcard"]:
         dkim_line = "unknown (wildcard at _domainkey)"
+    elif r.get("dkim_status") == "error":
+        n, m = len(r.get("dkim_unresolved") or []), len(r["dkim_probed"])
+        dkim_line = "LOOKUP FAILED - not verified" + (f" ({n} of {m} selector probes failed)" if n != m else "")
     elif r["dkim_selectors"]:
         dkim_line = ", ".join(r["dkim_selectors"])
     elif len(r["dkim_probed"]) > len(COMMON_SELECTORS):

@@ -9,6 +9,7 @@
 exports/
 audit-output/
 audit-out/
+audit-out-ci/
 *.jsonl
 
 # your domain-edited query copies (keep the shipped templates pristine)
@@ -22,3 +23,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# private per-machine state files (never committed)
+CLAUDE.local.md
+private/

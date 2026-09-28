@@ -7,13 +7,11 @@ Authentication-Results: mail.example.com; spf=fail (sender IP is 203.0.113.20)
  header.s=selector1 header.i=@example.com; dmarc=fail action=oreject header.from=example.com;
  compauth=fail reason=000
 ARC-Seal: i=1; a=rsa-sha256; s=arcselector; d=partner.example; cv=none;
- b=QVJDIFNFQUwgUExBQ0VIT0xERVIgLSBTQU1QTEUgT05MWSAtIE5PVCBBIFJFQUwgU0lHTkFUVVJFIGZvciBk
- bWFyYy1wcm92ZW5hbmNlIHNhbXBsZXMu
+ b=cGxhY2Vob2xkZXItc2lnbmF0dXJlLWJ5dGVz
 ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed; d=partner.example; s=arcselector;
  h=from:to:subject:date:message-id:mime-version:content-type;
  bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=;
- b=QVJDIE1FU1NBR0UgU0lHTkFUVVJFIFBMQUNFSE9MREVSIC0gU0FNUExFIE9OTFkgLSBOT1QgQSBSRUFMIFNJ
- R05BVFVSRS4=
+ b=cGxhY2Vob2xkZXItc2lnbmF0dXJlLWJ5dGVz
 ARC-Authentication-Results: i=1; mx.partner.example; spf=pass (sender IP is 198.51.100.98)
  smtp.mailfrom=example.com; dkim=pass header.d=example.com header.s=selector1;
  dmarc=pass action=none header.from=example.com
@@ -34,8 +32,7 @@ Received: from ZZ1-NAM99-obe.outbound.protection.outlook.com (mail-zz1nam99on000
 DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=selector1;
  h=From:Date:Subject:Message-ID:Content-Type:MIME-Version:X-MS-Exchange-SenderADCheck;
  bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=;
- b=TTM2NSBTSUdOQVRVUkUgUExBQ0VIT0xERVIgLSBTQU1QTEUgT05MWSAtIE5PVCBBIFJFQUwgU0lHTkFUVVJF
- IGZvciBkbWFyYy1wcm92ZW5hbmNlIHNhbXBsZXMuIENhbm5vdCB2ZXJpZnku
+ b=cGxhY2Vob2xkZXItc2lnbmF0dXJlLWJ5dGVz
 From: Example Newsletter <newsletter@example.com>
 To: Bob <bob@partner.example>
 Subject: [TEST] September update

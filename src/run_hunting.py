@@ -31,7 +31,8 @@ HUNT_URL = "https://graph.microsoft.com/v1.0/security/runHuntingQuery"
 ENV_KEYS = ("AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET")
 
 # Resolve from this file, not the cwd, so the script finds the same .env
-# the MCP server does no matter which folder it is launched from.
+# the MCP server does no matter which folder it is launched from. A .env in
+# the current folder is read only when the repo root has none.
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ENV = ROOT / ".env"
 
@@ -43,10 +44,17 @@ def usage_error(msg):
 
 
 def default_env_file():
-    """<repo root>/.env first; ./.env only when the root one is absent."""
+    """<repo root>/.env; ./.env only when the root one is absent and ./.env exists.
+
+    When neither exists this still names <repo root>/.env, so the
+    missing-credentials message points at the file to create.
+    """
     if DEFAULT_ENV.exists():
         return str(DEFAULT_ENV)
-    return ".env"
+    local = Path.cwd() / ".env"
+    if local.exists():
+        return str(local)
+    return str(DEFAULT_ENV)
 
 
 def load_env(path=None):

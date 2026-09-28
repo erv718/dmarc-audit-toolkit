@@ -16,9 +16,7 @@ Received: from MTUwNzQ2 (unknown) by geopod-ismtpd-12 (SG) with HTTP
 DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com;
  h=content-type:from:mime-version:subject:to:cc:content-type:from:subject:to;
  s=sg1; t=1789380931; x=1789985731; bh=frcCV1k9oG9oKj3dpUqdJg1PxRT2RSN/XKdLCPjaYaY=;
- b=Q0xFQU4gU0lHTkFUVVJFIFBMQUNFSE9MREVSIC0gTk9UIEEgUkVBTCBLRVkgLSBTQU1QTEUgT05MWSBmb3
- IgZG1hcmMtcHJvdmVuYW5jZSBoZWFkZXJzLnB5IHNtb2tlIHRlc3RzLiBUaGlzIGlzIG5vdCBhIHZhbGlkIHNp
- Z25hdHVyZSBhbmQgY2Fubm90IHZlcmlmeS4=
+ b=cGxhY2Vob2xkZXItc2lnbmF0dXJlLWJ5dGVz
 X-SG-EID: =?us-ascii?Q?u001=2EQjTz8xL1c4pHbnL0F8vRkz9Yw2XmA7pLq3vBn0cTe6Rg1?=
 X-Entity-ID: sample-entity-01
 From: Example Notifications <notify@example.com>

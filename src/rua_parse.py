@@ -19,8 +19,22 @@ What it answers
 
 Input: files or directories (recursed). Files may be .xml, .xml.gz, .gz or
 .zip; the format is sniffed, so a mislabeled file still parses. A malformed
-file is skipped with a warning, never a crash, and decompression is capped at
-50 MB per file. Relative paths resolve from the repo root, not the cwd.
+file or archive member is skipped with a warning, never a crash, and
+decompression is capped at 50 MB per file: the declared size is checked
+before anything is inflated, and the cap stops the read at the first byte
+over it. Relative paths resolve from the repo root, not the cwd.
+
+Per record: a missing or unparsable <count> is counted as one message with a
+warning (the record exists, so at least one message did), a negative <count>
+rejects the record with a warning, and both are counted in the JSON
+(totals.count_defaulted, totals.records_rejected) and finding OUTSIDE-012.
+source_ip is canonicalised through ipaddress (brackets stripped, IPv6
+compressed, IPv4-mapped unwrapped) so one sender is one source however a
+reporter wrote it; the spellings seen are kept as as_reported.
+
+Library use: analyse() raises RuaInputError for input problems (missing path,
+no report files, bad --since/--until, bad --known); the CLI prints it as
+"error: ..." and exits 2.
 
 Usage
 -----
@@ -68,6 +82,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 AREA = "outside_view"
 MAX_BYTES = 50 * 1024 * 1024        # decompressed cap per file: zip bombs and runaway reports
+CHUNK_BYTES = 1024 * 1024           # inflate in pieces so the cap stops the read, not the heap
+MAX_NUM_CHARS = 24                  # longest <count> or epoch text worth parsing (2^64 is 20 digits)
+MAX_LABEL_CHARS = 100               # archive member names are clipped to this in warnings and findings
 REPORT_SUFFIXES = (".xml", ".gz", ".zip")
 RDNS_TIMEOUT = 3
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocking": 3}
@@ -79,9 +96,28 @@ DOMAIN_RE = re.compile(r"[a-z0-9_-]+(\.[a-z0-9_-]+)*")
 
 # ------------------------------------------------------------------ input
 
+class RuaInputError(Exception):
+    """An input problem the caller has to fix: missing path, no report files,
+    bad --since/--until, bad --known. main() prints it as "error: ..." and
+    exits 2; library callers (audit.py, the MCP server) catch it."""
+
+
 def die(msg):
-    print(f"error: {msg}", file=sys.stderr)
-    sys.exit(2)
+    """Raise RuaInputError(msg). Kept under its old name: every input check
+    calls it, and the CLI turns it into the "error: ..." line and exit 2."""
+    raise RuaInputError(msg)
+
+
+def _clean(text, limit=MAX_LABEL_CHARS):
+    """Text safe to echo in a warning or finding: control characters replaced
+    by '?', clipped to limit with a marker. Used for archive member names and
+    for report values quoted back in a warning."""
+    if text is None:
+        return ""
+    out = "".join("?" if (ord(c) < 32 or ord(c) == 127 or 0x80 <= ord(c) < 0xA0) else c for c in str(text))
+    if len(out) > limit:
+        out = out[:limit] + f"...(+{len(out) - limit} chars)"
+    return out
 
 
 def repo_path(p):
@@ -91,7 +127,7 @@ def repo_path(p):
 
 
 def read_list(path):
-    """One entry per line; blanks and # comments skipped. Exit 2 if unreadable."""
+    """One entry per line; blanks and # comments skipped. RuaInputError if unreadable."""
     try:
         with open(path, encoding="utf-8-sig") as fh:
             return [l.strip() for l in fh if l.strip() and not l.lstrip().startswith("#")]
@@ -100,7 +136,7 @@ def read_list(path):
 
 
 def collect_files(paths):
-    """Report files under the given paths; directories are recursed. Exit 2 on a missing path."""
+    """Report files under the given paths; directories are recursed. RuaInputError on a missing path."""
     files = []
     for p in paths:
         path = repo_path(p)
@@ -114,46 +150,99 @@ def collect_files(paths):
     return files
 
 
+def _mb(n):
+    return f"{n / (1024 * 1024):.0f} MB"
+
+
 def _capped(fh, what=""):
-    data = fh.read(MAX_BYTES + 1)
-    if len(data) > MAX_BYTES:
-        raise ValueError(f"{what}decompressed size over the {MAX_BYTES // (1024 * 1024)} MB cap")
-    return data
+    """Read fh to the end in CHUNK_BYTES pieces, giving up at the first byte
+    over MAX_BYTES so a bomb costs at most cap + one chunk, never twice the cap."""
+    chunks, total = [], 0
+    while True:
+        chunk = fh.read(min(CHUNK_BYTES, MAX_BYTES + 1 - total))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_BYTES:
+            raise ValueError(f"{what}decompressed size over the {_mb(MAX_BYTES)} cap")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
-def read_payloads(path):
+def _gzip_declared_size(tail):
+    """ISIZE from a gzip trailer (last 4 bytes, little-endian, mod 2^32): the
+    size the writer declared, checked before anything is inflated. It cannot
+    overstate a well-formed file, so a value over the cap is a safe reject;
+    the chunked read stays as the backstop for a lying trailer."""
+    return int.from_bytes(tail[-4:], "little") if len(tail) >= 4 else 0
+
+
+def _gunzip_capped(fh, declared, what=""):
+    if declared > MAX_BYTES:
+        raise ValueError(f"{what}declared decompressed size {_mb(declared)} is over the {_mb(MAX_BYTES)} cap, not inflated")
+    return _capped(gzip.GzipFile(fileobj=fh), what)
+
+
+def read_payloads(path, warnings=None):
     """(label, xml_bytes) for every report inside one file.
 
     The container format is sniffed from magic bytes, not trusted from the
     name. A zip may hold several reports; a gzipped member inside it is
-    unpacked too. Raises on anything unreadable; the caller turns that into
-    a warning for this one file."""
+    unpacked too. Sizes are checked against the cap before inflating (zip
+    header, gzip trailer) and the read itself stops at the first byte over it.
+
+    Raises on anything that makes the whole file unreadable; the caller turns
+    that into a warning for this one file. A single bad archive member (over
+    the cap, corrupt, encrypted) is skipped so its siblings still parse: with
+    a warnings list given, a "skipped <label>: <reason>" line is appended per
+    member; with warnings=None the first member problem raises instead."""
     path = Path(path)
     with open(path, "rb") as fh:
         head = fh.read(4)
     if head.startswith(b"PK") and zipfile.is_zipfile(path):
-        out, total = [], 0
+        out, total, members = [], 0, 0
+
+        def skip(label, reason):
+            if warnings is None:
+                raise ValueError(f"{label.split(':', 1)[-1]}: {reason}")
+            warnings.append(f"skipped {label}: {reason}")
+
         with zipfile.ZipFile(path) as zf:
             for info in zf.infolist():
                 if info.is_dir():
                     continue
-                label = f"{path.name}:{info.filename}"
-                with zf.open(info) as member:
-                    data = _capped(member, f"member {info.filename}: ")
-                if data[:2] == b"\x1f\x8b":
-                    data = _capped(gzip.GzipFile(fileobj=io.BytesIO(data)), f"member {info.filename}: ")
+                members += 1
+                name = _clean(info.filename)
+                label = f"{path.name}:{name}"
+                if info.file_size > MAX_BYTES:
+                    skip(label, f"member declares {_mb(info.file_size)} uncompressed, over the {_mb(MAX_BYTES)} cap; not inflated")
+                    continue
+                try:
+                    with zf.open(info) as member:
+                        data = _capped(member, "member: ")
+                    if data[:2] == b"\x1f\x8b":
+                        data = _gunzip_capped(io.BytesIO(data), _gzip_declared_size(data), "gzipped member: ")
+                except Exception as exc:  # bad CRC, truncated, encrypted, over the cap: this member only
+                    skip(label, str(exc) or exc.__class__.__name__)
+                    continue
+                if total + len(data) > MAX_BYTES:
+                    skip(label, f"members would exceed the {_mb(MAX_BYTES)} cap together")
+                    continue
                 total += len(data)
-                if total > MAX_BYTES:
-                    raise ValueError(f"members exceed the {MAX_BYTES // (1024 * 1024)} MB cap together")
                 out.append((label, data))
-        if not out:
+        if not members:
             raise ValueError("empty zip")
         return out
     if head.startswith(b"\x1f\x8b"):
-        with gzip.open(path, "rb") as fh:
-            return [(path.name, _capped(fh))]
+        with open(path, "rb") as fh:
+            fh.seek(0, io.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 4))
+            declared = _gzip_declared_size(fh.read(4)) if size >= 18 else 0
+            fh.seek(0)
+            return [(path.name, _gunzip_capped(fh, declared))]
     if path.stat().st_size > MAX_BYTES:
-        raise ValueError(f"over the {MAX_BYTES // (1024 * 1024)} MB cap")
+        raise ValueError(f"over the {_mb(MAX_BYTES)} cap")
     with open(path, "rb") as fh:
         return [(path.name, fh.read())]
 
@@ -187,13 +276,63 @@ def _text(el, *names, lower=False):
 
 
 def _int(value, default=None):
+    """Integer from report text, or default. Accepts '12.7' style floats
+    (truncated). inf, nan, text longer than MAX_NUM_CHARS (which is where
+    int() starts raising on digit count) or plain junk give default, never
+    a crash."""
+    if value is None:
+        return default
+    txt = str(value).strip()
+    if not txt or len(txt) > MAX_NUM_CHARS:
+        return default
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return default
+        return int(txt)
+    except ValueError:
+        pass
+    try:
+        f = float(txt)
+    except ValueError:
+        return default
+    if f != f or f in (float("inf"), float("-inf")):
+        return default
+    try:
+        return int(f)
+    except (OverflowError, ValueError):
+        return default
+
+
+def _count(row):
+    """(count, warning) for one <row>. RFC 7489 requires <count>; when it is
+    missing or unparsable the record still proves at least one message, so it
+    counts as 1 and says so. A negative count is nonsense that would net out
+    real failures, so the record is rejected: count None."""
+    txt = _text(row, "count")
+    if txt is None:
+        return 1, "no <count>; counted as 1 message"
+    n = _int(txt)
+    if n is None:
+        return 1, f"unparsable <count> '{_clean(txt, 32)}'; counted as 1 message"
+    if n < 0:
+        return None, f"negative <count> {n}; record rejected"
+    return n, None
+
+
+def canon_ip(text):
+    """(canonical, as_reported) for a <source_ip>. Brackets and whitespace
+    stripped, IPv6 compressed and lower-cased, IPv4-mapped IPv6 unwrapped to
+    the IPv4, so one sender is one source however a reporter wrote it. Text
+    that is not an IP is kept lower-cased so it still shows up as a source."""
+    if text is None:
+        return None, None
+    raw = _clean(text.strip(), 64)
+    cand = raw.strip("[]").strip()
+    try:
+        addr = ipaddress.ip_address(cand)
+    except ValueError:
+        return raw.lower() or None, raw
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return str(addr), raw
 
 
 def _find_root(root):
@@ -210,7 +349,12 @@ def _find_root(root):
 
 def parse_report(data, label="report"):
     """One aggregate report as a dict. Tolerates namespaces, missing elements
-    and odd casing; raises ValueError or ET.ParseError on a broken file."""
+    and odd casing; raises ValueError or ET.ParseError on a broken file.
+
+    Record-level problems never raise: rep["warnings"] lists them, a record
+    with a missing or unparsable <count> is kept with count 1 and counted in
+    rep["count_defaulted"], a record with a negative <count> is dropped and
+    counted in rep["records_rejected"]."""
     if b"<!ENTITY" in data or b"<!DOCTYPE" in data:
         raise ValueError("DTD or entity declaration present - not an aggregate report")
     root = _find_root(ET.fromstring(data))
@@ -225,15 +369,28 @@ def parse_report(data, label="report"):
         "end": _int(_text(meta, "date_range", "end")),
         "policy": {k: _text(pol, k, lower=True) for k in ("domain", "adkim", "aspf", "p", "sp", "pct")},
         "records": [],
+        "warnings": [],
+        "count_defaulted": 0,
+        "records_rejected": 0,
     }
-    for rec in _children(root, "record"):
+    for i, rec in enumerate(_children(root, "record"), 1):
         row = _child(rec, "row")
         pe = _child(row, "policy_evaluated")
         ids = _child(rec, "identifiers")
         auth = _child(rec, "auth_results")
+        n, note = _count(row)
+        if note:
+            rep["warnings"].append(f"{label}: record {i}: {note}")
+        if n is None:
+            rep["records_rejected"] += 1
+            continue
+        if note:
+            rep["count_defaulted"] += 1
+        ip, ip_raw = canon_ip(_text(row, "source_ip"))
         rep["records"].append({
-            "source_ip": _text(row, "source_ip", lower=True),
-            "count": _int(_text(row, "count"), 1),
+            "source_ip": ip,
+            "source_ip_raw": ip_raw,
+            "count": n,
             "disposition": _text(pe, "disposition", lower=True),
             "dkim": _text(pe, "dkim", lower=True),
             "spf": _text(pe, "spf", lower=True),
@@ -250,29 +407,40 @@ def parse_report(data, label="report"):
 
 
 def load_reports(files, warnings=None):
-    """Parse every file; a bad file gets a warning line, never a crash.
+    """Parse every file; a bad file or archive member gets a warning line,
+    never a crash, and so does a record with a bad <count>.
 
-    Returns (reports, skipped). warnings, when given, collects the lines."""
+    Returns (reports, skipped): skipped counts files and archive members that
+    yielded no report. warnings, when given, collects every warning line
+    (skips start with "skipped ", record problems with the report label)."""
     reports, skipped = [], 0
+
+    def warn(msg):
+        print(f"warning: {msg}", file=sys.stderr)
+        if warnings is not None:
+            warnings.append(msg)
+
     for path in files:
+        member_warnings = []
         try:
-            payloads = read_payloads(path)
+            payloads = read_payloads(path, member_warnings)
         except Exception as exc:  # zip, gzip, size cap, permissions: all per-file problems
-            msg = f"skipped {path}: {exc}"
-            print(f"warning: {msg}", file=sys.stderr)
-            if warnings is not None:
-                warnings.append(msg)
+            warn(f"skipped {path}: {exc}")
             skipped += 1
             continue
+        for msg in member_warnings:
+            warn(msg)
+            skipped += 1
         for label, data in payloads:
             try:
-                reports.append(parse_report(data, label))
-            except (ET.ParseError, ValueError) as exc:
-                msg = f"skipped {label}: not an aggregate report ({exc})"
-                print(f"warning: {msg}", file=sys.stderr)
-                if warnings is not None:
-                    warnings.append(msg)
+                rep = parse_report(data, label)
+            except (ET.ParseError, ValueError, OverflowError, RecursionError) as exc:
+                warn(f"skipped {label}: not an aggregate report ({_clean(str(exc), 200)})")
                 skipped += 1
+                continue
+            for msg in rep["warnings"]:
+                warn(msg)
+            reports.append(rep)
     return reports, skipped
 
 
@@ -330,7 +498,7 @@ def _new_source():
             "aligned_dkim_failed": 0,
             "header_from": Counter(), "envelope_from": Counter(), "dispositions": Counter(),
             "reasons": Counter(), "dkim": Counter(), "spf": Counter(), "reporters": set(),
-            "begin": None, "end": None}
+            "as_reported": set(), "begin": None, "end": None}
 
 
 def _new_from():
@@ -352,6 +520,7 @@ def aggregate(reports):
     agg = {"reports": len(reports), "records": 0, "messages": 0, "pass": 0, "fail": 0,
            "dispositions": Counter(), "aligned": Counter(), "raw_dkim_pass": 0, "raw_spf_pass": 0,
            "domains": set(), "policies": Counter(), "begin": None, "end": None,
+           "count_defaulted": 0, "records_rejected": 0, "count_warnings": [],
            "sources": defaultdict(_new_source), "header_from": defaultdict(_new_from),
            "reporters": defaultdict(_new_reporter), "selectors": defaultdict(_new_selector)}
     for rep in reports:
@@ -361,6 +530,9 @@ def aggregate(reports):
             agg["domains"].add(dom)
         agg["policies"][(dom, pol.get("p"), pol.get("sp"), pol.get("pct"), pol.get("adkim"), pol.get("aspf"))] += 1
         _span(agg, rep["begin"], rep["end"])
+        agg["count_defaulted"] += rep.get("count_defaulted", 0)
+        agg["records_rejected"] += rep.get("records_rejected", 0)
+        agg["count_warnings"] += rep.get("warnings", [])
         org = rep["org_name"] or "(unknown org)"
         r = agg["reporters"][org]
         r["reports"] += 1
@@ -415,6 +587,8 @@ def aggregate(reports):
             for a in rec["spf_auth"]:
                 s["spf"][(a["domain"], a["scope"], a["result"])] += n
             s["reporters"].add(org)
+            if rec.get("source_ip_raw"):
+                s["as_reported"].add(rec["source_ip_raw"])
             _span(s, rep["begin"], rep["end"])
 
             f = agg["header_from"][hf]
@@ -444,7 +618,8 @@ def parse_known(value):
     if not value:
         return [], []
     path = repo_path(value)
-    raw = read_list(path) if path.is_file() else [value]
+    from_file = path.is_file()
+    raw = read_list(path) if from_file else [value]
     nets, domains = [], []
     for line in raw:
         for e in line.split(","):
@@ -457,6 +632,8 @@ def parse_known(value):
             except ValueError:
                 pass
             if not DOMAIN_RE.fullmatch(e):
+                if not from_file and "," not in value and re.search(r"[\\/]|\.(txt|lst|csv)$", value, re.I):
+                    die(f"--known file not found: {path}")
                 die(f"--known entry is neither an IP prefix nor a domain: {e}")
             domains.append(e)
     return nets, domains
@@ -728,9 +905,17 @@ def build_findings(agg, derived, opts, skipped=0, warnings=()):
 
     if skipped:
         add("OUTSIDE-008", "minor",
-            f"{skipped} file(s) skipped as unreadable or malformed",
-            _sample(list(warnings), lambda w: w, 3),
+            f"{skipped} file(s) or archive member(s) skipped as unreadable, malformed or over the size cap",
+            _sample([w for w in warnings if w.startswith("skipped ")], lambda w: w, 3),
             "a skipped report can hide a sender; re-fetch or inspect the file before trusting the totals")
+
+    if agg["count_defaulted"] or agg["records_rejected"]:
+        add("OUTSIDE-012", "minor",
+            f"{agg['count_defaulted']} record(s) with a missing or unparsable <count> counted as 1 message each; "
+            f"{agg['records_rejected']} record(s) with a negative <count> rejected",
+            _sample(agg["count_warnings"], lambda w: w, 3),
+            "the reporter sent a malformed report; read these totals as a floor and inspect or re-fetch "
+            "the file before quoting a number from it")
 
     if not agg["reports"]:
         add("OUTSIDE-011", "info",
@@ -769,6 +954,7 @@ def _source_doc(ip, s, total, nets, known_given, names):
         "selectors": sorted({f"{d}/{sel}" for (d, sel, _) in s["dkim"] if d or sel}),
         "dispositions": dict(s["dispositions"]), "reasons": dict(s["reasons"]),
         "reporters": sorted(s["reporters"]),
+        "as_reported": sorted(s["as_reported"]),
         "first_seen": _day(s["begin"]), "last_seen": _day(s["end"]),
         "known": ip_known(ip, nets) if known_given else None,
         "rdns": names.get(ip),
@@ -789,7 +975,9 @@ def build_doc(files, reports, agg, derived, findings, opts, skipped, warnings, n
                          "report_id": r["report_id"], "begin": r["begin"], "end": r["end"],
                          "begin_date": _day(r["begin"]), "end_date": _day(r["end"]),
                          "domain": r["policy"].get("domain"), "policy": r["policy"],
-                         "records": len(r["records"]), "messages": sum(x["count"] for x in r["records"])}
+                         "records": len(r["records"]), "messages": sum(x["count"] for x in r["records"]),
+                         "count_defaulted": r.get("count_defaulted", 0),
+                         "records_rejected": r.get("records_rejected", 0)}
                         for r in reports],
         },
         "filters": {"since": opts["since"], "until": opts["until"], "min_volume": opts["min_volume"],
@@ -808,6 +996,9 @@ def build_doc(files, reports, agg, derived, findings, opts, skipped, warnings, n
             "raw": {"dkim_verified_any_domain": agg["raw_dkim_pass"], "spf_pass_any_domain": agg["raw_spf_pass"]},
             "domains": sorted(agg["domains"]), "reporters": [org for org, _ in by_org],
             "begin": agg["begin"], "end": agg["end"], "begin_date": _day(agg["begin"]), "end_date": _day(agg["end"]),
+            "count_defaulted": agg["count_defaulted"], "records_rejected": agg["records_rejected"],
+            "count_note": "count_defaulted records had no usable <count> and were counted as 1 message each; "
+                          "records_rejected had a negative <count> and are not in any total",
         },
         "by_source_ip": [_source_doc(ip, s, total, opts["nets"], opts["known_given"], names) for ip, s in by_ip],
         "by_header_from": [{"domain": d, "apex": org_domain(d) if not d.startswith("(") else None,
@@ -866,6 +1057,9 @@ def print_report(doc, agg, top=20):
     print(f"domains reported on         : {', '.join(t['domains']) or '(none)'}")
     print(f"date range                  : {t['begin_date'] or '?'} .. {t['end_date'] or '?'} (UTC)")
     print(f"messages                    : {t['messages']}")
+    if t.get("count_defaulted") or t.get("records_rejected"):
+        print(f"  count caveat              : {t['count_defaulted']} record(s) without a usable <count> counted as 1 msg; "
+              f"{t['records_rejected']} record(s) with a negative <count> rejected   <-- see OUTSIDE-012")
     print(f"  DMARC pass                : {t['pass']}   ({_pct(t['pass'], t['messages'])})")
     print(f"  DMARC fail                : {t['fail']}")
     print(f"  by disposition            : " + ", ".join(f"{k} {v}" for k, v in t["by_disposition"].items()))
@@ -889,6 +1083,9 @@ def print_report(doc, agg, top=20):
             print(f"  {s['count']:>7} {s['share'] * 100:>5.1f}% {s['pass']:>7} {s['fail']:>7}  {s['source_ip']:<39} {hf}{tag}"
                   + (f"  rdns={s['rdns']}" if s["rdns"] else ""))
             print(f"           {_auth_line(agg['sources'][s['source_ip']])}")
+            forms = s.get("as_reported") or []
+            if forms != [s["source_ip"]]:
+                print(f"           reported as: {', '.join(forms[:4])}" + (f" +{len(forms) - 4} more" if len(forms) > 4 else ""))
         line = _more(ips, top)
         if line:
             print(line)
@@ -1007,7 +1204,11 @@ def in_window(rep, since, until):
 
 def analyse(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, until=None,
             expect_policy=None, retiring=(), use_rdns=False, top=20):
-    """Everything main does short of printing: the --json document. Exit 2 on input errors."""
+    """Everything main does short of printing: the --json document.
+
+    Raises RuaInputError on input problems (missing path, no report files,
+    nothing parsable, bad --since/--until or --known); main() prints that as
+    "error: ..." and exits 2."""
     files = collect_files(paths)
     if not files:
         die("no report files (.xml, .xml.gz, .gz, .zip) found under: " + ", ".join(str(repo_path(p)) for p in paths))
@@ -1078,8 +1279,12 @@ def main():
     if not 0 <= args.fail_threshold <= 1:
         ap.error("--fail-threshold must be between 0 and 1")
 
-    doc, agg = analyse(args.paths, args.known, args.min_volume, args.fail_threshold, args.since, args.until,
-                       args.expect_policy, args.retiring_selector, args.rdns, args.top)
+    try:
+        doc, agg = analyse(args.paths, args.known, args.min_volume, args.fail_threshold, args.since, args.until,
+                           args.expect_policy, args.retiring_selector, args.rdns, args.top)
+    except RuaInputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
     code = doc["exit_code"]
     if args.json:
         print(json.dumps(doc, indent=1))

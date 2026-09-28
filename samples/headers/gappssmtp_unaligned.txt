@@ -16,16 +16,15 @@ DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example-com.20230601.gap
  t=1789391143; x=1789995943; darn=example.com;
  h=to:subject:message-id:date:from:mime-version:from:to:cc:subject:date:message-id:reply-to;
  bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=;
- b=R09PR0xFIERFRkFVTFQgS0VZIFNJR05BVFVSRSBQTEFDRUhPTERFUiAtIFNBTVBMRSBPTkxZIC0gTk9UIEEg
- UkVBTCBTSUdOQVRVUkUgZm9yIGRtYXJjLXByb3ZlbmFuY2Ugc2FtcGxlcy4=
+ b=cGxhY2Vob2xkZXItc2lnbmF0dXJlLWJ5dGVz
 X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=1e100.net; s=20230601;
  t=1789391143; x=1789995943;
  h=to:subject:message-id:date:from:mime-version:x-gm-message-state:from:to:cc:subject:date:message-id:reply-to;
  bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=;
- b=WC1HT09HTEUtREtJTSBQTEFDRUhPTERFUiAtIFNBTVBMRSBPTkxZIC0gTk9UIEEgUkVBTCBTSUdOQVRVUkUu
+ b=cGxhY2Vob2xkZXItc2lnbmF0dXJlLWJ5dGVz
 X-Gm-Message-State: AOJu0YxSAMPLESTATEPLACEHOLDER0000000000000000000000000000
 X-Google-Smtp-Source: AGHT+IESAMPLESOURCEPLACEHOLDER000000000000000000000000000000000
-X-Received: by 2002:a05:6902:1234:b0:000:0000:0000 with SMTP id 000000000000-00000000000000mr0000000zzz.0.1789391143000;
+X-Received: by 2001:db8:6902:1234:b0:0:0:1 with SMTP id 000000000000-00000000000000mr0000000zzz.0.1789391143000;
  Mon, 14 Sep 2026 06:05:43 -0700 (PDT)
 MIME-Version: 1.0
 From: Carol <carol@example.com>

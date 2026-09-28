@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCP server exposing this toolkit's read-only DMARC tools to AI clients.
+r"""MCP server exposing this toolkit's read-only DMARC tools to AI clients.
 
 Nothing here writes to DNS, tenant configuration, or vendor settings - the
 protocol surface IS the permission boundary. The only write any tool can
@@ -8,11 +8,18 @@ is confined to this repo's folder. Credentials for the hunting tool come
 from the repo's .env exactly as they do for run_hunting.py, and never
 transit the conversation.
 
-Register once and the client launches this file on demand:
+Register once and the client launches this file on demand. Give the
+registration the absolute path to your clone: an MCP client starts the
+server from its own working directory, not from this repo, so a relative
+path fails everywhere except inside the repo folder.
 
-  claude mcp add dmarc-audit-toolkit -- python src/mcp_server.py
+  Windows:
+    claude mcp add dmarc-audit-toolkit -- python "C:\path\to\dmarc-audit-toolkit\src\mcp_server.py"
+  macOS / Linux:
+    claude mcp add dmarc-audit-toolkit -- python /path/to/dmarc-audit-toolkit/src/mcp_server.py
 
-Requires: pip install -r requirements-mcp.txt
+Requires: pip install -r requirements-mcp.txt, and AI_ANALYSIS_ENABLED=true
+in the repo's .env or in the environment (see .env.example).
 """
 
 import csv
@@ -141,7 +148,12 @@ def audit_dns(domains: list[str], resolver: str = "8.8.8.8") -> dict:
     """Audit the DNS authentication posture of one or more domains: SPF
     presence/terminator/lookup budget, DMARC policy gaps, common DKIM
     selectors (with wildcard detection), and MX. Returns one report per
-    domain with a `flags` list of findings. Max 25 domains per call."""
+    domain, exactly as dns_audit.py --json emits it: `flags` (finding
+    titles), `findings` (id, severity, evidence, action, verified),
+    `dmarc_source` and `inherited` (which label answered, walk-up to the
+    organisational domain), `effective_policy`, and `evidence` (every
+    lookup with its status). A failed lookup is reported as failed, never
+    as absent. Max 25 domains per call."""
     cleaned = [d.strip().lower().rstrip(".") for d in domains if d.strip()]
     if not cleaned:
         return {"error": "no domains given"}
@@ -149,6 +161,7 @@ def audit_dns(domains: list[str], resolver: str = "8.8.8.8") -> dict:
         return {"error": "more than %d domains in one call - split the list"
                          % MAX_DOMAINS}
     res = _make_resolver(resolver)
+    # each report is dns_audit.audit_domain's dict, passed through untouched
     return {"reports": [dns_audit.audit_domain(d, res) for d in cleaned]}
 
 
@@ -156,26 +169,34 @@ def audit_dns(domains: list[str], resolver: str = "8.8.8.8") -> dict:
 def walk_spf(domain: str, resolver: str = "8.8.8.8") -> dict:
     """Expand a domain's SPF record recursively and count DNS-querying
     mechanisms against the RFC 7208 limit of ten. Use before recommending
-    any new SPF include."""
+    any new SPF include. `status` is found, absent or error and `evidence`
+    names the resolver path that answered; `verified` is false whenever a
+    lookup failed, and `lookups` is then a lower bound. A failed lookup is
+    never reported as "no SPF record"."""
     domain = domain.strip().lower().rstrip(".")
     if not domain:
         return {"error": "no domain given"}
+    if any(c in domain for c in " \t/@"):
+        return {"error": "%r is not a domain name" % domain}
     res = _make_resolver(resolver)
-    record = spf_lookups.get_spf(domain, res)
-    entries = spf_lookups.walk(domain, res)
-    cost = sum(1 for _, _, _, billable in entries if billable)
+    # spf_lookups.analyse is what the CLI renders: get_spf_status for the
+    # record and its status, walk for the mechanisms, classify(status,
+    # cost, failed) for the verdict - so the two surfaces cannot disagree
+    r = spf_lookups.analyse(domain, res)
+    failed = sum(1 for m in r["mechanisms"] if m["mechanism"].startswith("LOOKUP FAILED"))
     return {
-        "domain": domain,
-        "record": record,
-        "lookups": cost,
-        "limit": spf_lookups.LIMIT,
-        "mechanisms": [_clip_row({"depth": d, "owner": o, "mechanism": m,
-                                  "counts": b}) for d, o, m, b in entries],
-        "verdict": ("no SPF record" if record is None
-                    else "OVER LIMIT - SPF returns PERMERROR" if cost > spf_lookups.LIMIT
-                    else "at the limit - no room for another vendor" if cost == spf_lookups.LIMIT
-                    else "one include away from breaking - new senders need DKIM"
-                    if cost == spf_lookups.LIMIT - 1 else "ok"),
+        "domain": r["domain"],
+        "record": r["record"],
+        "status": r["status"],
+        "evidence": r["evidence"],
+        "lookups": r["lookups"],
+        "limit": r["limit"],
+        "failed_lookups": failed,
+        "mechanisms": [_clip_row(m) for m in r["mechanisms"]],
+        "verdict": r["verdict"],
+        "severity": r["severity"],
+        "verified": r["verified"],
+        "exit_code": r["exit_code"],
     }
 
 
@@ -191,38 +212,94 @@ def dedupe_maillog(
     action_column: str = "Delivery action",
     location_column: str = "Latest delivery location",
     subject_column: str = "Subject",
+    envelope_column: str = "Sender mail from domain",
+    vendor_domains: list[str] | None = None,
 ) -> dict:
-    """Collapse a mail-log CSV into logical messages by Message-ID and
-    classify each one. Returns the deduplicated failure count next to the
-    naive count - a message is failing only if NO copy of it passed.
-    Column defaults match a Microsoft 365 Defender 'All email' export."""
+    """Collapse a mail-log CSV into logical messages by Message-ID plus
+    recipient and classify each one. Returns the deduplicated failure count
+    next to the naive count - a message is failing only if NO copy of it
+    passed. Pass auth_column (the DMARC verdict column) to get the two
+    crossings dedupe.py reports: delivered_despite_fail (a local override
+    let a failing message through) and blocked_despite_pass (something
+    other than DMARC caught it); without it 'failure' means never
+    delivered. Every genuine failure carries a likely_* label - a
+    heuristic from the subject and envelope domain, not a verdict;
+    vendor_domains teaches it your vendors' envelope domains. Column
+    defaults match a Microsoft 365 Defender 'All email' export; a
+    misspelled column is an error, never a silent zero."""
     cols = {"msgid": msgid_column, "recipient": recipient_column,
             "sender": sender_column, "domain": domain_column,
             "action": action_column, "location": location_column,
-            "subject": subject_column}
+            "subject": subject_column, "envelope": envelope_column}
+    sender_domain = (sender_domain or "").strip().lower() or None
+    auth_column = (auth_column or "").strip() or None
+    vendors = [v.strip().lower() for v in (vendor_domains or []) if v and v.strip()]
     path = Path(csv_path)
     if not path.is_absolute():
         path = ROOT / path
+    if path.is_dir():
+        return {"error": "%s is a directory, not a CSV file" % csv_path}
     try:
+        header = dedupe_mod.read_header(path)
         rows = list(dedupe_mod.load(str(path), cols))
-    except (OSError, UnicodeDecodeError, csv.Error) as err:
-        return {"error": "cannot read %s: %s" % (csv_path, err)}
-    verdicts = dedupe_mod.classify(rows, cols, sender_domain, auth_column)
-    genuine = [dict(v, msgid=k[0], recipient=k[1]) for k, v in verdicts.items()
-               if v["genuine_failure"]]
-    echoes = sum(1 for v in verdicts.values() if v["echo_present"])
-    naive = len(genuine) + echoes
-    return {
-        "raw_rows": len(rows),
-        "logical_messages": len(verdicts),
-        "genuine_failures": len(genuine),
-        "echo_legs_with_a_pass": echoes,
-        "relayed_only": sum(1 for v in verdicts.values() if v["relayed_only"]),
-        "genuine_failure_details": [_clip_row(g) for g in genuine[:ROW_PREVIEW_CAP]],
-        "detail_truncated": len(genuine) > ROW_PREVIEW_CAP,
+    except UnicodeDecodeError:
+        return {"error": "%s is not UTF-8 (PowerShell may have written UTF-16; "
+                         "re-export or convert it)" % csv_path}
+    except OSError as err:
+        return {"error": "cannot read %s: %s" % (csv_path, err.strerror or err)}
+    except csv.Error as err:
+        return {"error": "cannot parse %s as CSV: %s" % (csv_path, err)}
+
+    # the same column gate audit.py and dedupe.py apply before counting
+    # anything: a typo in a column name dies loudly, it never returns zero
+    missing_req, missing_opt = dedupe_mod.check_columns(header, cols, auth_column, sender_domain)
+    if missing_req:
+        return {"error": "column not found: %s. Available columns: %s"
+                         % (", ".join(missing_req), ", ".join(header) or "(none)")}
+
+    counts = dedupe_mod.count_rows(rows, cols, sender_domain, auth_column)
+    verdicts = dedupe_mod.classify(rows, cols, sender_domain, auth_column, vendors)
+    counts.update(dedupe_mod.summarize(verdicts))
+    findings = dedupe_mod.build_findings(counts, verdicts, auth_column, missing_opt, sender_domain)
+
+    def messages_where(flag):
+        return [dict(v, msgid=k[0], recipient=k[1]) for k, v in verdicts.items() if v[flag]]
+
+    reply = {
+        "source": str(path),
+        "sender_domain": sender_domain,
+        "auth_column": auth_column,
+        "basis": ("auth column %s" % auth_column) if auth_column
+                 else "delivery action only (no auth column)",
+        "raw_rows": counts["raw_rows"],
+        "rows_in_scope": counts["rows_in_scope"],
+        "rows_without_msgid": counts["rows_without_msgid"],
+        "raw_failing_rows": counts["raw_failing_rows"],
+        "logical_messages": counts["logical_messages"],
+        "genuine_failures": counts["genuine_failures"],
+        "echo_legs_with_a_pass": counts["echo_messages"],
+        "relayed_only": counts["relayed_only"],
+        "delivered_despite_fail": counts["delivered_despite_fail"],
+        "blocked_despite_pass": counts["blocked_despite_pass"],
+        "by_likely": counts["by_likely"],
+        "counters": counts,
+        "findings": findings,
+        "summary": {"findings": len(findings),
+                    "actionable": sum(1 for f in findings if f["severity"] in ("major", "blocking")),
+                    "worst": dedupe_mod.worst_severity(findings),
+                    "exit_code": dedupe_mod.exit_code(findings)},
+        # the naive number is the raw failing-row count, exactly what the CLI
+        # prints - an echo message with two failing legs counts twice there
         "note": "counting rows would report %d failures; the true count is %d"
-                % (naive, len(genuine)),
+                % (counts["raw_failing_rows"], counts["genuine_failures"]),
     }
+    if missing_opt:
+        reply["missing_optional_columns"] = missing_opt
+    reply.update(_cap_list(messages_where("genuine_failure"), "genuine_failure_details"))
+    reply["detail_truncated"] = reply["genuine_failure_details_truncated"]
+    reply.update(_cap_list(messages_where("delivered_despite_fail"), "delivered_despite_fail_details"))
+    reply.update(_cap_list(messages_where("blocked_despite_pass"), "blocked_despite_pass_details"))
+    return reply
 
 
 @server.tool()
@@ -459,7 +536,11 @@ def run_audit(
 
 if __name__ == "__main__":
     if not ai_analysis_enabled():
-        sys.exit("AI analysis is off: no tool here runs for an AI client until"
-                 " .env contains AI_ANALYSIS_ENABLED=true (see .env.example)."
-                 " That is a deliberate opt-in, not a bug.")
+        # exit 2 (usage), the same status as a missing MCP SDK: the server
+        # was asked to run without its prerequisite, nothing failed inside it
+        print("AI analysis is off: no tool here runs for an AI client until"
+              " AI_ANALYSIS_ENABLED=true is set in the repo's .env or as an"
+              " environment variable (see .env.example). That is a deliberate"
+              " opt-in, not a bug.", file=sys.stderr)
+        sys.exit(2)
     server.run()

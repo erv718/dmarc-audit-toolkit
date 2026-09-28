@@ -5,5 +5,12 @@
 #
 #   cp .denylist.example .denylist
 #
+# Replace the two placeholders below rather than adding to them: while they
+# stay in your .denylist the scanner flags this example file, which is the
+# reminder that the list has not been edited yet.
+#
+# A tracked line that has to keep a listed term (or a typographic dash) can
+# be allowlisted by ending it with the marker "# publish-ok". The scanner
+# skips that line and reports the skip on stderr, so a bypass is never silent.
 yourcompany.example
 contoso

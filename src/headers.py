@@ -20,8 +20,14 @@ For every file (a raw header block pasted from a mail client, or a full .eml):
 Authentication-Results headers can be injected by a sender, so the receiver's
 own header is the only one worth trusting. Give --authserv-id (the id the
 receiving host writes at the front of its AR header, e.g. example.com or
-mail.protection.outlook.com). Without it the topmost AR is used and the
-report says so.
+mail.protection.outlook.com). The match is exact: a sender can write any id
+it likes, so an AR whose id is a subdomain of --authserv-id
+(host1.mail.example.com for mail.example.com) is trusted only with
+--trust-subdomains, the opt-in for tenants whose filtering hosts write varying
+ids. An AR with no id at all (Microsoft 365 style) counts only when it is the
+topmost AR and the topmost Received hop, the one the receiving side wrote, is
+by the --authserv-id host. Without --authserv-id the topmost AR is used and
+the report says so.
 
 The tool cannot verify a DKIM signature cryptographically: that needs the
 message body and the public key at signing time. It proves that a signature
@@ -31,6 +37,7 @@ Usage:
     python headers.py samples/headers/aligned_dkim_pass.txt --authserv-id mail.example.com
     python headers.py msg1.eml msg2.eml --authserv-id example.com --json
     python headers.py msg.eml --verify-dns
+    python headers.py m365.eml --authserv-id example.com --trust-subdomains
 
 Relative paths resolve from the repo root, not from the current directory.
 
@@ -188,11 +195,25 @@ def _addr_domain(addr):
 
 
 def _address(value):
-    """Bare address from a From/Reply-To style header, or None."""
+    """Bare address from a From/Reply-To style header, or None.
+
+    A display name with an unquoted @ ("ceo@bank.example <alice@example.com>",
+    the impersonation shape) makes parseaddr give up or pick the wrong side,
+    so the address is the last <...> group holding an @, else the last bare
+    token holding one, else whatever parseaddr returns.
+    """
     value = _unfold(value)
     if not value:
         return None
-    _, addr = email.utils.parseaddr(value)
+    angled = [a.strip() for a in re.findall(r"<([^<>]*)>", value) if "@" in a]
+    if angled:
+        addr = angled[-1]
+    else:
+        _, addr = email.utils.parseaddr(value)
+        if "@" not in addr:
+            bare = [t.strip("<>,;()\"'") for t in value.split()]
+            bare = [t for t in bare if "@" in t]
+            addr = bare[-1] if bare else addr
     return addr.strip().lower() or None
 
 
@@ -208,7 +229,7 @@ def aligned(domain, from_domain, strict=False):
     """DKIM/SPF identifier alignment to the From domain (RFC 7489 section 3.1)."""
     if not domain or not from_domain:
         return False
-    domain, from_domain = domain.lower(), from_domain.lower()
+    domain, from_domain = domain.lower().rstrip("."), from_domain.lower().rstrip(".")
     if strict:
         return domain == from_domain
     return org_domain(domain) == org_domain(from_domain)
@@ -223,27 +244,33 @@ def read_headers(path):
     return parse_headers(text)
 
 
+_HEADER_LINE = re.compile(r"^[!-9;-~]+:")  # "Name:" - a field name is printable ASCII minus the colon
+
+
 def parse_headers(text):
-    """Message (headers only) from raw text. Tolerates a leading mbox From line and blank lines."""
+    """Message (headers only) from raw text. Tolerates a leading mbox From line.
+
+    A full message is cut at the first blank line, the header/body separator,
+    so nothing written in the body can pose as a header. A pasted header block
+    has no body, and mail clients paste those with stray blank lines inside
+    folded values, so there the blank lines are dropped instead. The two are
+    told apart by what follows the first blank line: a body has at least one
+    line that is neither a "Name:" line nor a folded continuation.
+    """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = text.split("\n")
     while lines and not lines[0].strip():
         lines.pop(0)
     if lines and lines[0].startswith("From ") and ":" not in lines[0].split(" ", 1)[0]:
         lines.pop(0)
-    # Mail clients paste headers with a bare "  " continuation or a stray blank
-    # line inside a folded value; only a blank line followed by a non-header
-    # line really starts the body, so drop blank lines that sit between headers.
-    cleaned = []
-    for i, line in enumerate(lines):
-        if not line.strip():
-            rest = [l for l in lines[i + 1:] if l.strip()]
-            if rest and re.match(r"^[!-9;-~]+:", rest[0]):
-                continue  # blank inside the header block
-            cleaned.extend(lines[i:])
-            break
-        cleaned.append(line)
-    return Parser(policy=policy.compat32).parsestr("\n".join(cleaned), headersonly=True)
+    blank = next((i for i, line in enumerate(lines) if not line.strip()), None)
+    if blank is not None:
+        rest = [line for line in lines[blank + 1:] if line.strip()]
+        if any(not _HEADER_LINE.match(line) and not line[0].isspace() for line in rest):
+            lines = lines[:blank]  # a body follows: the blank line is the separator
+        else:
+            lines = lines[:blank] + rest  # pasted header block: stray blanks between headers
+    return Parser(policy=policy.compat32).parsestr("\n".join(lines), headersonly=True)
 
 
 def header_all(msg, name):
@@ -312,11 +339,11 @@ def ar_verdicts(ar):
             mf = p.get("smtp.mailfrom") or p.get("smtp.helo")
             out["spf"] = {"result": m["result"], "smtp_mailfrom": mf, "domain": _addr_domain(mf)}
         elif method == "dkim":
-            d = (p.get("header.d") or "").lower()
+            d = (p.get("header.d") or "").lower().rstrip(".")
             out["dkim"].append({"result": m["result"], "d": d if d and d != "none" else None,
                                 "s": p.get("header.s"), "i": p.get("header.i")})
         elif method == "dmarc" and out["dmarc"] is None:
-            out["dmarc"] = {"result": m["result"], "header_from": (p.get("header.from") or "").lower() or None,
+            out["dmarc"] = {"result": m["result"], "header_from": (p.get("header.from") or "").lower().rstrip(".") or None,
                             "action": p.get("action"), "policy": p.get("policy") or ar.get("dmarc_policy"),
                             "reason": p.get("reason")}
         elif method == "compauth" and out["compauth"] is None:
@@ -336,35 +363,61 @@ def collect_ar(msg):
 
 
 def _under(host, want):
+    """host is want or a subdomain of it (the --trust-subdomains rule)."""
     host = (host or "").lower().rstrip(".")
     return bool(host) and (host == want or host.endswith("." + want))
 
 
-def choose_ar(ars, authserv_id=None, hops=None):
+def _id_match(host, want, trust_subdomains=False):
+    """Does an authserv-id or a Received 'by' host stand for --authserv-id?
+    Exact match by default; a subdomain only when the caller opted in."""
+    host = (host or "").lower().rstrip(".")
+    return bool(host) and (host == want or (trust_subdomains and _under(host, want)))
+
+
+def choose_ar(ars, authserv_id=None, hops=None, trust_subdomains=False):
     """(ar, trusted, why). Only a plain Authentication-Results whose authserv-id
-    is the one asked for counts as trusted; anything else may have been injected
-    by the sender or copied through a forwarder.
+    is exactly the one asked for counts as trusted; anything else may have been
+    injected by the sender or copied through a forwarder. A sender can write any
+    authserv-id it likes, so one that is merely a subdomain of --authserv-id
+    (host1.mail.example.com for mail.example.com) is trusted only with
+    trust_subdomains, the opt-in for tenants whose filtering hosts write
+    varying ids.
 
     Microsoft 365 writes its AR with no authserv-id at all. That header is
-    accepted only when it is the topmost one and a Received hop was handled by
-    a host under --authserv-id (e.g. mail.protection.outlook.com).
+    accepted only when it is the topmost Authentication-Results and the topmost
+    Received hop (the one the receiving side wrote, the last in transit order)
+    is by the --authserv-id host; any other id-less header is reported
+    untrusted, because a sender can write one just like it.
     """
     plain = [a for a in ars if a["source"] == "Authentication-Results"]
     if authserv_id:
         want = authserv_id.strip().lower().rstrip(".")
         for a in plain:
-            if _under(a["authserv_id"], want):
-                return a, True, f"authserv-id {a['authserv_id']} matched --authserv-id {want}"
-        if plain and not plain[0]["authserv_id"]:
-            by = next((h["by"] for h in (hops or []) if _under((h["by"] or "").strip("[]"), want)), None)
-            if by:
-                return plain[0], True, (f"topmost Authentication-Results carries no authserv-id (Microsoft 365 style);"
-                                        f" accepted because {by} under {want} handled the message")
+            if _id_match(a["authserv_id"], want, trust_subdomains):
+                if a["authserv_id"] == want:
+                    return a, True, f"authserv-id {a['authserv_id']} matched --authserv-id {want}"
+                return a, True, (f"authserv-id {a['authserv_id']} is under --authserv-id {want}"
+                                 f" (accepted by --trust-subdomains)")
         if not plain:
             return None, False, f"no Authentication-Results header at all (expected one from {want})"
         top = plain[0]
+        if not top["authserv_id"]:
+            last = hops[-1] if hops else None
+            by = ((last or {}).get("by") or "").strip("[]")
+            if _id_match(by, want, trust_subdomains):
+                how = "which is " if by.lower().rstrip(".") == want else "under "
+                return top, True, (f"topmost Authentication-Results carries no authserv-id (Microsoft 365 style);"
+                                   f" accepted because the topmost Received hop is by {by}, {how}{want}")
+            return top, False, (f"topmost Authentication-Results carries no authserv-id and the topmost Received hop"
+                                f" is by {by or '?'}, not {want}; a sender can write such a header, so it is unverified")
+        near = [a["authserv_id"] for a in plain if a["authserv_id"] and _under(a["authserv_id"], want)]
+        hint = ""
+        if near and not trust_subdomains:
+            hint = (f"; {', '.join(near)} is under {want} but not equal to it - a sender can write that too,"
+                    f" pass --trust-subdomains only if your receiving hosts really write varying ids")
         return top, False, (f"no Authentication-Results from {want}; using the topmost one"
-                            f" ({top['authserv_id'] or 'no authserv-id'}) unverified")
+                            f" ({top['authserv_id'] or 'no authserv-id'}) unverified{hint}")
     if not plain:
         return None, False, "no Authentication-Results header"
     top = plain[0]
@@ -380,17 +433,22 @@ def parse_dkim_signature(value):
         if "=" in part:
             k, v = part.split("=", 1)
             tags[k.strip().lower()] = re.sub(r"\s+", "", v)
-    return {"d": (tags.get("d") or "").lower() or None, "s": tags.get("s") or None,
+    return {"d": (tags.get("d") or "").lower().rstrip(".") or None, "s": tags.get("s") or None,
             "a": tags.get("a"), "c": tags.get("c"), "i": tags.get("i"),
             "h": [h.lower() for h in (tags.get("h") or "").split(":") if h],
             "bh_present": bool(tags.get("bh")), "b_present": bool(tags.get("b")),
             "t": tags.get("t"), "x": tags.get("x")}
 
 
+def _same_selector(a, b):
+    """Selectors are DNS labels, so case does not matter; a side without one matches."""
+    return not a or not b or a.lower() == b.lower()
+
+
 def match_ar_dkim(sig, ar_dkim):
-    """The receiver's verdict for this signature: same d= (and s= when the AR has one)."""
+    """The receiver's verdict for this signature: same d= (and s= when both have one)."""
     for v in ar_dkim:
-        if v["d"] == sig["d"] and (not v["s"] or not sig["s"] or v["s"] == sig["s"]):
+        if v["d"] == sig["d"] and _same_selector(v["s"], sig["s"]):
             return v["result"]
     return None
 
@@ -586,7 +644,7 @@ def build_findings(r, authserv_id=None):
         if authserv_id:
             add("PROOF-004", "major", f"Authentication-Results is not from {authserv_id} - verdicts below are untrusted",
                 "authserv-ids present: " + ", ".join(seen_ids),
-                "senders can inject this header; use the header as received by the host whose authserv-id you passed, or pass the id that host actually writes",
+                "senders can inject this header; use the header as received by the host whose authserv-id you passed, or pass the id that host actually writes (--trust-subdomains if its hosts write varying ids)",
                 verified=False)
         else:
             add("PROOF-005", "info", "no --authserv-id given: topmost Authentication-Results trusted without verification",
@@ -682,8 +740,9 @@ def build_findings(r, authserv_id=None):
     return findings
 
 
-def analyze(msg, authserv_id=None, strict=False, verify=False, resolver=None, file=None):
-    """Full analysis of one parsed message (headers only). Returns the per-message document."""
+def analyze(msg, authserv_id=None, strict=False, verify=False, resolver=None, file=None, trust_subdomains=False):
+    """Full analysis of one parsed message (headers only). Returns the per-message document.
+    trust_subdomains: also trust an AR whose authserv-id is a subdomain of authserv_id (off by default)."""
     from_addr = _address(header_one(msg, "From"))
     from_domain = _addr_domain(from_addr)
     return_path = _address(header_one(msg, "Return-Path"))
@@ -692,7 +751,7 @@ def analyze(msg, authserv_id=None, strict=False, verify=False, resolver=None, fi
 
     hops = received_chain(msg)
     ars = collect_ar(msg)
-    ar, trusted, why = choose_ar(ars, authserv_id, hops)
+    ar, trusted, why = choose_ar(ars, authserv_id, hops, trust_subdomains)
     v = ar_verdicts(ar)
 
     spf = v["spf"]
@@ -712,7 +771,7 @@ def analyze(msg, authserv_id=None, strict=False, verify=False, resolver=None, fi
         s["ar_result"] = match_ar_dkim(s, v["dkim"])
         sigs.append(s)
     for vd in v["dkim"]:  # receiver verdicts for signatures not in the paste
-        if vd["d"] and vd["result"] != "none" and not any(s["d"] == vd["d"] and (not vd["s"] or not s["s"] or s["s"] == vd["s"]) for s in sigs):
+        if vd["d"] and vd["result"] != "none" and not any(s["d"] == vd["d"] and _same_selector(vd["s"], s["s"]) for s in sigs):
             sigs.append({"d": vd["d"], "s": vd["s"], "a": None, "c": None, "i": vd["i"], "h": [],
                          "bh_present": False, "b_present": False, "t": None, "x": None,
                          "header_present": False,
@@ -734,6 +793,8 @@ def analyze(msg, authserv_id=None, strict=False, verify=False, resolver=None, fi
          "to": header_one(msg, "To"), "message_id": header_one(msg, "Message-ID"),
          "date": header_one(msg, "Date"),
          "authserv_id_used": ar["authserv_id"] if ar else None,
+         "authserv_id_expected": (authserv_id.strip().lower().rstrip(".") or None) if authserv_id else None,
+         "trust_subdomains": bool(trust_subdomains),
          "ar_trusted": trusted, "ar_reason": why, "ar_header_count": sum(1 for a in ars if a["source"] == "Authentication-Results"),
          "ar_headers": ars, "_ar": ar, "ar_dkim": v["dkim"],
          "spf": spf, "dkim_signatures": sigs, "dmarc": v["dmarc"], "compauth": v["compauth"], "arc": v["arc"],
@@ -831,6 +892,10 @@ def main():
     ap.add_argument("files", nargs="+", help="raw header blocks or .eml files (relative paths resolve from the repo root)")
     ap.add_argument("--authserv-id", help="authserv-id your receiving host writes into Authentication-Results, "
                                           "e.g. example.com or mail.protection.outlook.com; without it the topmost header is trusted unverified")
+    ap.add_argument("--trust-subdomains", action="store_true",
+                    help="also trust an Authentication-Results whose authserv-id (or, for an id-less Microsoft 365 header, "
+                         "the topmost Received host) is a subdomain of --authserv-id; off by default because a sender can "
+                         "write any id it likes, so use it only when your filtering hosts really write varying ids")
     ap.add_argument("--strict", action="store_true", help="require strict alignment (adkim=s / aspf=s) when deciding what DMARC would pass on")
     ap.add_argument("--verify-dns", action="store_true", help="look up each signature's selector TXT to show the key exists (existence only, no crypto)")
     ap.add_argument("--resolver", default="8.8.8.8", help="port-53 resolver for --verify-dns; DNS-over-HTTPS is the fallback")
@@ -839,6 +904,8 @@ def main():
 
     if args.verify_dns and dns_audit is None:
         die("--verify-dns needs dns_audit.py next to this script")
+    if args.trust_subdomains and not args.authserv_id:
+        die("--trust-subdomains needs --authserv-id")
     resolver = make_resolver(args.resolver) if args.verify_dns else None
     if not args.authserv_id:
         print("warning: no --authserv-id; the topmost Authentication-Results is trusted unverified "
@@ -853,7 +920,8 @@ def main():
             die(f"cannot read {path}: {exc.strerror or exc}")
         if not msg.keys():
             die(f"{path}: no headers found (expected a raw header block or a .eml file)")
-        r = analyze(msg, args.authserv_id, args.strict, args.verify_dns, resolver, file=str(path))
+        r = analyze(msg, args.authserv_id, args.strict, args.verify_dns, resolver, file=str(path),
+                    trust_subdomains=args.trust_subdomains)
         if args.authserv_id and not r["ar_trusted"]:
             print(f"warning: {path}: {r['ar_reason']}", file=sys.stderr)
         results.append(r)
