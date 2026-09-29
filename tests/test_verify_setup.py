@@ -152,3 +152,61 @@ def test_print_report_renders_without_color(capsys):
     out = capsys.readouterr().out
     assert "setup: OK - with warnings worth fixing (1 passed, 1 warnings, 0 failed)" in out
     assert "fix: remove it" in out and "\033[" not in out
+
+
+class _FakeResp:
+    def __init__(self, payload=b"{}"):
+        self.payload = payload
+
+    def read(self, *args):
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_get_retries_a_dropped_stream(monkeypatch):
+    import http.client
+    import time
+    import urllib.request
+    calls = {"n": 0}
+
+    def flaky(req, timeout=60):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise http.client.IncompleteRead(b"")
+        return _FakeResp(b'{"ok": true}')
+    monkeypatch.setattr(urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    assert graph_client.get("tok", "/servicePrincipals") == {"ok": True}
+    assert calls["n"] == 2
+
+
+def test_get_wraps_a_persistent_drop(monkeypatch):
+    import http.client
+    import time
+    import urllib.request
+
+    import pytest
+
+    def always_fail(req, timeout=60):
+        raise http.client.IncompleteRead(b"")
+    monkeypatch.setattr(urllib.request, "urlopen", always_fail)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    with pytest.raises(graph_client.GraphError):
+        graph_client.get("tok", "/servicePrincipals")
+
+
+def test_sp_grants_survives_a_failed_catalog(monkeypatch):
+    def fake_get(tok, url, params=None, **kw):
+        if url == "/servicePrincipals":
+            return {"value": [{"id": "sp-1"}]}
+        if url.endswith("/appRoleAssignments"):
+            return {"value": [{"resourceId": "graph", "appRoleId": "12345678-abcd",
+                               "createdDateTime": "2026-06-10T00:00:00Z"}]}
+        raise graph_client.GraphError("request did not complete: IncompleteRead")
+    monkeypatch.setattr(graph_client, "get", fake_get)
+    assert vs.sp_grants("tok", "client-id") == [("role id 12345678", "2026-06-10")]

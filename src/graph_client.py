@@ -11,8 +11,10 @@ AZURE_CLIENT_SECRET) exactly as run_hunting.py reads them.
 """
 
 import base64
+import http.client
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,28 +71,42 @@ def roles(tok):
     return sorted(jwt_claims(tok).get("roles", []) or [])
 
 
-def get(tok, url, params=None):
-    """GET a Graph URL (absolute, or a path under GRAPH). Returns JSON."""
+TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+
+
+def get(tok, url, params=None, retries=1):
+    """GET a Graph URL (absolute, or a path under GRAPH). Returns JSON.
+
+    A dropped stream (IncompleteRead), a timeout, or a 429/5xx gets one
+    retry before becoming a GraphError: some catalog reads are large and a
+    flaky moment must not take the whole run down."""
     if not url.startswith("http"):
         url = GRAPH + "/" + url.lstrip("/")
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok,
-                                               "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as err:
-        detail = ""
+    for attempt in range(retries + 1):
+        if attempt:
+            time.sleep(2)
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok,
+                                                   "Accept": "application/json"})
         try:
-            detail = json.loads(err.read()).get("error", {}).get("message", "")
-        except Exception:
-            pass
-        detail = "".join(ch for ch in str(detail) if ch >= " ")[:300]
-        raise GraphError("HTTP %d on %s: %s" % (err.code, url.split("?")[0], detail), err.code)
-    except (OSError, json.JSONDecodeError) as err:
-        raise GraphError("request did not complete: %s"
-                         % getattr(err, "reason", err.__class__.__name__))
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as err:
+            detail = ""
+            try:
+                detail = json.loads(err.read()).get("error", {}).get("message", "")
+            except Exception:
+                pass
+            detail = "".join(ch for ch in str(detail) if ch >= " ")[:300]
+            if err.code in TRANSIENT_STATUS and attempt < retries:
+                continue
+            raise GraphError("HTTP %d on %s: %s" % (err.code, url.split("?")[0], detail), err.code)
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as err:
+            if attempt < retries:
+                continue
+            raise GraphError("request did not complete: %s"
+                             % getattr(err, "reason", err.__class__.__name__))
 
 
 def get_all(tok, url, params=None):

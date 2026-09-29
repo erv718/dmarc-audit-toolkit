@@ -121,10 +121,16 @@ def sp_grants(tok, client_id):
     for a in assignments:
         rid = a.get("resourceId")
         if rid not in names_by_resource:
-            res = graph_client.get(tok, "/servicePrincipals/%s" % rid,
-                                   params={"$select": "appRoles"})
-            names_by_resource[rid] = {r["id"]: r.get("value") for r in res.get("appRoles") or []}
-        name = names_by_resource[rid].get(a.get("appRoleId")) or str(a.get("appRoleId"))
+            try:
+                res = graph_client.get(tok, "/servicePrincipals/%s" % rid,
+                                       params={"$select": "appRoles"})
+                names_by_resource[rid] = {r["id"]: r.get("value") for r in res.get("appRoles") or []}
+            except graph_client.GraphError:
+                # one unreadable catalog (the big first-party ones are heavy)
+                # must not hide the rest of the grants
+                names_by_resource[rid] = {}
+        name = (names_by_resource[rid].get(a.get("appRoleId"))
+                or "role id %s" % str(a.get("appRoleId"))[:8])
         grants.append((name, (a.get("createdDateTime") or "?")[:10]))
     return sorted(grants)
 
