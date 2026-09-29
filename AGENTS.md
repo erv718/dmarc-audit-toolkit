@@ -142,3 +142,7 @@ Starter tasks, in order:
 - Draft DNS changes as diffs with a rollback line and TTL noted
 - Draft tickets and vendor messages; the human sends them
 - A clear "verified" vs "assumed" split in every status summary
+- For the stakeholder-facing next-steps document: fill
+  `docs/templates/next-steps.md` from `audit-out/latest/report.json`,
+  `plan.md`, and `metrics.md`. Every number must come from those files;
+  never from raw row counts, never invented.
