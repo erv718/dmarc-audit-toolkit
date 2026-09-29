@@ -20,8 +20,8 @@ you enforce DMARC:
     attacker can spoof straight past the rule.
   - Which rules had zero hits in the window? Dead rules are free cleanup.
 
-Requires an interactive Exchange Online session:
-    Connect-ExchangeOnline -UserPrincipalName you@yourdomain.example
+Connects app-only via .env (EXO_CERT_THUMBPRINT, EXO_ORGANIZATION; setup in
+docs/app-registration.md) or falls back to interactive browser sign-in:
     ./audit_rules.ps1 -Days 10 -ExportPath ./rule-audit
     ./audit_rules.ps1 -Json -SkipHits > rules.json
 
@@ -43,7 +43,11 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
-if (-not (Get-Command Get-TransportRule -ErrorAction SilentlyContinue)) {
+$exoHelper = Join-Path $PSScriptRoot 'ToolkitExo.ps1'
+if (Test-Path $exoHelper) { . $exoHelper }
+if (Get-Command Connect-ToolkitExo -ErrorAction SilentlyContinue) {
+    if (-not (Connect-ToolkitExo)) { exit 2 }
+} elseif (-not (Get-Command Get-TransportRule -ErrorAction SilentlyContinue)) {
     Write-Host "Not connected. Run Connect-ExchangeOnline first (read-only cmdlets only are used)"
     exit 2
 }

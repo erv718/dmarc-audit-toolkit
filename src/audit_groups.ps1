@@ -33,8 +33,8 @@ licence or role is reported as a not-verified finding instead of aborting
 the run. Membership is read per group; -SkipMembers skips that for a fast
 first pass.
 
-Requires an interactive Exchange Online session:
-    Connect-ExchangeOnline -UserPrincipalName you@yourdomain.example
+Connects app-only via .env (EXO_CERT_THUMBPRINT, EXO_ORGANIZATION; setup in
+docs/app-registration.md) or falls back to interactive browser sign-in:
     ./audit_groups.ps1 -ExportPath ./group-audit
     ./audit_groups.ps1 -IncludeInboxRules -Json > groups.json
 
@@ -56,7 +56,11 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
-if (-not (Get-Command Get-DistributionGroup -ErrorAction SilentlyContinue)) {
+$exoHelper = Join-Path $PSScriptRoot 'ToolkitExo.ps1'
+if (Test-Path $exoHelper) { . $exoHelper }
+if (Get-Command Connect-ToolkitExo -ErrorAction SilentlyContinue) {
+    if (-not (Connect-ToolkitExo)) { exit 2 }
+} elseif (-not (Get-Command Get-DistributionGroup -ErrorAction SilentlyContinue)) {
     Write-Host "Not connected. Run Connect-ExchangeOnline first (read-only cmdlets only are used)"
     exit 2
 }

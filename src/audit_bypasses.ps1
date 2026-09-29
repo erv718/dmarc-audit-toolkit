@@ -33,8 +33,8 @@ Every section is wrapped in try/catch: a cmdlet that is missing from your
 licence or role is reported as a not-verified finding instead of aborting
 the run.
 
-Requires an interactive Exchange Online session:
-    Connect-ExchangeOnline -UserPrincipalName you@yourdomain.example
+Connects app-only via .env (EXO_CERT_THUMBPRINT, EXO_ORGANIZATION; setup in
+docs/app-registration.md) or falls back to interactive browser sign-in:
     ./audit_bypasses.ps1 -ExportPath ./bypass-audit
     ./audit_bypasses.ps1 -Json > bypasses.json
 
@@ -54,7 +54,11 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
-if (-not (Get-Command Get-AcceptedDomain -ErrorAction SilentlyContinue)) {
+$exoHelper = Join-Path $PSScriptRoot 'ToolkitExo.ps1'
+if (Test-Path $exoHelper) { . $exoHelper }
+if (Get-Command Connect-ToolkitExo -ErrorAction SilentlyContinue) {
+    if (-not (Connect-ToolkitExo)) { exit 2 }
+} elseif (-not (Get-Command Get-AcceptedDomain -ErrorAction SilentlyContinue)) {
     Write-Host "Not connected. Run Connect-ExchangeOnline first (read-only cmdlets only are used)"
     exit 2
 }
