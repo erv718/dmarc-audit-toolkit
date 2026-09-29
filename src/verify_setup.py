@@ -14,6 +14,8 @@ Checks:
   2. a token can be obtained (tenant id, client id, secret all valid)
   3. roles the token carries: required, recommended, and anything EXTRA
      (a leaked secret can do everything the extras allow, so they are flagged)
+  3b. the consent grants behind those roles, with the date each was granted -
+      the self-proving answer to "the portal says I removed that already"
   4. GET /domains works (Domain.Read.All or Directory.Read.All)
   5. an advanced hunting query works (ThreatHunting.Read.All)
   6. the report mailbox can be read (Mail.Read), when RUA_MAILBOX is set
@@ -39,10 +41,56 @@ MAIL_ROLES = {"Mail.Read": "read the aggregate report mailbox (must be scoped by
               "Mail.ReadBasic.All": "read mailbox metadata (not enough for attachments)"}
 ALLOWED = set(REQUIRED) | set(DOMAIN_ROLES) | set(MAIL_ROLES)
 WRITE_MARKERS = ("ReadWrite", "Write", "Manage", "FullControl", "Send", "Create", "Delete")
+GRANT_READERS = ("Application.Read.All", "Directory.Read.All")
+
+STATUSES = ("PASS", "WARN", "FAIL", "INFO")
 
 
-def check(results, name, status, detail, fix=""):
-    results.append({"check": name, "status": status, "detail": detail, "fix": fix})
+class Paint:
+    """Stdlib ANSI color, on only when the terminal can use it."""
+
+    STATUS_COLOR = {"PASS": "32", "WARN": "33", "FAIL": "31", "INFO": "36"}
+
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+    def _wrap(self, code, text):
+        return "\033[%sm%s\033[0m" % (code, text) if self.enabled else text
+
+    def status(self, status):
+        return self._wrap(self.STATUS_COLOR.get(status, "0") + ";1", status)
+
+    def bold(self, text):
+        return self._wrap("1", text)
+
+    def dim(self, text):
+        return self._wrap("2", text)
+
+
+def color_wanted(stream):
+    """Color unless piped, explicitly disabled (NO_COLOR), or a dumb terminal."""
+    if os.environ.get("NO_COLOR") is not None or os.environ.get("TERM") == "dumb":
+        return False
+    return hasattr(stream, "isatty") and stream.isatty()
+
+
+def enable_windows_ansi():
+    """Ask the Windows console for VT processing; a no-op elsewhere."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+
+
+def check(results, name, status, detail, fix="", lines=None):
+    entry = {"check": name, "status": status, "detail": detail, "fix": fix}
+    if lines:
+        entry["lines"] = lines
+    results.append(entry)
 
 
 def role_review(roles):
@@ -54,6 +102,31 @@ def role_review(roles):
               "extra": sorted(have - ALLOWED),
               "extra_write": sorted(r for r in have - ALLOWED if any(m in r for m in WRITE_MARKERS))}
     return review
+
+
+def sp_grants(tok, client_id):
+    """(role name, granted-on date) per consent grant on the app's service
+    principal. This is the live tenant truth behind the token's role list:
+    a permission 'removed' in the portal still works until its grant here is
+    revoked, and this list shows each grant's birthday."""
+    sps = graph_client.get(tok, "/servicePrincipals", params={
+        "$filter": "appId eq '%s'" % client_id,
+        "$select": "id,appDisplayName"}).get("value") or []
+    if not sps:
+        raise graph_client.GraphError("no service principal found for this client id")
+    assignments = graph_client.get(
+        tok, "/servicePrincipals/%s/appRoleAssignments" % sps[0]["id"]).get("value") or []
+    names_by_resource = {}
+    grants = []
+    for a in assignments:
+        rid = a.get("resourceId")
+        if rid not in names_by_resource:
+            res = graph_client.get(tok, "/servicePrincipals/%s" % rid,
+                                   params={"$select": "appRoles"})
+            names_by_resource[rid] = {r["id"]: r.get("value") for r in res.get("appRoles") or []}
+        name = names_by_resource[rid].get(a.get("appRoleId")) or str(a.get("appRoleId"))
+        grants.append((name, (a.get("createdDateTime") or "?")[:10]))
+    return sorted(grants)
 
 
 def run_checks(env_file=None, expect_denied=None, mailbox=None):
@@ -94,24 +167,41 @@ def run_checks(env_file=None, expect_denied=None, mailbox=None):
               "add %s as an Application permission and grant admin consent"
               % ", ".join(rv["required_missing"]))
     else:
-        check(results, "roles", "PASS", "present: " + ", ".join(roles))
+        check(results, "roles", "PASS",
+              "granted to the app right now, per the token just issued: " + ", ".join(roles))
     if not rv["domain_role"]:
         check(results, "roles: domain list", "WARN", "no Domain.Read.All - discover.py cannot read the tenant's domains",
               "add Domain.Read.All (Application) and grant admin consent; or pass domains on the command line")
     elif rv["domain_role"] == "Directory.Read.All":
         check(results, "roles: domain list", "WARN", "Directory.Read.All present - broader than needed",
               "replace with Domain.Read.All (least privilege)")
+    revoke_hint = ("remove under BOTH App registrations > API permissions and Enterprise applications > "
+                   "Permissions (the grant lives in both places); new tokens drop the role within ~30 minutes")
     if rv["extra_write"]:
         check(results, "roles: excess (write-capable)", "WARN",
               "the app can WRITE through: " + ", ".join(rv["extra_write"]),
-              "this toolkit is read-only; remove these permissions so a leaked secret cannot change anything")
+              "this toolkit is read-only; " + revoke_hint)
     extra_read = [r for r in rv["extra"] if r not in rv["extra_write"]]
     if extra_read:
         check(results, "roles: excess (read)", "WARN", "not needed by this toolkit: " + ", ".join(extra_read),
-              "remove to keep the registration at least privilege")
-    check(results, "roles: note", "PASS",
+              "least privilege: " + revoke_hint)
+    check(results, "roles: note", "INFO",
           "Exchange.ManageAsApp does not appear in a Graph token; check its Exchange role assignment "
           "separately (it should be a view-only role)")
+
+    # 3b. grant provenance
+    if set(roles) & set(GRANT_READERS):
+        try:
+            grants = sp_grants(tok, cred[1])
+            check(results, "roles: grant dates", "INFO",
+                  "%d consent grant(s) on the service principal, live from Graph - "
+                  "a role above works until its grant here is revoked" % len(grants),
+                  lines=["%s  granted %s" % (name, when) for name, when in grants])
+        except graph_client.GraphError as err:
+            check(results, "roles: grant dates", "WARN", "could not enumerate grants: %s" % err)
+    else:
+        check(results, "roles: grant dates", "INFO",
+              "skipped - listing consent grants needs %s (read-only)" % " or ".join(GRANT_READERS))
 
     # 4. domains
     try:
@@ -163,6 +253,28 @@ def run_checks(env_file=None, expect_denied=None, mailbox=None):
     return results
 
 
+def print_report(results, paint):
+    print(paint.bold("dmarc-audit-toolkit - setup verification"))
+    print(paint.dim("read-only checks; no token or secret is ever printed"))
+    print()
+    for r in results:
+        tag = paint.status(r["status"]) + " " * max(0, 5 - len(r["status"]))
+        print("%s %-28s %s" % (tag, r["check"], r["detail"]))
+        for line in r.get("lines", []):
+            print(paint.dim("      %s" % line))
+        if r["fix"] and r["status"] not in ("PASS", "INFO"):
+            print(paint.dim("      fix: %s" % r["fix"]))
+    counts = {s: sum(1 for r in results if r["status"] == s) for s in STATUSES}
+    failed = counts["FAIL"]
+    print()
+    verdict = "FAILED - fix the items above" if failed else (
+        "OK" if not counts["WARN"] else "OK - with warnings worth fixing")
+    tail = "%d passed, %d warnings, %d failed" % (counts["PASS"], counts["WARN"], failed)
+    banner = "setup: %s (%s)" % (verdict, tail)
+    color = "31;1" if failed else ("33;1" if counts["WARN"] else "32;1")
+    print(paint._wrap(color, banner))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Prove the app registration works and is not over-permissioned.")
     ap.add_argument("--env-file", help="credentials file (default: <repo root>/.env)")
@@ -176,12 +288,8 @@ def main():
     if args.json:
         print(json.dumps({"results": results, "ok": not failed}, indent=1))
     else:
-        for r in results:
-            print("%-5s %-28s %s" % (r["status"], r["check"], r["detail"]))
-            if r["fix"] and r["status"] != "PASS":
-                print("      fix: %s" % r["fix"])
-        print()
-        print("setup: %s" % ("FAILED - fix the items above" if failed else "OK"))
+        enable_windows_ansi()
+        print_report(results, Paint(color_wanted(sys.stdout)))
     sys.exit(1 if failed else 0)
 
 

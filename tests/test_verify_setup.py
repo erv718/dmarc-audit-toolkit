@@ -84,3 +84,71 @@ def test_jwt_claims_decodes_roles_without_verifying():
     tok = "eyJhbGciOiJub25lIn0." + payload + ".sig"
     assert graph_client.roles(tok) == ["Mail.Read", "ThreatHunting.Read.All"]
     assert graph_client.roles("not-a-jwt") == []
+
+
+def test_paint_wraps_only_when_enabled():
+    assert "\033[" in vs.Paint(True).status("PASS")
+    assert vs.Paint(False).status("PASS") == "PASS"
+    assert vs.Paint(False).dim("fix") == "fix"
+
+
+def test_color_wanted_honors_no_color(monkeypatch):
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+    class Tty:
+        def isatty(self):
+            return True
+    assert vs.color_wanted(Tty()) is False
+    monkeypatch.delenv("NO_COLOR")
+    assert vs.color_wanted(Tty()) is True
+    monkeypatch.setenv("TERM", "dumb")
+    assert vs.color_wanted(Tty()) is False
+    assert vs.color_wanted(object()) is False
+
+
+def test_grant_dates_skipped_without_directory_roles():
+    res = []
+    vs.check(res, "roles: grant dates", "INFO",
+             "skipped - listing consent grants needs Application.Read.All or Directory.Read.All (read-only)")
+    assert res[0]["status"] == "INFO" and "lines" not in res[0]
+
+
+def test_grant_dates_listed_with_dates(monkeypatch):
+    monkeypatch.setattr(graph_client, "creds", lambda env_file=None: ("t", "client-id", "s"))
+    monkeypatch.setattr(graph_client, "token", lambda cred: "tok")
+    monkeypatch.setattr(graph_client, "roles", lambda tok: [
+        "ThreatHunting.Read.All", "Directory.Read.All", "Mail.Read", "eDiscovery.ReadWrite.All"])
+    monkeypatch.setattr(graph_client, "list_domains", lambda tok: [])
+    monkeypatch.setattr(graph_client, "hunting", lambda tok, kql, ts=None: {"results": [{}]})
+    monkeypatch.setattr(graph_client, "mailbox_messages", lambda tok, mailbox, top=1, select=None: [])
+
+    calls = {"n": 0}
+
+    def fake_get(tok, url, params=None):
+        calls["n"] += 1
+        if url == "/servicePrincipals":
+            return {"value": [{"id": "sp-1"}]}
+        if url.endswith("/appRoleAssignments"):
+            return {"value": [{"resourceId": "graph", "appRoleId": "role-9",
+                               "createdDateTime": "2026-06-10T15:04:05Z"}]}
+        if url == "/servicePrincipals/graph":
+            return {"appRoles": [{"id": "role-9", "value": "eDiscovery.ReadWrite.All"}]}
+        raise AssertionError("unexpected url " + url)
+    monkeypatch.setattr(graph_client, "get", fake_get)
+
+    res = vs.run_checks(mailbox=None)
+    by = {r["check"]: r for r in res}
+    gd = by["roles: grant dates"]
+    assert gd["status"] == "INFO"
+    assert gd["lines"] == ["eDiscovery.ReadWrite.All  granted 2026-06-10"]
+
+
+def test_print_report_renders_without_color(capsys):
+    res = []
+    vs.check(res, "credentials", "PASS", "present")
+    vs.check(res, "roles: excess (read)", "WARN", "extra", "remove it", lines=["AuditLog.Read.All  granted 2026-06-10"])
+    vs.print_report(res, vs.Paint(False))
+    out = capsys.readouterr().out
+    assert "setup: OK - with warnings worth fixing (1 passed, 1 warnings, 0 failed)" in out
+    assert "fix: remove it" in out and "\033[" not in out
