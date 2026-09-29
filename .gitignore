@@ -3,6 +3,13 @@
 *.env
 !.env.example
 
+# key material never crosses into the repo (certs are uploaded to the portal
+# as .cer by hand; the private halves stay on the machine that made them)
+*.key
+*.pfx
+*.pem
+*.p12
+
 # tenant and customer data
 *.csv
 !samples/*.csv
