@@ -47,12 +47,20 @@ def finding_keys(report):
 
 
 def rua_sources(report):
+    """Sending sources by IP from the outside view (rua_parse's by_source_ip)."""
     rua = report.get("rua") or {}
     out = {}
-    for s in rua.get("sources") or rua.get("by_source_ip") or []:
+    for s in rua.get("by_source_ip") or []:
         if isinstance(s, dict) and s.get("source_ip"):
             out[s["source_ip"]] = s
     return out
+
+
+def sender_label(u):
+    """A short name for an unknown-sender entry, whatever its shape."""
+    if isinstance(u, dict):
+        return u.get("source_ip") or (" ".join(str(u.get(k)) for k in ("kind", "value") if u.get(k)) or "?")
+    return str(u)
 
 
 def summarize(report, previous=None, plan=None):
@@ -88,7 +96,7 @@ def summarize(report, previous=None, plan=None):
         unk = rua.get("unknown_senders") or []
         if unk:
             lines.append("- unknown senders in reports: %d (top: %s)"
-                         % (len(unk), ", ".join(str(u.get("source_ip", u)) if isinstance(u, dict) else str(u) for u in unk[:3])))
+                         % (len(unk), ", ".join(sender_label(u) for u in unk[:3])))
 
     if previous:
         now_f, prev_f = finding_keys(report), finding_keys(previous)

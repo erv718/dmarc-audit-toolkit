@@ -74,7 +74,10 @@ file only.)
 
 ## The working sequence
 
-Follow `docs/methodology.md`. In short: reporting on before anything changes,
+`src/collect.py` runs the whole sweep and writes `report.md`, `plan.md`, the
+history and the summary; read `latest/report.json` and `latest/plan.json`
+before anything else, and `verify_setup.py` output when a tenant step is
+missing. Then follow `docs/methodology.md`. In short: reporting on before anything changes,
 then sender inventory, then deduplicated failure analysis, then fix senders
 (DKIM preferred - check the SPF lookup budget with `src/spf_lookups.py`
 before adding any include), then ratchet policy with a deduplicated gate check

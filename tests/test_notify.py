@@ -19,8 +19,8 @@ def report(policy="quarantine", verdict="no_go", findings=(), failures=21, pass_
         "maillog": {"counters": {"genuine_failures": failures, "raw_failing_rows": failures + 12,
                                  "delivered_despite_fail": 3, "by_likely": {"likely_spoof": 18}}},
         "rua": {"totals": {"messages": 1000, "pass_rate": pass_rate, "by_disposition": {"reject": 300, "quarantine": 6}},
-                "sources": [{"source_ip": ip, "count": 10} for ip in sources],
-                "unknown_senders": [{"source_ip": "203.0.113.5"}]},
+                "by_source_ip": [{"source_ip": ip, "count": 10} for ip in sources],
+                "unknown_senders": [{"kind": "dkim_domain", "value": "vendor.example", "count": 800}]},
     }
 
 

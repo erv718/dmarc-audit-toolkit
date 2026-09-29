@@ -59,6 +59,30 @@ access use the MCP server instead (`pip install -r requirements-mcp.txt`, then
 the registration command below). The AI reads what the tools produced; it
 never touches the tenant itself.
 
+## One command, every week
+
+`collect.py` is the whole audit as a scheduled job. With an app registration
+in `.env` it verifies the registration, reads the tenant's domain list, pulls
+the raw mail log for each organizational domain, pulls new aggregate reports
+out of your report mailbox, runs the audit, writes the rollout plan, keeps a
+dated history with running metrics, and posts a one-message summary to Slack
+or Teams. Without credentials it still runs DNS, the plan, and whatever files
+you hand it.
+
+```bash
+python src/collect.py                       # everything, from the tenant
+python src/collect.py --dry-run             # same, print the summary instead of posting it
+.\scriptsegister_weekly_task.ps1         # Windows: run it every Monday at 06:00
+```
+
+What you get under `audit-out/`: `latest/report.md` (findings and the gate),
+`latest/plan.md` (the records to publish next, grouped by DNS host, with
+rollback), `history/<date>/` for every run, `metrics.md` across runs, and
+`summary.txt` (what changed since last time: new findings, resolved ones,
+policy changes, newly seen senders, spoofing blocked). The plan is
+regenerated from each run, so the enforcement steps appear only when their
+prerequisites are met - one ratchet per domain per week.
+
 ## Quick start
 
 The DNS and file tools need nothing installed but Python (they fall back to
@@ -103,6 +127,11 @@ Counting rows would report 33 failures; the true count is 21.
 | `src/discover.py` | Finds the domains to audit: command line, file, the tenant (Graph), and subdomains seen in mail flow; merges and deduplicates; records each zone's DNS host (Route53, CSC, Cloudflare, ...), which decides how a change gets made. |
 | `src/verify_setup.py` | Proves the app registration: token, required roles, roles in EXCESS (write-capable ones flagged), the domain list, a hunting query, the report mailbox, and that other mailboxes are denied. |
 | `src/graph_client.py` | Shared Microsoft Graph helper (token, paging, domains, hunting, mailbox). Library only. |
+| `src/collect.py` | The weekly job: verify, discover, pull mail log and reports, audit, plan, history and metrics, summary. |
+| `src/plan.py` | report.json in, plan.md out: the exact records to publish per domain, grouped by DNS host, with current value, rollback, priority, and the prerequisites for each enforcement step. |
+| `src/fetch_rua.py` | Pulls aggregate (rua) reports out of your report mailbox by Graph (Mail.Read scoped to that mailbox), with a one-time backfill and delta runs after. |
+| `src/notify.py` | One Slack or Teams message per run: policy and gate per domain, findings, failure counts, what changed since the last run. |
+| `scripts/register_weekly_task.ps1` | Registers (or removes) the Windows scheduled task that runs `collect.py` weekly. |
 | `src/dedupe.py` | Collapses mail-log rows into logical messages by (Message-ID, recipient) and classifies each one. Reports failed-but-delivered and passed-but-blocked separately, and dies loudly on a misspelled column instead of returning a silent zero. |
 | `src/spf_lookups.py` | Recursively expands an SPF record and counts DNS-querying mechanisms against the RFC 7208 limit of ten. Falls back to DNS-over-HTTPS; reports lookup errors as errors, never as "no record". |
 | `src/dns_audit.py` | Multi-domain posture sweep: SPF strength and lookup budget, DMARC policy and subdomain inheritance, DKIM selectors (incl. dangling CNAMEs), MX. One findings list per domain with evidence. |
