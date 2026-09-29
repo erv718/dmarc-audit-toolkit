@@ -45,7 +45,12 @@ step is <action>, and it is ready when <prerequisite>.**
 
 ---
 
-## Filled example (from the bundled sample data - delete this section)
+## Filled example (delete this section)
+
+The counts below come from the bundled samples (`src/audit.py example.com
+--offline --rua samples/rua --maillog samples/sample_maillog.csv`). The policy
+line and the trend line are illustrative: the sample reports publish
+`p=reject`, and a single run has no previous run to compare against.
 
 **example.com is at p=none. 6 senders still fail. The next safe step is
 p=quarantine at pct=10, and it is ready once the 3 misconfigured senders are

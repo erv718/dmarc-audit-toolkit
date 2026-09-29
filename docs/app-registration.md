@@ -60,12 +60,14 @@ python src/verify_setup.py
 python src/verify_setup.py --expect-denied someone.else@example.com
 ```
 
-Every check prints PASS, WARN or FAIL with the exact fix: credentials
-present, token obtained, roles present and roles in **excess**, the domain
-list, a hunting query, the report mailbox, and (with `--expect-denied`) that
-another mailbox is refused, which proves the access policy is in effect.
-Nothing is printed that you could not paste into a ticket: no token, no
-secret.
+Every check prints PASS, WARN, FAIL or INFO with the exact fix: credentials
+present, token obtained, roles present and roles in **excess** (write-capable
+ones called out), the consent grant behind each role with the date it was
+granted, the domain list, a hunting query, the report mailbox, and (with
+`--expect-denied`) that another mailbox is refused, which proves the access
+policy is in effect. A summary line at the end counts passed, warnings and
+failed; the exit code is 1 when anything failed. Nothing is printed that you
+could not paste into a ticket: no token, no secret.
 
 ## Why least privilege, and what to do with an existing registration
 
@@ -136,9 +138,9 @@ is only needed if you put a passphrase on the PFX. A Windows thumbprint is
 shown by `Get-ChildItem Cert:\CurrentUser\My`; on OpenSSL it is
 `openssl x509 -in dmarc-audit-readonly.cer -noout -fingerprint -sha1`.
 
-`EXO_APP_ID` is optional and defaults to `AZURE_CLIENT_ID`. With those set,
-the three scripts connect app-only on their own (via `src/ToolkitExo.ps1`)
-and only offer interactive sign-in when app-only is not configured.
+With those set, the three scripts connect app-only on their own (via
+`src/ToolkitExo.ps1`) and only offer interactive sign-in when app-only is not
+configured.
 Close-out when the project wraps: delete the certificate from the
 registration and remove the role assignment.
 
@@ -168,8 +170,10 @@ python src/dedupe.py maillog.csv --auth-column DMARC
 
 takes you from tenant data to a deduplicated failure count with no portal
 export and no column flags, and `audit.py --maillog maillog.csv` folds the
-same file into the full report. One API call returns at most 100,000 rows;
-if a busy domain hits the cap, narrow the window and run twice.
+same file into the full report. One API call returns at most 100,000 rows.
+`collect.py` notices when a domain lands on that cap and splits the window
+into smaller slices on its own; when you run `run_hunting.py` by hand, narrow
+the window (or split by subdomain) and run it twice.
 
 ## Validation
 

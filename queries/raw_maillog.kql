@@ -12,6 +12,7 @@
 //   Sender address / domain   = From header address and its domain
 //   Delivery action           = Delivered, Junked, Blocked, Replaced
 //   Latest delivery location  = Inbox/folder, Junk, Quarantine, On-premises/external, ...
+//   Subject                   = Subject (personal data, like Recipients; keep the export local)
 //   DMARC / SPF / DKIM        = the receiver-side verdicts on this leg
 //   Sender mail from domain   = SenderMailFromDomain, the MAIL FROM domain (vendor
 //                               fingerprint); dedupe.py --envelope-column defaults to it
@@ -19,7 +20,8 @@
 //   Sender IP, Timestamp, Direction = SenderIPv4, Timestamp, EmailDirection
 // Limits: Advanced Hunting keeps 30 days, so ago(30d) is the maximum window
 // and the API caps a single result set (100,000 rows). If a busy domain hits
-// the cap, narrow the window or split by subdomain and run twice.
+// the cap, narrow the window or split by subdomain and run twice
+// (src/collect.py does the window split on its own).
 let sender_domain = "example.com";                    // apex; subdomains are included, like dedupe.py --sender-domain
 let window_start  = ago(30d);                         // 30d is the retention maximum
 let window_end    = now();

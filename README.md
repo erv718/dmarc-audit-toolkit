@@ -35,7 +35,8 @@ notices until the record breaks.
 
 **1. Audit with no AI.** Python, an optional `.env`, one command. You get
 `report.md` (findings ranked by severity, a go / no-go gate per domain, the
-next policy step) and `report.json`. No AI, no MCP, nothing beyond
+next policy step) and `report.json`, plus `plan.md` with the records to
+publish next whenever live DNS was checked. No AI, no MCP, nothing beyond
 `requirements.txt`.
 
 ```bash
@@ -72,14 +73,14 @@ you hand it.
 ```bash
 python src/collect.py                       # everything, from the tenant
 python src/collect.py --dry-run             # same, print the summary instead of posting it
-.\scriptsegister_weekly_task.ps1         # Windows: run it every Monday at 06:00
+.\scripts\register_weekly_task.ps1         # Windows: run it every Monday at 06:00
 ```
 
 What you get under `audit-out/`: `latest/report.md` (findings and the gate),
 `latest/plan.md` (the records to publish next, grouped by DNS host, with
 rollback), `history/<date>/` for every run, `metrics.md` across runs, and
-`summary.txt` (what changed since last time: new findings, resolved ones,
-policy changes, newly seen senders, spoofing blocked). The plan is
+`latest/summary.txt` (what changed since last time: new findings, resolved
+ones, policy changes, newly seen senders, spoofing blocked). The plan is
 regenerated from each run, so the enforcement steps appear only when their
 prerequisites are met - one ratchet per domain per week.
 
@@ -121,12 +122,14 @@ rows read                   : 93
 logical messages            : 81
   with more than one leg    : 12
   GENUINE failures          : 21   <-- the real number
-  messages with an echo leg : 12   <-- echoes, not failures
+  messages with an echo leg : 12   <-- a failing copy of a message that also passed; not failures
   delivered only via relay  : 6
 
 4 findings, 2 major or blocking
   [major] MAILFLOW-001 21 logical messages failed with no passing copy, from 6 senders
   [major] MAILFLOW-002 3 messages failed authentication but reached a mailbox
+  [minor] MAILFLOW-003 2 messages passed authentication but were blocked or quarantined
+  [info] MAILFLOW-004 heuristic split of the failures: 18 likely_spoof, 3 likely_misconfigured_sender, 0 unknown (heuristic, not verified)
 ```
 
 Counting rows would report 33 failures; the true count is 21.
@@ -135,9 +138,9 @@ Counting rows would report 33 failures; the true count is 21.
 
 | Path | What it does |
 |---|---|
-| `src/audit.py` | The orchestrator: runs the whole sweep (DNS posture, rua reports, mail log, headers) and writes `report.md` + `report.json` with severity-ranked findings and a go / no-go gate verdict for the next policy step. Works `--offline` from saved files. |
+| `src/audit.py` | The orchestrator: runs the whole sweep (DNS posture, rua reports, mail log, headers) and writes `report.md` + `report.json` with severity-ranked findings and a go / no-go gate verdict for the next policy step, plus `plan.md` + `plan.json` when live DNS ran (`--no-plan` skips them). Works `--offline` from saved files. |
 | `src/discover.py` | Finds the domains to audit: command line, file, the tenant (Graph), and subdomains seen in mail flow; merges and deduplicates; records each zone's DNS host (Route53, CSC, Cloudflare, ...), which decides how a change gets made. |
-| `src/verify_setup.py` | Proves the app registration: token, required roles, roles in EXCESS (write-capable ones flagged), the domain list, a hunting query, the report mailbox, and that other mailboxes are denied. |
+| `src/verify_setup.py` | Proves the app registration: token, required roles, roles in EXCESS (write-capable ones flagged), the consent grant and date behind each role, the domain list, a hunting query, the report mailbox, and that other mailboxes are denied. |
 | `src/graph_client.py` | Shared Microsoft Graph helper (token, paging, domains, hunting, mailbox). Library only. |
 | `src/collect.py` | The weekly job: verify, discover, pull mail log and reports, audit, plan, history and metrics, summary. |
 | `src/plan.py` | report.json in, plan.md out: the exact records to publish per domain, grouped by DNS host, with current value, rollback, priority, and the prerequisites for each enforcement step. |

@@ -49,12 +49,15 @@ dashboard numbers.
 
 ## Setup
 
+Opt in first: set `AI_ANALYSIS_ENABLED=true` in `.env`. Without it the MCP
+server refuses to start and `AGENTS.md` tells the agent to stop, so nothing
+AI-facing runs by accident.
+
 Point your agent at this repo and tell it to read `AGENTS.md` first (most
 coding agents load it automatically; Claude Code gets pointed there from
-`CLAUDE.md`). Agents without shell
-access connect through the bundled MCP server instead - see the README's
-AI-agent section; it is one registration command, not something each user
-builds. Fill in the placeholders.
+`CLAUDE.md`). Agents without shell access connect through the bundled MCP
+server instead - see the README's AI-agent section; it is one registration
+command carrying the path to your clone, not something each user builds.
 Set up the read-only app registration (`docs/app-registration.md`) and put
 its credentials in `.env`, kept out of the repo: the agent then pulls fresh
 query results through `src/run_hunting.py` without the secret ever entering

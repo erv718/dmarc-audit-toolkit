@@ -81,9 +81,9 @@ missing. Then follow `docs/methodology.md`. In short: reporting on before anythi
 then sender inventory, then deduplicated failure analysis, then fix senders
 (DKIM preferred - check the SPF lookup budget with `src/spf_lookups.py`
 before adding any include), then ratchet policy with a deduplicated gate check
-at every step, then DKIM-before-reject, always. `src/audit.py` runs the whole
-sweep and ends with the gate verdict; the individual tools are for digging
-into one question at a time.
+at every step, then DKIM-before-reject, always. `src/audit.py` is the same
+sweep run once, on demand, ending with the gate verdict; the individual tools
+are for digging into one question at a time.
 
 ## Analyzing pulled exports
 
@@ -97,7 +97,8 @@ First run for a tenant: prove the plumbing with the validation step in that
 doc before trusting any number the API returns.
 
 Point the queries at your domain by editing the `let sender_domain` line at
-the top of each `.kql` file; the runner warns if `example.com` is still in
+the top of each `.kql` file (`let org_domains` in `impersonation.kql`, which
+takes every domain you own); the runner warns if `example.com` is still in
 there. Keep domain-edited copies in `queries/live/` (gitignored) so the
 shipped templates stay pristine.
 

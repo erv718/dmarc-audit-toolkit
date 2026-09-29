@@ -9,6 +9,8 @@
 // Columns:
 //   lost_time / lost_action / lost_location   = the row that looks like a loss
 //   twin_time / twin_action / twin_location   = the delivered leg, empty if none
+//   lost_dmarc / twin_dmarc, lost_direction / twin_direction
+//               = each leg's DMARC verdict and EmailDirection, to read the hop
 //   gap_seconds = twin_time minus lost_time; negative means the delivered leg
 //                 came first, which is the normal echo shape
 //   verdict     = "echo" (twin within twin_window, not a loss),
