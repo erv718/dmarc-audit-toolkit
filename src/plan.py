@@ -24,7 +24,12 @@ The rules are the methodology, encoded (docs/methodology.md):
                        report can and cannot prove.
   evidence holds       a mail log or aggregate reports showing a legitimate
                        sender still failing holds that domain's next
-                       enforcement step, and says why.
+                       enforcement step, and says why - unless the gate
+                       formally excepted it (audit.toml [[exceptions]]).
+  DKIM before reject   the move to p=reject is held when the run carries no
+                       aligned-DKIM evidence at all, and when senders pass on
+                       SPF alone (aggregate reports, or a mail log with SPF
+                       and DKIM columns).
 
 Nothing here changes DNS. Every change carries the current value and the
 rollback so the human can apply and revert it.
@@ -148,7 +153,9 @@ def org_domain(name):
 def evidence_for(report, domain):
     """What the report proves about this domain's legitimate senders."""
     ev = {"legit_failing": [], "spf_only": [], "has_maillog": False, "has_rua": False,
-          "outbound_seen": None}
+          "outbound_seen": None, "dkim_evidence": False}
+    gate_exc = (report.get("gate") or {}).get("exceptions") or {}
+    excepted_ips = set(gate_exc.get("excepted_streams") or [])
     ml = report.get("maillog") or {}
     if ml:
         ev["has_maillog"] = True
@@ -156,16 +163,30 @@ def evidence_for(report, domain):
         if not scope or domain == scope or domain.endswith("." + scope):
             by = (ml.get("counters") or {}).get("by_likely") or {}
             n = by.get("likely_misconfigured_sender", 0)
+            excepted = gate_exc.get("excepted_maillog_failures") or 0
             if n:
-                ev["legit_failing"].append("%d message(s) in the mail log failed from a sender that looks like your own misconfigured system, not a spoof" % n)
+                ev["legit_failing"].append("%d message(s) in the mail log failed from a sender that looks like your own misconfigured system, not a spoof%s"
+                                           % (n, " (%d failure(s) are excepted in the gate)" % excepted if excepted else ""))
+        if (ml.get("alignment") or {}).get("available"):
+            ev["dkim_evidence"] = True
+        for s in ml.get("spf_only_senders") or []:
+            d = (s.get("domain") or "").lower()
+            if d == domain or d.endswith("." + domain):
+                ev["spf_only"].append("%s (mail log, %d msgs)" % (s.get("sender") or d, s.get("spf_only") or 0))
     rua = report.get("rua") or {}
     if rua:
         ev["has_rua"] = True
+        if (rua.get("totals") or {}).get("messages"):
+            ev["dkim_evidence"] = True
         for s in rua.get("failing_streams") or []:
+            if s.get("source_ip") in excepted_ips:
+                continue
             froms = [h.lower() for h in s.get("header_from") or []]
-            if domain in froms and s.get("likely") == "likely_misconfigured_sender":
-                ev["legit_failing"].append("aggregate reports: %s sends %d message(s) as %s and fails (%s)"
-                                           % (s.get("source_ip"), s.get("count"), domain,
+            # rua_parse labels these likely_misconfigured; older reports said likely_misconfigured_sender.
+            # Anything not labelled a spoof is a sender to fix or except before p= moves (the gate rule).
+            if domain in froms and s.get("likely") != "likely_spoof":
+                ev["legit_failing"].append("aggregate reports: %s sends %d message(s) as %s and fails (%s; %s)"
+                                           % (s.get("source_ip"), s.get("count"), domain, s.get("likely") or "unlabelled",
                                               "; ".join(s.get("likely_signals") or [])[:120]))
         for s in rua.get("spf_only_senders") or []:
             froms = [h.lower() for h in (s.get("header_from") or [])] if isinstance(s, dict) else []
@@ -272,14 +293,17 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
 
     # --- the ratchet, one step at a time ----------------------------------------
     hold_reasons = list(ev["legit_failing"])
+    pct = int(tags.get("pct", "100") or 100) if tags.get("pct", "100").isdigit() else 100
     if ev["spf_only"] and policy in ("quarantine",):
-        hold_reasons.append("SPF-only aligned senders in the aggregate reports (%s): they break on forwarding at reject" % ", ".join(ev["spf_only"][:5]))
+        hold_reasons.append("SPF-only aligned senders (%s): they break on forwarding at reject - aligned DKIM first" % ", ".join(ev["spf_only"][:5]))
+    if policy == "quarantine" and pct >= 100 and (ev["has_maillog"] or ev["has_rua"]) and not ev["dkim_evidence"]:
+        hold_reasons.append("no aligned-DKIM evidence in this run (no aggregate reports; the mail log has no SPF/DKIM columns): "
+                            "run queries/dkim_alignment.kql or supply reports before this step - DKIM before reject, always")
     if not (ev["has_maillog"] or ev["has_rua"]):
         gate_note = "no failure evidence in this run - supply --maillog and/or --rua before applying any enforcement step"
     else:
         gate_note = None
 
-    pct = int(tags.get("pct", "100") or 100) if tags.get("pct", "100").isdigit() else 100
     if dmarc and "DMARC-005" not in ids and not inherited:
         if policy == "none" and rua_of(dmarc):
             add("ratchet", 3, "TXT", hostname, set_tag(set_tag(dmarc, "p", "quarantine"), "pct", "25"), dmarc,

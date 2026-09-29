@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Post a short status to Slack (or Teams) after an audit run.
+"""Post a short status to Slack after an audit run.
 
 Reads report.json (and optionally the previous run's report.json and this
 run's plan.json) and writes one message: policy and gate per domain, what
-changed since last time (new findings, resolved findings, newly seen
-senders, spoofing blocked, failure counts), and how many plan rows are
-waiting. Nothing is posted unless a webhook is given; --dry-run prints the
-message instead. The webhook URL is read from SLACK_WEBHOOK_URL (or
-TEAMS_WEBHOOK_URL) in .env or the environment and is never printed.
+changed since last time (new findings, resolved findings, newly identified
+senders, spoofing blocked, failure counts), the trend over the last runs,
+and how many plan rows are waiting. Aggregates only: domains, counts and
+sender identities (source IPs, envelope domains), never addresses or
+subject lines. Nothing is posted unless a webhook is given; --dry-run prints
+the message instead. The webhook URL is read from SLACK_WEBHOOK_URL in .env
+or the environment and is never printed. Teams is designed in
+(TEAMS_WEBHOOK_URL, build_payload) but not yet verified against a live
+webhook.
 
   python src/notify.py --report audit-out/report.json --dry-run
   python src/notify.py --report audit-out/report.json --previous audit-out/history/2026-01-01/report.json --plan audit-out/plan.json
@@ -26,6 +30,8 @@ from pathlib import Path
 import run_hunting
 
 WEBHOOK_KEYS = ("SLACK_WEBHOOK_URL", "TEAMS_WEBHOOK_URL")
+TARGETS = ("slack", "teams")
+TREND_RUNS = 4
 
 
 def die(msg):
@@ -63,8 +69,46 @@ def sender_label(u):
     return str(u)
 
 
-def summarize(report, previous=None, plan=None):
-    """Plain-text (Slack mrkdwn) message. Deterministic, no secrets."""
+def sender_keys(report):
+    """Sender identities one run saw, as aggregates: rua source IPs and
+    mail-log envelope domains, keyed ip:<address> and envelope:<domain>. No
+    From addresses, no people - this set is what collect.py remembers in
+    senders.json so 'newly identified' means new to the whole history."""
+    keys = set()
+    for s in (report.get("rua") or {}).get("by_source_ip") or []:
+        if isinstance(s, dict) and s.get("source_ip"):
+            keys.add("ip:" + str(s["source_ip"]))
+    for v in (report.get("maillog") or {}).get("verdicts") or []:
+        env = (v.get("envelope_domain") or "").strip().lower() if isinstance(v, dict) else ""
+        if env:
+            keys.add("envelope:" + env)
+    return keys
+
+
+def _key_label(key):
+    kind, _, value = key.partition(":")
+    return value + (" (envelope)" if kind == "envelope" else "")
+
+
+def trend_word(values):
+    """improving / worsening / flat from the first and last known value."""
+    pts = [v for v in values if v is not None]
+    if len(pts) < 2:
+        return "too few runs to call"
+    if pts[-1] < pts[0]:
+        return "improving"
+    if pts[-1] > pts[0]:
+        return "worsening"
+    return "flat"
+
+
+def summarize(report, previous=None, plan=None, known_senders=None, history=None):
+    """Plain-text (Slack mrkdwn) message. Deterministic, no secrets.
+
+    known_senders: every sender key seen in earlier runs (collect.py keeps
+    them); with it, "newly identified" means never seen before, not merely
+    absent last week. history: the metrics.json entries, newest last, for
+    the trend line over the last TREND_RUNS runs."""
     lines = []
     gen = report.get("generated_utc", "")
     lines.append("*DMARC audit* %s" % gen[:16].replace("T", " "))
@@ -112,10 +156,11 @@ def summarize(report, previous=None, plan=None):
             if a and (a.get("current_policy") != b.get("current_policy") or a.get("verdict") != b.get("verdict")):
                 lines.append("- `%s` changed: p=%s/%s -> p=%s/%s" % (dom, a.get("current_policy"), a.get("verdict"),
                                                                      b.get("current_policy"), b.get("verdict")))
-        now_s, prev_s = rua_sources(report), rua_sources(previous)
-        new_s = sorted(set(now_s) - set(prev_s))
-        if new_s:
-            lines.append("- *newly seen senders*: " + ", ".join(new_s[:6]) + (" ..." if len(new_s) > 6 else ""))
+        if known_senders is None:
+            now_s, prev_s = rua_sources(report), rua_sources(previous)
+            new_s = sorted(set(now_s) - set(prev_s))
+            if new_s:
+                lines.append("- *newly seen senders*: " + ", ".join(new_s[:6]) + (" ..." if len(new_s) > 6 else ""))
         pml = (previous.get("maillog") or {}).get("counters") or {}
         if ml and pml:
             d = ml.get("genuine_failures", 0) - pml.get("genuine_failures", 0)
@@ -125,6 +170,31 @@ def summarize(report, previous=None, plan=None):
             d = 100 * (float(tot.get("pass_rate", 0) or 0) - float(ptot.get("pass_rate", 0) or 0))
             lines.append("- pass rate vs last run: %+.1f points" % d)
 
+    if known_senders is not None:
+        now_keys = sender_keys(report)
+        if not known_senders:
+            lines.append("- baseline run: %d sender identities recorded; newly identified senders are reported "
+                         "from the next run" % len(now_keys))
+        else:
+            new_s = sorted(k for k in now_keys if k not in known_senders)
+            if new_s:
+                lines.append("- *newly identified senders* (never seen in an earlier run): "
+                             + ", ".join(_key_label(k) for k in new_s[:6]) + (" ..." if len(new_s) > 6 else ""))
+            else:
+                lines.append("- newly identified senders: none")
+
+    if history and len(history) >= 2:
+        pts = list(history)[-TREND_RUNS:]
+        gf = [h.get("genuine_failures") for h in pts]
+        pr = [h.get("rua_pass_rate") for h in pts]
+        parts = []
+        if any(x is not None for x in gf):
+            parts.append("genuine failures " + ", ".join("-" if x is None else str(x) for x in gf))
+        if any(x is not None for x in pr):
+            parts.append("pass rate " + ", ".join("-" if x is None else "%.1f%%" % (100 * float(x)) for x in pr))
+        if parts:
+            lines.append("- trend over the last %d runs (%s): %s" % (len(pts), trend_word(gf), "; ".join(parts)))
+
     if plan:
         ch = plan.get("changes") or []
         p1 = sum(1 for c in ch if c.get("priority") == 1)
@@ -133,8 +203,24 @@ def summarize(report, previous=None, plan=None):
     return "\n".join(lines)
 
 
-def post(webhook, text):
-    body = json.dumps({"text": text}).encode("utf-8")
+def target_for(webhook):
+    """slack, unless the URL is a Teams workflow or connector endpoint."""
+    w = (webhook or "").lower()
+    return "teams" if ("webhook.office.com" in w or "logic.azure.com" in w) else "slack"
+
+
+def build_payload(text, target="slack"):
+    """The JSON body for one target. Slack incoming webhooks take {"text"} in
+    mrkdwn. Teams is designed in here so a card layout can be added without
+    touching any caller; until it is verified against a live webhook it sends
+    the same plain-text body, which the legacy Teams connectors accepted."""
+    if target not in TARGETS:
+        raise ValueError("unknown notify target: %s (expected one of %s)" % (target, ", ".join(TARGETS)))
+    return {"text": text}
+
+
+def post(webhook, text, target=None):
+    body = json.dumps(build_payload(text, target or target_for(webhook))).encode("utf-8")
     req = urllib.request.Request(webhook, data=body, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -151,6 +237,7 @@ def main():
     ap.add_argument("--previous", help="the previous run's report.json, for deltas")
     ap.add_argument("--plan", help="this run's plan.json")
     ap.add_argument("--webhook", help="webhook URL (default: SLACK_WEBHOOK_URL or TEAMS_WEBHOOK_URL from .env)")
+    ap.add_argument("--target", choices=TARGETS, help="payload shape (default: guessed from the URL; slack)")
     ap.add_argument("--dry-run", action="store_true", help="print the message, post nothing")
     ap.add_argument("--env-file", help="credentials file (default: <repo root>/.env)")
     args = ap.parse_args()
@@ -170,7 +257,7 @@ def main():
     if not webhook:
         die("no webhook: pass --webhook or set SLACK_WEBHOOK_URL in .env (or use --dry-run)")
     try:
-        post(webhook, text)
+        post(webhook, text, args.target)
     except RuntimeError as err:
         print("error: " + str(err), file=sys.stderr)
         sys.exit(1)

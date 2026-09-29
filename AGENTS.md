@@ -74,10 +74,12 @@ file only.)
 
 ## The working sequence
 
-`src/collect.py` runs the whole sweep and writes `report.md`, `plan.md`, the
-history and the summary; read `latest/report.json` and `latest/plan.json`
-before anything else, and `verify_setup.py` output when a tenant step is
-missing. Then follow `docs/methodology.md`. In short: reporting on before anything changes,
+`src/collect.py` runs the whole sweep and writes `report.md`, `todo.md`,
+`plan.md`, the history and the summary; read `latest/todo.md`,
+`latest/report.json` and `latest/plan.json` before anything else, and
+`verify_setup.py` output when a tenant step is missing. Settings, including
+the formal exceptions the gate honours, live in `audit.toml`: never edit it
+yourself, propose entries (see below). Then follow `docs/methodology.md`. In short: reporting on before anything changes,
 then sender inventory, then deduplicated failure analysis, then fix senders
 (DKIM preferred - check the SPF lookup budget with `src/spf_lookups.py`
 before adding any include), then ratchet policy with a deduplicated gate check
@@ -135,12 +137,38 @@ Starter tasks, in order:
 4. **Gate check** - before any policy ratchet, rerun the failures query at
    `--timespan P7D` and the DKIM-alignment query before any move to reject;
    whatever is still failing must be explained, fixed, or formally excepted
-   before `p=` moves. `src/audit.py` automates this verdict.
+   before `p=` moves. `src/audit.py` automates this verdict. A mail log pulled
+   with `queries/raw_maillog.kql` carries SPF and DKIM columns, so the verdict
+   judges SPF-only senders from the tenant side as well as from the aggregate
+   reports; with neither, the move to reject is `insufficient_data`, never go.
+   "Formally excepted" means an `[[exceptions]]` entry in `audit.toml` with an
+   expiry and a removal criterion; the gate ignores incomplete entries and
+   names expired ones.
+
+## The weekly run's files (`audit-out/latest/`)
+
+| File | What it holds | How to use it |
+|---|---|---|
+| `todo.md` | the prioritised list: holds to decide, zero-risk DNS rows, senders to fix DKIM-first, tenant findings, gated enforcement steps with prerequisites, exceptions in force | work it top to bottom; every line names the file with the evidence |
+| `report.json`, `report.md` | every finding with severity, evidence, action and `verified`; the gate per domain with its reasons; `gate.exceptions` (applied, expired, invalid); `gate.evidence.dkim_evidence` | cite finding ids and gate reasons, never raw rows; quote deduplicated and raw counts together |
+| `plan.json`, `plan.md` | the records to publish with current value, rollback and prerequisites | draft the change ticket from a row; the human applies it |
+| `summary.txt` | the Slack message: deltas vs the previous run, newly identified senders, the trend | the status line; do not recompute it |
+| `run.json` | notes, caveats (for example a truncated mail-log slice), degraded steps, strict reasons | say when a number is a floor because of a caveat |
+| `../metrics.json`, `../metrics.md` | one entry per run since day one | trend questions |
+| `../senders.json` | every sender identity ever seen with its first and last run | "is this sender new?" is answered here, never from one week's report |
+
+Exceptions: when a failing sender is explained and accepted, draft the
+`[[exceptions]]` entry for `audit.toml` (`match`, `reason`, `owner`, `until`,
+`removal_criterion`) and hand it to the human. Never write it yourself, and
+never propose one without an expiry and a removal criterion
+(`docs/methodology.md` step 5).
 
 ## What to hand back to the human
 
 - Deduplicated numbers with the naive number alongside, so they see the gap
 - Draft DNS changes as diffs with a rollback line and TTL noted
+- Draft exception entries for `audit.toml` with match, reason, owner, until
+  and removal criterion; the human adds them
 - Draft tickets and vendor messages; the human sends them
 - A clear "verified" vs "assumed" split in every status summary
 - For the stakeholder-facing next-steps document: fill

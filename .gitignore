@@ -25,6 +25,18 @@ queries/live/
 # your private pre-push deny list (ship only the .example)
 .denylist
 
+# your settings copy (it names your domains; ship only audit.example.toml)
+audit.toml
+
+# credential material - keys and certificates never belong in the repo;
+# make them under private/ (docs/app-registration.md)
+*.pfx
+*.p12
+*.key
+*.pem
+*.cer
+*.crt
+
 # python
 __pycache__/
 *.pyc

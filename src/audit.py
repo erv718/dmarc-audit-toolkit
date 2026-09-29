@@ -33,7 +33,14 @@ The gate rule, deliberately conservative:
   - a likely_spoof stream does NOT block: failing spoofs are what enforcement
     stops. It blocks only when receivers deliver it anyway (disposition none)
   - SPF-only senders block the move quarantine -> reject (DKIM before reject),
-    not the move none -> quarantine
+    not the move none -> quarantine; they come from the aggregate reports and,
+    when the mail log carries SPF and DKIM columns (queries/raw_maillog.kql
+    writes them), from the mail log too
+  - the move to p=reject with no aligned-DKIM evidence at all (no aggregate
+    reports, no SPF/DKIM columns) is insufficient_data, never go
+  - a sender formally excepted in audit.toml ([[exceptions]]: reason, owner,
+    until, removal criterion) does not block until its date passes; expired
+    and incomplete entries are named in the verdict and ignored
   - no DMARC record / no rua / DMARC lookup failed: no_go (you cannot ratchet
     a policy you cannot see)
   - if no policy could be determined at all, or no failure evidence was
@@ -73,6 +80,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+import config as config_mod
 import dedupe
 import dns_audit
 import discover
@@ -102,7 +110,8 @@ TENANT_GATE_BLOCKS = ("RULES-001", "RULES-002", "RULES-101", "RULES-102", "RULES
 MAILLOG_COLUMNS = {"msgid": "Internet message ID", "recipient": "Recipients",
                    "sender": "Sender address", "domain": "Sender domain",
                    "action": "Delivery action", "location": "Latest delivery location",
-                   "subject": "Subject", "envelope": "Sender mail from domain"}
+                   "subject": "Subject", "envelope": "Sender mail from domain",
+                   "spf": "SPF", "dkim": "DKIM"}
 # The three PowerShell exports: report key -> (script, tool tag, default finding area, title).
 TENANT_SECTIONS = {
     "rules": ("audit_rules.ps1", "audit_rules", "rules", "Transport rules"),
@@ -124,7 +133,10 @@ TENANT_ISSUE_ROWS = {
 GATE_RULE = ("failing streams not labelled likely_spoof, genuine mail-log failures, "
              "delivered-despite-fail, blocking findings, tenant allows that deliver "
              "unauthenticated mail, and invisible DMARC state block the gate; spoofs "
-             "already rejected do not")
+             "already rejected do not; a sender formally excepted in audit.toml "
+             "([[exceptions]] with an unexpired until and a removal criterion) does not; "
+             "the move to p=reject needs aligned-DKIM evidence (aggregate reports, or a "
+             "mail log with SPF and DKIM columns) or the verdict is insufficient_data")
 RATCHET_PHRASE = "before ratcheting to p=reject"
 RATCHET_AT_END = ("now - the policy is already p=reject, nothing is left to ratchet, and "
                   "every forwarded copy of their mail is rejected today")
@@ -539,6 +551,12 @@ def evidence_summary(rua_doc, maillog_doc, headers_doc=None):
     rows = maillog_doc["counters"]["rows_in_scope"] if maillog_doc else 0
     hdr = len(headers_doc["messages"]) if headers_doc else 0
     supplied = bool(rua_n and rua_m) or bool(rows)
+    align = (maillog_doc or {}).get("alignment") or {}
+    dkim_sources = []
+    if rua_n and rua_m:
+        dkim_sources.append("aggregate reports (aligned DKIM per source)")
+    if align.get("available"):
+        dkim_sources.append("mail log SPF/DKIM columns (dkim_alignment buckets)")
     if supplied:
         stmt = (f"failure evidence supplied: {rua_n} aggregate report(s) ({rua_m} messages), "
                 f"{rows} mail-log row(s) in scope of {raw} read, {hdr} header file(s)")
@@ -546,16 +564,28 @@ def evidence_summary(rua_doc, maillog_doc, headers_doc=None):
         stmt = (f"no failure evidence supplied ({rua_n} aggregate reports, {rows} mail-log rows, "
                 f"{hdr} header files): this is a posture check, not a completed audit - "
                 "pass --rua reports and/or --maillog")
+    stmt += "; aligned-DKIM evidence: " + (", ".join(dkim_sources) if dkim_sources else "none in this run")
     return {"rua_reports": rua_n, "rua_messages": rua_m, "maillog_rows": raw,
             "maillog_rows_in_scope": rows, "header_files": hdr,
-            "failure_evidence": supplied, "statement": stmt}
+            "failure_evidence": supplied, "dkim_evidence": bool(dkim_sources),
+            "dkim_evidence_sources": dkim_sources, "statement": stmt}
 
 
-def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None):
-    """Blockers that apply to every domain in the run."""
-    blockers = []
+def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None):
+    """Blockers that apply to every domain in the run, plus what the formal
+    exceptions (audit.toml [[exceptions]], already split to the active ones)
+    lifted: notes naming each excepted sender, the excepted rua source IPs,
+    and how many deduplicated mail-log failures were excepted."""
+    blockers, notes, excepted_streams = [], [], []
+    active = list(exceptions or [])
     if rua_doc:
         for f in rua_doc["failing_streams"]:
+            hit = next((e for e in active if config_mod.matches_stream(e, f)), None)
+            if hit:
+                excepted_streams.append(f["source_ip"])
+                notes.append(f"{f['source_ip']} ({f['count']} msgs, {f['likely']}) excepted until {hit['until']}: "
+                             f"{hit['reason']}; remove when {hit['removal_criterion']}")
+                continue
             if f["likely"] == "likely_spoof":
                 if f["dispositions"].get("none", 0):
                     blockers.append(
@@ -566,11 +596,26 @@ def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None):
                 blockers.append(
                     f"{f['source_ip']} fails DMARC on {f['fail']}/{f['count']} msgs "
                     f"({f['likely']}); fix, or formally except it, before p= moves")
+    excepted_failures = 0
     if maillog_doc:
         c = maillog_doc["counters"]
-        if c["genuine_failures"]:
-            blockers.append(f"{c['genuine_failures']} logical message(s) in the mail log failed with "
-                            "no passing copy (deduplicated)")
+        if active and maillog_doc.get("verdicts"):
+            hits = {}
+            for v in maillog_doc["verdicts"]:
+                if not v.get("genuine_failure"):
+                    continue
+                hit = next((e for e in active if config_mod.matches_verdict(e, v)), None)
+                if hit:
+                    hits.setdefault(hit["match"], [hit, 0])[1] += 1
+            for match, (hit, n) in hits.items():
+                excepted_failures += n
+                notes.append(f"{n} mail-log failure(s) from {match} excepted until {hit['until']}: "
+                             f"{hit['reason']}; remove when {hit['removal_criterion']}")
+        remaining = c["genuine_failures"] - excepted_failures
+        if remaining > 0:
+            tail = f"; {excepted_failures} more excepted" if excepted_failures else ""
+            blockers.append(f"{remaining} logical message(s) in the mail log failed with "
+                            f"no passing copy (deduplicated{tail})")
         if c["delivered_despite_fail"]:
             blockers.append(f"{c['delivered_despite_fail']} message(s) failed authentication but reached "
                             "a mailbox - a local override is masking failures external receivers enforce")
@@ -578,7 +623,8 @@ def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None):
         for f in (doc or {}).get("findings", []):
             if f["severity"] == "blocking" or (f["severity"] == "major" and f["id"] in TENANT_GATE_BLOCKS):
                 blockers.append(f"{name}: {f['title']} - unauthenticated mail is delivered past the policy")
-    return blockers
+    return blockers, {"notes": notes, "excepted_streams": excepted_streams,
+                      "excepted_maillog_failures": excepted_failures}
 
 
 def _dns_blockers(r, domain):
@@ -586,20 +632,30 @@ def _dns_blockers(r, domain):
             if f["severity"] == "blocking" or f["id"] in DNS_GATE_BLOCKS]
 
 
-def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence):
+def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence, maillog_doc=None, exception_notes=()):
     """One domain's verdict. Every branch names the step being gated and
-    whether failure evidence was supplied."""
+    whether failure evidence was supplied. The move to p=reject additionally
+    needs aligned-DKIM evidence from somewhere (DKIM before reject, always)."""
     policy, policy_from = info["policy"], info["source"]
     blockers = list(dns_blockers) + list(shared)
-    if policy == "quarantine" and rua_doc:
-        spf_only = [f for f in rua_doc["spf_only_senders"]
-                    if domain is None or any(_under(hf, domain) for hf in f["header_from"])]
-        if spf_only:
-            msgs = sum(f["spf_only"] for f in spf_only)
-            blockers.append(f"{len(spf_only)} sender(s) pass on SPF alone ({msgs} msgs): "
-                            "set up aligned DKIM before moving quarantine -> reject")
+    if policy == "quarantine":
+        if rua_doc:
+            spf_only = [f for f in rua_doc["spf_only_senders"]
+                        if domain is None or any(_under(hf, domain) for hf in f["header_from"])]
+            if spf_only:
+                msgs = sum(f["spf_only"] for f in spf_only)
+                blockers.append(f"{len(spf_only)} sender(s) pass on SPF alone ({msgs} msgs): "
+                                "set up aligned DKIM before moving quarantine -> reject")
+        ml_spf_only = [s for s in ((maillog_doc or {}).get("spf_only_senders") or [])
+                       if domain is None or _under(s.get("domain"), domain)]
+        if ml_spf_only:
+            msgs = sum(s["spf_only"] for s in ml_spf_only)
+            blockers.append(f"{len(ml_spf_only)} sender(s) in the mail log pass on SPF alone ({msgs} msgs, no DKIM "
+                            "pass on any leg): set up aligned DKIM before moving quarantine -> reject")
     step = next_step(policy, info["tags"], info["spf_terminator"], info["spf_status"], info["record_at"])
     at_end = policy == "reject"
+    pct = str((info["tags"] or {}).get("pct", "100")).strip()
+    reject_step = policy == "quarantine" and (int(pct) if pct.isdigit() else 100) >= 100
     name = domain or "the domain"
     if blockers:
         verdict = "no_go"
@@ -625,6 +681,12 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence):
             reasons = [f"policy is p={policy} ({policy_from}) but no failure evidence was supplied: "
                        "pass --rua reports and/or --maillog; a ratchet on zero data is a guess; "
                        f"step being gated: {step}"]
+    elif reject_step and not evidence.get("dkim_evidence"):
+        verdict = "insufficient_data"
+        reasons = [f"policy is p=quarantine at pct=100 ({policy_from}) and the step being gated is the move to "
+                   "p=reject, but this run holds no aligned-DKIM evidence: supply --rua reports, or a mail log "
+                   "pulled with SPF and DKIM columns (queries/raw_maillog.kql; queries/dkim_alignment.kql gives "
+                   "the same buckets in the portal), before that move - DKIM before reject, always"]
     else:
         verdict = "go"
         if at_end:
@@ -640,16 +702,24 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence):
                 if spoof:
                     reasons.append(f"{len(spoof)} failing stream(s) look like spoofs - moving p= forward "
                                    "is exactly what stops them")
+    reasons += [f"exception: {n}" for n in exception_notes]
     reasons.append(evidence["statement"])
     return {"verdict": verdict, "current_policy": policy, "policy_source": policy_from,
             "next_step": step, "reasons": reasons}
 
 
-def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None, tenant_docs=None):
+def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None, tenant_docs=None,
+                 exceptions=None):
     """The ratchet decision, per domain, plus the overall verdict (the worst).
-    See the module docstring for the rule."""
+    See the module docstring for the rule. exceptions: the raw or normalised
+    [[exceptions]] entries; expired and incomplete ones are named, not applied."""
     evidence = evidence_summary(rua_doc, maillog_doc, headers_doc)
-    shared = _shared_blockers(rua_doc, maillog_doc, tenant_docs)
+    active, expired, invalid = config_mod.parse_exceptions(exceptions or [])
+    shared, exc = _shared_blockers(rua_doc, maillog_doc, tenant_docs, active)
+    notes = list(exc["notes"])
+    notes += [f"{e['match']} expired {e['until']} and blocks again until renewed or removed ({e['reason']})"
+              for e in expired]
+    notes += [f"{e['entry']} not applied: {e['problem']}" for e in invalid]
     names = list(dict.fromkeys(domains)) or list((dns_reports or {}).keys())
     if not names and rua_doc:
         names = list(dict.fromkeys(s["domain"] for s in rua_doc["policy_check"]["seen"] if s["domain"]))
@@ -657,21 +727,23 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
     for d in names:
         info = domain_policy(d, dns_reports, rua_doc)
         dns_b = _dns_blockers(dns_reports[d], d) if dns_reports and d in dns_reports else []
-        per_domain[d] = _domain_gate(d, info, shared, dns_b, rua_doc, evidence)
+        per_domain[d] = _domain_gate(d, info, shared, dns_b, rua_doc, evidence, maillog_doc, notes)
     if per_domain:
         lead = max(per_domain, key=lambda d: GATE_RANK[per_domain[d]["verdict"]])
         overall = per_domain[lead]
         merged = {}
         for d, g in per_domain.items():
             for r in g["reasons"]:
-                if r == evidence["statement"] or r in shared or len(per_domain) == 1 or r.startswith(f"{d}: "):
+                if (r == evidence["statement"] or r in shared or len(per_domain) == 1 or r.startswith(f"{d}: ")
+                        or r.startswith("exception: ")):
                     merged.setdefault(r, None)
                 else:
                     merged.setdefault(f"{d}: {r}", None)
         merged.pop(evidence["statement"], None)
         reasons = list(merged) + [evidence["statement"]]
     else:
-        overall = _domain_gate(None, domain_policy(None, dns_reports, rua_doc), shared, [], rua_doc, evidence)
+        overall = _domain_gate(None, domain_policy(None, dns_reports, rua_doc), shared, [], rua_doc, evidence,
+                               maillog_doc, notes)
         reasons = overall["reasons"]
     return {"verdict": overall["verdict"], "current_policy": overall["current_policy"],
             "policy_source": overall["policy_source"], "next_step": overall["next_step"],
@@ -679,6 +751,9 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
             "policies": {d: g["current_policy"] for d, g in per_domain.items()},
             "domains": per_domain,
             "evidence": evidence,
+            "exceptions": {"applied": active, "expired": expired, "invalid": invalid,
+                           "excepted_streams": exc["excepted_streams"],
+                           "excepted_maillog_failures": exc["excepted_maillog_failures"]},
             "rule": GATE_RULE}
 
 
@@ -758,6 +833,10 @@ def verified_vs_inferred(report):
     g = report["gate"]
     inferred.append(f"gate verdict {g['verdict']} and next step ({g['next_step']}) are reasoning over "
                     "the evidence above, not a measurement")
+    applied = (g.get("exceptions") or {}).get("applied") or []
+    if applied:
+        inferred.append(f"{len(applied)} formal exception(s) from audit.toml lifted blockers: a human decision "
+                        "with an expiry and a removal criterion, not a measurement")
     seen_v, seen_i = set(), set()
     for f in report["findings"]:
         bucket, seen = (verified, seen_v) if f.get("verified", True) else (inferred, seen_i)
@@ -773,7 +852,8 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                  auth_column=None, vendor_domains=(), authserv_id=None, strict=False,
                  min_volume=20, fail_threshold=0.5, since=None, until=None,
                  expect_policy=None, retiring=(), columns=None, domain_file=None,
-                 rules_json=None, bypasses_json=None, groups_json=None, domain_sources=None):
+                 rules_json=None, bypasses_json=None, groups_json=None, domain_sources=None,
+                 exceptions=None):
     """The whole audit as one document. Raises UsageError on input problems."""
     domains = [part for d in domains for part in str(d).split(",")]
     if domain_file:
@@ -815,14 +895,15 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                    "groups": str(repo_path(groups_json)) if groups_json else None,
                    "authserv_id": authserv_id, "sender_domain": sender_domain,
                    "known": known, "since": since, "until": until,
-                   "expect_policy": expect_policy, "retiring_selectors": list(retiring)},
+                   "expect_policy": expect_policy, "retiring_selectors": list(retiring),
+                   "exceptions": [str(e.get("match")) for e in (exceptions or []) if isinstance(e, dict)]},
         "dns": dns_reports,
         "rua": rua_doc,
         "maillog": maillog_doc,
         "headers": headers_doc,
     }
     report.update(tenant_docs)
-    report["gate"] = gate_verdict(dns_reports, rua_doc, maillog_doc, domains, headers_doc, tenant_docs)
+    report["gate"] = gate_verdict(dns_reports, rua_doc, maillog_doc, domains, headers_doc, tenant_docs, exceptions)
     findings = reword_for_reject(flatten_findings(report), report["gate"])
     report["findings"] = findings
     by_sev, by_area = {}, {}
@@ -985,6 +1066,8 @@ def render_md(report):
     L.append(head)
     L.append(f"- step being gated: {g.get('next_step') or 'unknown'}")
     L.append(f"- evidence: {ev.get('statement') or 'not recorded'}")
+    L.append("- aligned-DKIM evidence (needed before p=reject): "
+             + (", ".join(ev.get("dkim_evidence_sources") or []) or "none in this run"))
     per = g.get("domains") or {}
     if per:
         L.append("")
@@ -1082,6 +1165,19 @@ def render_md(report):
                  f"blocked despite pass: {c['blocked_despite_pass']}")
         L.append("- likely split of failures (heuristic): "
                  + ", ".join(f"{n} {label}" for label, n in c["by_likely"].items()))
+        al = report["maillog"].get("alignment") or c.get("alignment") or {}
+        if al.get("available"):
+            L.append(f"- alignment of passing mail (dkim_alignment buckets): {al['dkim_aligned']} DKIM-carried, "
+                     f"{al['spf_and_dkim']} SPF and DKIM, {al['spf_only']} SPF only (break on forwarding)")
+            so = report["maillog"].get("spf_only_senders") or []
+            if so:
+                L.append("- SPF-only senders in the mail log (aligned DKIM before reject):")
+                for sender in so[:20]:
+                    L.append(f"  - {sender['sender'] or '?'} (envelope {sender['envelope_domain'] or '?'}): "
+                             f"{sender['spf_only']} of {sender['passing']} passing msgs")
+        else:
+            L.append("- alignment: not judged - the export has no SPF/DKIM columns "
+                     "(queries/raw_maillog.kql adds them)")
         if c.get("auth_column"):
             L.append(f"- verdict basis: column '{c['auth_column']}'")
         elif report["maillog"].get("auth_column"):
@@ -1184,7 +1280,20 @@ def main():
                     help="flag rua reports that saw a different p= than this")
     ap.add_argument("--retiring-selector", action="append", default=[], metavar="NAME",
                     help="DKIM selector you plan to delete; checked against the rua reports (repeatable)")
+    ap.add_argument("--config", metavar="TOML",
+                    help="settings file read for [[exceptions]] and vendor_domains "
+                         "(default: <repo root>/audit.toml when it exists)")
+    ap.add_argument("--no-config", action="store_true", help="ignore audit.toml even if it exists")
     args = ap.parse_args()
+
+    exceptions, cfg_vendors = [], []
+    if not args.no_config:
+        try:
+            cfg = config_mod.load(args.config)
+        except config_mod.ConfigError as exc:
+            die(str(exc))
+        exceptions = cfg.get("exceptions") or []
+        cfg_vendors = [str(v) for v in ((cfg.get("audit") or {}).get("vendor_domains") or [])]
 
     # Domains: command line (comma or space separated), --file, and - unless
     # --no-graph or --offline - the tenant's own verified domain list, merged
@@ -1240,11 +1349,12 @@ def main():
             offline=args.offline, resolver_addr=args.resolver,
             selectors=[s.strip() for s in args.selectors.split(",")] if args.selectors else (),
             known=args.known, sender_domain=args.sender_domain, auth_column=args.auth_column,
-            vendor_domains=args.vendor_domain, authserv_id=args.authserv_id, strict=args.strict,
+            vendor_domains=list(args.vendor_domain) + cfg_vendors, authserv_id=args.authserv_id, strict=args.strict,
             min_volume=args.min_volume, fail_threshold=args.fail_threshold,
             since=args.since, until=args.until, expect_policy=args.expect_policy,
             retiring=args.retiring_selector, columns=columns,
-            rules_json=args.rules_json, bypasses_json=args.bypasses_json, groups_json=args.groups_json)
+            rules_json=args.rules_json, bypasses_json=args.bypasses_json, groups_json=args.groups_json,
+            exceptions=exceptions)
     except UsageError as exc:
         die(str(exc))
 
