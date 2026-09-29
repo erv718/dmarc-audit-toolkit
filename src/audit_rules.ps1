@@ -20,8 +20,9 @@ you enforce DMARC:
     attacker can spoof straight past the rule.
   - Which rules had zero hits in the window? Dead rules are free cleanup.
 
-Connects app-only via .env (EXO_CERT_THUMBPRINT, EXO_ORGANIZATION; setup in
-docs/app-registration.md) or falls back to interactive browser sign-in:
+Connects app-only via .env (EXO_ORGANIZATION plus EXO_CERT_THUMBPRINT or
+EXO_CERT_FILE; setup in docs/app-registration.md) or offers interactive
+browser sign-in:
     ./audit_rules.ps1 -Days 10 -ExportPath ./rule-audit
     ./audit_rules.ps1 -Json -SkipHits > rules.json
 

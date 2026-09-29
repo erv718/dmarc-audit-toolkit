@@ -7,10 +7,12 @@ Dot-sourced by audit_rules.ps1, audit_bypasses.ps1 and audit_groups.ps1;
 not meant to be run alone. Connection order:
 
   1. an already-open Exchange Online session is used as-is
-  2. app-only through the app registration: EXO_CERT_THUMBPRINT and
-     EXO_ORGANIZATION from .env or the process environment, with the app id
-     from EXO_APP_ID falling back to AZURE_CLIENT_ID (same registration the
-     Python data plane uses; setup: docs/app-registration.md)
+  2. app-only through the app registration: EXO_ORGANIZATION plus either
+     EXO_CERT_THUMBPRINT (Windows certificate store) or EXO_CERT_FILE (a .pfx
+     for macOS/Linux, with EXO_CERT_PASSWORD if it has one), from .env or the
+     process environment, with the app id from EXO_APP_ID falling back to
+     AZURE_CLIENT_ID (same registration the Python data plane uses; setup:
+     docs/app-registration.md). The .pfx is tried first when both are set.
   3. interactive browser sign-in, offered only when someone is at the
      keyboard - nothing here ever hardcodes an account
 
@@ -39,6 +41,13 @@ function Get-ToolkitEnvValue {
     if ($proc) { return $proc }
     if ($Map.ContainsKey($Name)) { return $Map[$Name] }
     return ''
+}
+
+function Write-ToolkitAppOnlyHint {
+    # what an app-only connect needs, printed after either certificate path fails
+    Write-Host "Needs Exchange.ManageAsApp (Application) on the registration, a view-only role"
+    Write-Host "(Global Reader is enough), and the certificate uploaded under Certificates & secrets."
+    Write-Host "See docs/app-registration.md."
 }
 
 function Connect-ToolkitExo {
@@ -79,6 +88,7 @@ function Connect-ToolkitExo {
             }
             catch {
                 Write-Host "App-only Exchange Online connect with EXO_CERT_FILE failed: $($_.Exception.Message)"
+                Write-ToolkitAppOnlyHint
             }
         }
         else {
@@ -93,10 +103,8 @@ function Connect-ToolkitExo {
             return $true
         }
         catch {
-            Write-Host "App-only Exchange Online connect failed: $($_.Exception.Message)"
-            Write-Host "Needs Exchange.ManageAsApp (Application) on the registration, a directory"
-            Write-Host "role (Global Reader is enough for read-only), and the certificate uploaded"
-            Write-Host "under Certificates & secrets. See docs/app-registration.md."
+            Write-Host "App-only Exchange Online connect with EXO_CERT_THUMBPRINT failed: $($_.Exception.Message)"
+            Write-ToolkitAppOnlyHint
         }
     }
     elseif (-not $certFile) {
@@ -115,7 +123,8 @@ function Connect-ToolkitExo {
         }
         return [bool](Get-Command Get-TransportRule -ErrorAction SilentlyContinue)
     }
-    Write-Host "Not connected. Fill EXO_CERT_THUMBPRINT and EXO_ORGANIZATION in .env for app-only"
-    Write-Host "(docs/app-registration.md), or run Connect-ExchangeOnline yourself first."
+    Write-Host "Not connected. For app-only, set EXO_ORGANIZATION plus EXO_CERT_THUMBPRINT (Windows)"
+    Write-Host "or EXO_CERT_FILE (macOS/Linux) in .env - see docs/app-registration.md - or run"
+    Write-Host "Connect-ExchangeOnline yourself and re-run this script."
     return $false
 }

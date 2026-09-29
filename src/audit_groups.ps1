@@ -33,8 +33,9 @@ licence or role is reported as a not-verified finding instead of aborting
 the run. Membership is read per group; -SkipMembers skips that for a fast
 first pass.
 
-Connects app-only via .env (EXO_CERT_THUMBPRINT, EXO_ORGANIZATION; setup in
-docs/app-registration.md) or falls back to interactive browser sign-in:
+Connects app-only via .env (EXO_ORGANIZATION plus EXO_CERT_THUMBPRINT or
+EXO_CERT_FILE; setup in docs/app-registration.md) or offers interactive
+browser sign-in:
     ./audit_groups.ps1 -ExportPath ./group-audit
     ./audit_groups.ps1 -IncludeInboxRules -Json > groups.json
 

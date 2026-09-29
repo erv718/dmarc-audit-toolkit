@@ -33,8 +33,9 @@ Every section is wrapped in try/catch: a cmdlet that is missing from your
 licence or role is reported as a not-verified finding instead of aborting
 the run.
 
-Connects app-only via .env (EXO_CERT_THUMBPRINT, EXO_ORGANIZATION; setup in
-docs/app-registration.md) or falls back to interactive browser sign-in:
+Connects app-only via .env (EXO_ORGANIZATION plus EXO_CERT_THUMBPRINT or
+EXO_CERT_FILE; setup in docs/app-registration.md) or offers interactive
+browser sign-in:
     ./audit_bypasses.ps1 -ExportPath ./bypass-audit
     ./audit_bypasses.ps1 -Json > bypasses.json
 
