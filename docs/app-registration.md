@@ -89,10 +89,33 @@ settings that have no Graph API. They run fine interactively after
 `Connect-ExchangeOnline`. To run them from a schedule with no human signed
 in, add the Office 365 Exchange Online application permission
 `Exchange.ManageAsApp`, assign the app's service principal a **view-only**
-Exchange role (View-Only Organization Management), and use a certificate
-credential (app-only Exchange PowerShell does not accept secrets). The role
-assignment, not the permission name, is what decides whether the app can
-change anything; keep it view-only. Skip this entirely on the Python path.
+Exchange role (View-Only Organization Management, or Global Reader), and use
+a certificate credential - app-only Exchange PowerShell does not accept
+secrets. The role assignment, not the permission name, is what decides
+whether the app can change anything; keep it view-only. Skip this entirely
+on the Python path.
+
+To make and upload the certificate on Windows:
+
+```powershell
+$c = New-SelfSignedCertificate -Subject "CN=DMARC-Audit-ReadOnly" `
+    -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable
+Export-Certificate -Cert $c -FilePath .\dmarc-audit-readonly.cer
+```
+
+Upload `dmarc-audit-readonly.cer` under **Certificates & secrets**; the
+private key never leaves your machine. Then in `.env`:
+
+```
+EXO_CERT_THUMBPRINT=<the cert's thumbprint>
+EXO_ORGANIZATION=<yourtenant>.onmicrosoft.com
+```
+
+`EXO_APP_ID` is optional and defaults to `AZURE_CLIENT_ID`. With those set,
+the three scripts connect app-only on their own (via `src/ToolkitExo.ps1`)
+and only offer interactive sign-in when app-only is not configured.
+Close-out when the project wraps: delete the certificate from the
+registration and remove the role assignment.
 
 ## Run
 
@@ -129,41 +152,6 @@ Prove the plumbing before trusting any number from it: run
 `sender_census.kql` and check the busiest two or three senders against the
 same query pasted into the Defender portal. Same rows, same counts, then
 the API path is good.
-
-## Exchange Online app-only (only for the PowerShell auditors)
-
-The three PowerShell tools (`audit_rules.ps1`, `audit_bypasses.ps1`,
-`audit_groups.ps1`) talk to Exchange Online, and EXO app-only plays by its
-own rules: a client secret does NOT work there - it wants a certificate.
-
-1. **API permissions** on the same registration > add **Office 365 Exchange
-   Online** > Application > `Exchange.ManageAsApp`. Grant admin consent.
-2. **Certificates & secrets** > upload the PUBLIC half of a certificate. To
-   make a self-signed one on Windows:
-
-   ```powershell
-   $c = New-SelfSignedCertificate -Subject "CN=DMARC-Audit-ReadOnly" `
-       -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable
-   Export-Certificate -Cert $c -FilePath .\dmarc-audit-readonly.cer
-   ```
-
-   Upload `dmarc-audit-readonly.cer`; the private key never leaves your machine.
-3. The service principal needs a **directory role** to read EXO objects:
-   Entra > Roles and administrators > **Global Reader** > add the app's
-   service principal. Read-only is enough for every Get-* these scripts run.
-4. In `.env`:
-
-   ```
-   EXO_CERT_THUMBPRINT=<the cert's thumbprint>
-   EXO_ORGANIZATION=<yourtenant>.onmicrosoft.com
-   ```
-
-   `EXO_APP_ID` is optional and defaults to `AZURE_CLIENT_ID`.
-
-Run any of the three scripts directly after that - they connect app-only on
-their own, and only offer interactive browser sign-in when app-only is not
-configured. Close-out when the project wraps: delete the certificate from
-the registration and remove the directory-role assignment.
 
 ## Where the AI agent fits
 

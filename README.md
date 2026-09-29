@@ -83,6 +83,18 @@ policy changes, newly seen senders, spoofing blocked). The plan is
 regenerated from each run, so the enforcement steps appear only when their
 prerequisites are met - one ratchet per domain per week.
 
+## How far back can it see?
+
+The hunting API shows a rolling 30 days - that is Microsoft's retention
+ceiling, not a setting, and no query gets past it. The long view comes from
+accumulation instead: the first run does a one-time backfill of your report
+mailbox, every weekly run archives the new aggregate reports and stamps a
+dated copy of everything under `audit-out/history/`. By week six you are
+reading six weeks of local history even though the API still only shows 30
+days - and `metrics.md` turns that into the trend line. Those files are
+exactly what the AI layer reads when you opt it in: the archive lives on
+your disk, and nothing leaves the machine unless you share it.
+
 ## Quick start
 
 The DNS and file tools need nothing installed but Python (they fall back to
