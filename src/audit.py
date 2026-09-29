@@ -81,6 +81,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 import config as config_mod
+import console
 import dedupe
 import dns_audit
 import discover
@@ -1366,21 +1367,23 @@ def main():
     g = report["gate"]
     s = report["summary"]
     statement = g["evidence"]["statement"]
-    print(f"gate: {g['verdict']}" + (f" (current policy p={g['current_policy']})" if g["current_policy"] else ""))
+    paint = console.painter()
+    print("gate: " + paint.status(g["verdict"])
+          + (f" (current policy p={g['current_policy']})" if g["current_policy"] else ""))
     if g["domains"]:
         for d, dg in g["domains"].items():
             pol = f"p={dg['current_policy']} ({dg['policy_source']})" if dg["current_policy"] else "policy unknown"
-            print(f"  {d}: {dg['verdict']} - {pol}; next step: {dg['next_step']}")
+            print(f"  {d}: " + paint.status(dg["verdict"]) + f" - {pol}; next step: {dg['next_step']}")
             for r in dg["reasons"]:
                 if r != statement:
-                    print(f"    - {r}")
+                    print(paint.dim(f"    - {r}"))
     else:
         for r in g["reasons"]:
             if r != statement:
-                print(f"  - {r}")
-    print(f"  evidence: {statement}")
-    print(f"findings: {s['findings']} (worst {s['worst'] or 'none'}), "
-          f"{s['actionable']} major or blocking")
+                print(paint.dim(f"  - {r}"))
+    print(paint.dim(f"  evidence: {statement}"))
+    print(paint.by_exit(f"findings: {s['findings']} (worst {s['worst'] or 'none'}), "
+                        f"{s['actionable']} major or blocking", report["exit_code"]))
     print(f"wrote {mpath}")
     print(f"wrote {jpath}")
     if not args.no_plan and report.get("dns"):

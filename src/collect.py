@@ -56,6 +56,7 @@ from pathlib import Path
 
 import audit
 import config as config_mod
+import console
 import discover
 import graph_client
 import notify
@@ -78,7 +79,7 @@ PRIORITY_WORD = {1: "now, zero delivery risk", 2: "before enforcement", 3: "enfo
 
 
 def die(msg):
-    print("error: " + msg, file=sys.stderr)
+    print(console.painter(sys.stderr).red("error: ") + msg, file=sys.stderr)
     sys.exit(2)
 
 
@@ -395,10 +396,12 @@ def main():
         die("cannot create %s: %s" % (run_dir, err))
     notes = []
     degraded = []  # tenant steps that failed or were cut short: --strict turns these into exit 1
+    paint = console.painter(sys.stderr)
 
-    def note(msg):
+    def note(msg, shown=None):
+        """Record msg for run.json; print it, or a painted variant of it, to stderr."""
         notes.append(msg)
-        print("note: " + msg, file=sys.stderr)
+        print(paint.dim("note: ") + (shown if shown is not None else msg), file=sys.stderr)
 
     def degrade(msg):
         degraded.append(msg)
@@ -423,7 +426,8 @@ def main():
         failed = [r for r in results if r["status"] == "FAIL"]
         for r in results:
             if r["status"] != "PASS":
-                note("setup %s: %s - %s" % (r["status"], r["check"], r["detail"]))
+                note("setup %s: %s - %s" % (r["status"], r["check"], r["detail"]),
+                     "setup %s: %s - %s" % (paint.status(r["status"]), r["check"], r["detail"]))
         if failed and not args.ignore_setup:
             die("setup check failed (%s); fix it or pass --ignore-setup" % "; ".join(r["check"] for r in failed))
         if failed:
@@ -576,8 +580,9 @@ def main():
         else:
             print(text)
 
-    print("run %s: %s" % (stamp, run_dir))
-    print("latest: %s" % latest)
+    out_paint = console.painter()
+    print(out_paint.bold("run %s:" % stamp) + " %s" % run_dir)
+    print(out_paint.bold("latest:") + " %s" % latest)
     for r in strict_reasons:
         print("strict: %s" % r, file=sys.stderr)
     sys.exit(code)
