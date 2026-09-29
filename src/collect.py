@@ -38,6 +38,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import shutil
 import sys
 from datetime import datetime, timedelta, timezone
@@ -81,26 +82,64 @@ def unique_run_dir(history, stamp):
     return run_dir, run_dir.name
 
 
-def kql_for_domain(template, domain):
+ROW_CAP = 100000  # one hunting call never returns more than this
+
+
+def kql_for_domain(template, domain, start_days=30, end_days=0):
     if PLACEHOLDER not in template:
         raise ValueError("the sender_domain placeholder line was not found in queries/raw_maillog.kql")
-    return template.replace(PLACEHOLDER, 'let sender_domain = "%s";' % domain, 1)
+    kql = template.replace(PLACEHOLDER, 'let sender_domain = "%s";' % domain, 1)
+    kql = re.sub(r"let window_start\s*=[^;]+;", "let window_start  = ago(%dd);" % start_days, kql, count=1)
+    if end_days:
+        kql = re.sub(r"let window_end\s*=[^;]+;", "let window_end    = ago(%dd);" % end_days, kql, count=1)
+    return kql
+
+
+def pull_domain(tok, template, org, start_days, end_days, notes):
+    """One domain's rows for ago(start)..ago(end), splitting the window when
+    a call lands exactly on the 100,000-row API cap - that many rows means
+    rows were silently dropped, so the window halves until every call fits."""
+    res = graph_client.hunting(tok, kql_for_domain(template, org, start_days, end_days),
+                               "P%dD" % (start_days - end_days))
+    got = res.get("results") or []
+    cols = run_hunting.columns(res)
+    if len(got) < ROW_CAP:
+        return got, cols, 1
+    span = start_days - end_days
+    if span <= 1:
+        notes.append("mail log: %s STILL at the 100,000-row cap on a single day "
+                     "(%dd..%dd ago) - that slice is truncated; split the query "
+                     "by subdomain for this domain" % (org, start_days, end_days))
+        return got, cols, 1
+    mid = end_days + span // 2
+    notes.append("mail log: %s hit the 100,000-row API cap (%dd..%dd ago) - splitting the window"
+                 % (org, start_days, end_days))
+    left, cols, n1 = pull_domain(tok, template, org, start_days, mid, notes)
+    right, cols, n2 = pull_domain(tok, template, org, mid, end_days, notes)
+    return left + right, cols, n1 + n2
 
 
 def pull_maillog(tok, org_domains, out_csv, days=30):
-    """raw_maillog.kql once per organizational domain, merged into one CSV."""
+    """raw_maillog.kql per organizational domain, merged into one CSV."""
     template = QUERY.read_text(encoding="utf-8-sig")
     rows, cols, notes = [], None, []
+    seen = set()
     for org in org_domains:
         try:
-            res = graph_client.hunting(tok, kql_for_domain(template, org), "P%dD" % days)
+            got, res_cols, calls = pull_domain(tok, template, org, days, 0, notes)
         except (graph_client.GraphError, ValueError) as err:
             notes.append("mail log for %s not pulled: %s" % (org, err))
             continue
-        got = res.get("results") or []
-        cols = cols or run_hunting.columns(res)
-        rows.extend(got)
-        notes.append("mail log: %d rows for %s (last %d days)" % (len(got), org, days))
+        cols = cols or res_cols
+        before = len(rows)
+        for r in got:
+            key = tuple(sorted(r.items()))  # slice boundaries can repeat a leg
+            if key not in seen:
+                seen.add(key)
+                rows.append(r)
+        suffix = " (%d window slices)" % calls if calls > 1 else ""
+        notes.append("mail log: %d rows for %s (last %d days)%s"
+                     % (len(rows) - before, org, days, suffix))
     if not rows:
         return None, notes
     with open(out_csv, "w", newline="", encoding="utf-8") as fh:

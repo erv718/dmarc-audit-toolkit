@@ -70,3 +70,52 @@ def test_metrics_render_is_a_table():
                                   "findings": {"major": 2}, "genuine_failures": 21, "rua_pass_rate": 0.77,
                                   "plan_changes": 3, "plan_priority1": 2}])
     assert "| 2026-01-08T0600Z | example.com quarantine/no_go | major 2 | 21 | 77.0% | 3 (2 now) |" in md
+
+
+TEMPLATE = ('let sender_domain = "example.com";\n'
+            'let window_start  = ago(30d);\n'
+            'let window_end    = now();\n'
+            'EmailEvents | where Timestamp between (window_start .. window_end)')
+
+
+def test_kql_window_rewrite():
+    out = collect.kql_for_domain(TEMPLATE, "x.example", start_days=7)
+    assert "ago(7d);" in out and "now();" in out
+    out = collect.kql_for_domain(TEMPLATE, "x.example", start_days=14, end_days=7)
+    assert "let window_start  = ago(14d);" in out and "let window_end    = ago(7d);" in out
+    assert "ago(30d)" not in out
+
+
+def test_pull_domain_splits_at_the_row_cap(monkeypatch):
+    import re as _re
+
+    def fake_hunting(tok, kql, ts=None):
+        start = int(_re.search(r"window_start\s*=\s*ago\((\d+)d\)", kql).group(1))
+        m = _re.search(r"window_end\s*=\s*ago\((\d+)d\)", kql)
+        end = int(m.group(1)) if m else 0
+        if start - end > 10:  # any window wider than 10 days comes back capped
+            return {"results": [{"Internet message ID": str(i)} for i in range(100000)],
+                    "schema": [{"name": "Internet message ID"}]}
+        return {"results": [{"Internet message ID": "x"}],
+                "schema": [{"name": "Internet message ID"}]}
+    monkeypatch.setattr(collect.graph_client, "hunting", fake_hunting)
+    notes = []
+    rows, cols, calls = collect.pull_domain("tok", TEMPLATE, "x.example", 30, 0, notes)
+    # (30,0) -> (30,15)+(15,0), both still capped -> four small leaf slices
+    assert calls == 4 and len(rows) == 4
+    assert any("cap" in n for n in notes)
+
+
+def test_pull_maillog_dedupes_boundary_rows(monkeypatch, tmp_path):
+    same_leg = {"Internet message ID": "m1", "Recipients": "a@x.example"}
+
+    def fake_hunting(tok, kql, ts=None):
+        return {"results": [dict(same_leg), dict(same_leg)],
+                "schema": [{"name": "Internet message ID"}, {"name": "Recipients"}]}
+    monkeypatch.setattr(collect.graph_client, "hunting", fake_hunting)
+    out = tmp_path / "maillog.csv"
+    path, notes = collect.pull_maillog("tok", ["x.example"], out)
+    import csv as _csv
+    with open(path, newline="", encoding="utf-8") as fh:
+        assert len(list(_csv.DictReader(fh))) == 1
+    assert any("1 rows for x.example" in n for n in notes)
