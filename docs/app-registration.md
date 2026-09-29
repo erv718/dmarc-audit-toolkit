@@ -95,7 +95,9 @@ secrets. The role assignment, not the permission name, is what decides
 whether the app can change anything; keep it view-only. Skip this entirely
 on the Python path.
 
-To make and upload the certificate on Windows:
+To make and upload the credential, pick your platform:
+
+**Windows** (PowerShell, built in - private key stays in the cert store):
 
 ```powershell
 $c = New-SelfSignedCertificate -Subject "CN=DMARC-Audit-ReadOnly" `
@@ -103,13 +105,36 @@ $c = New-SelfSignedCertificate -Subject "CN=DMARC-Audit-ReadOnly" `
 Export-Certificate -Cert $c -FilePath .\dmarc-audit-readonly.cer
 ```
 
-Upload `dmarc-audit-readonly.cer` under **Certificates & secrets**; the
-private key never leaves your machine. Then in `.env`:
+**macOS / Linux** (OpenSSL, built in on both - two files come out):
+
+```bash
+# private key + public cert, no passphrase so scripts can run unattended
+openssl req -x509 -newkey rsa:2048 -keyout dmarc-audit.key \
+    -out dmarc-audit-readonly.cer -days 365 -nodes -subj "/CN=DMARC-Audit-ReadOnly"
+chmod 600 dmarc-audit.key
+# bundle both into the .pfx the scripts read on this platform
+openssl pkcs12 -export -out dmarc-audit-readonly.pfx \
+    -inkey dmarc-audit.key -in dmarc-audit-readonly.cer -passout pass:
+```
+
+Upload `dmarc-audit-readonly.cer` (same file on every platform) under
+**Certificates & secrets**; the `.key` / `.pfx` never leaves your machine.
+Then in `.env`:
 
 ```
+# Windows:
 EXO_CERT_THUMBPRINT=<the cert's thumbprint>
 EXO_ORGANIZATION=<yourtenant>.onmicrosoft.com
+
+# macOS / Linux:
+EXO_CERT_FILE=dmarc-audit-readonly.pfx
+EXO_ORGANIZATION=<yourtenant>.onmicrosoft.com
 ```
+
+`EXO_APP_ID` is optional and defaults to `AZURE_CLIENT_ID`; `EXO_CERT_PASSWORD`
+is only needed if you put a passphrase on the PFX. A Windows thumbprint is
+shown by `Get-ChildItem Cert:\CurrentUser\My`; on OpenSSL it is
+`openssl x509 -in dmarc-audit-readonly.cer -noout -fingerprint -sha1`.
 
 `EXO_APP_ID` is optional and defaults to `AZURE_CLIENT_ID`. With those set,
 the three scripts connect app-only on their own (via `src/ToolkitExo.ps1`)

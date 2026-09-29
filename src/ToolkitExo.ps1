@@ -60,6 +60,32 @@ function Connect-ToolkitExo {
     $thumb = Get-ToolkitEnvValue $map 'EXO_CERT_THUMBPRINT'
     $org = Get-ToolkitEnvValue $map 'EXO_ORGANIZATION'
 
+    $certFile = Get-ToolkitEnvValue $map 'EXO_CERT_FILE'
+    if ($certFile -and -not [System.IO.Path]::IsPathRooted($certFile)) {
+        $certFile = Join-Path (Split-Path $PSScriptRoot -Parent) $certFile
+    }
+    $certPass = Get-ToolkitEnvValue $map 'EXO_CERT_PASSWORD'
+
+    if ($appId -and $org -and $certFile) {
+        if (Test-Path $certFile) {
+            try {
+                $params = @{ AppId = $appId; Organization = $org; ShowBanner = $false
+                             CertificateFilePath = $certFile; ErrorAction = 'Stop' }
+                if ($certPass) {
+                    $params.CertificatePassword = (ConvertTo-SecureString $certPass -AsPlainText -Force)
+                }
+                Connect-ExchangeOnline @params
+                return $true
+            }
+            catch {
+                Write-Host "App-only Exchange Online connect with EXO_CERT_FILE failed: $($_.Exception.Message)"
+            }
+        }
+        else {
+            Write-Host "EXO_CERT_FILE points at $certFile, which is not there."
+        }
+    }
+
     if ($appId -and $thumb -and $org) {
         try {
             Connect-ExchangeOnline -AppId $appId -CertificateThumbprint $thumb `
@@ -73,8 +99,8 @@ function Connect-ToolkitExo {
             Write-Host "under Certificates & secrets. See docs/app-registration.md."
         }
     }
-    else {
-        Write-Host "No EXO_CERT_THUMBPRINT / EXO_ORGANIZATION in .env - app-only not configured."
+    elseif (-not $certFile) {
+        Write-Host "No EXO_CERT_THUMBPRINT / EXO_CERT_FILE / EXO_ORGANIZATION in .env - app-only not configured."
     }
 
     $answer = 'n'
