@@ -10,7 +10,7 @@ What it answers
 ---------------
   - who sends as the domain, from where, at what volume, how it authenticated
   - which DKIM selectors are actually signing, per signing domain: the
-    evidence CLAUDE.md rule 8 demands before any key is deleted
+    evidence AGENTS.md rule 8 demands before any key is deleted
     (--retiring-selector NAME shows the count for one key)
   - which sources are not in your inventory (--known: domains and IP prefixes)
   - which sources fail with real volume, with a heuristic likely label

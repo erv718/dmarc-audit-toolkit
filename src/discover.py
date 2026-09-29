@@ -75,7 +75,7 @@ ZONE_HOSTS = [
 
 
 def usage_error(msg):
-    print(msg, file=sys.stderr)
+    print("error: " + msg, file=sys.stderr)
     sys.exit(2)
 
 

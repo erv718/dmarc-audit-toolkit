@@ -77,7 +77,7 @@ def _doh_notice(domain, why):
     global _doh_noticed
     if not _doh_noticed:
         _doh_noticed = True
-        print(f"note: {why} for {domain}, querying DNS-over-HTTPS "
+        print(f"note: {why}; querying DNS-over-HTTPS for {domain} "
               f"(dns.google, up to {DOH_TIMEOUT}s per lookup)", file=sys.stderr)
 
 
@@ -139,7 +139,8 @@ def get_spf_status(domain, resolver):
             return None, "absent", f"{path} NOERROR, {len(records)} TXT, none v=spf1"
 
     if resolver is None:
-        prior, why = ["no dnspython"], "dnspython is not installed"
+        prior, why = ["no dnspython"], ("dnspython is not installed, so there is no port-53 path "
+                                        "(pip install -r requirements.txt adds it)")
     elif negative:
         prior, why = [negative], negative
     else:

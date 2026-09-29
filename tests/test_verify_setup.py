@@ -200,6 +200,22 @@ def test_get_wraps_a_persistent_drop(monkeypatch):
         graph_client.get("tok", "/servicePrincipals")
 
 
+def test_creds_names_the_encoding_problem_not_the_exit_code(monkeypatch):
+    # load_env exits 2 on a non-UTF-8 .env; SystemExit(2) stringifies to "2",
+    # so the GraphError used to read "credentials file unreadable: 2"
+    import pytest
+    import run_hunting
+
+    def bad_file(path=None):
+        raise SystemExit(2)
+    monkeypatch.setattr(run_hunting, "load_env", bad_file)
+    with pytest.raises(graph_client.GraphError) as exc:
+        graph_client.creds("C:/somewhere/.env")
+    msg = str(exc.value)
+    assert "UTF-8" in msg and "C:/somewhere/.env" in msg
+    assert not msg.endswith(": 2")
+
+
 def test_sp_grants_survives_a_failed_catalog(monkeypatch):
     def fake_get(tok, url, params=None, **kw):
         if url == "/servicePrincipals":

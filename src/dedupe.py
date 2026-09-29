@@ -477,7 +477,7 @@ def print_report(c, verdicts, findings, auth_column=None, top=20):
 # -------------------------------------------------------------------- cli
 
 def die(msg):
-    print(msg, file=sys.stderr)
+    print("error: " + msg, file=sys.stderr)
     sys.exit(2)
 
 

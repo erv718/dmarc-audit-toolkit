@@ -122,7 +122,8 @@ def main():
     except graph_client.GraphError as err:
         die(str(err))
     if cred is None:
-        die("missing credentials: " + ", ".join(graph_client.missing_keys()) + " - see docs/app-registration.md")
+        die("missing credentials: " + ", ".join(graph_client.missing_keys())
+            + " - copy .env.example to .env and fill them in (docs/app-registration.md)")
     mailbox = args.mailbox or os.environ.get("RUA_MAILBOX")
     if not mailbox:
         die("no mailbox: pass --mailbox or set RUA_MAILBOX in .env")

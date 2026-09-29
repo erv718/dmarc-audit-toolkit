@@ -39,7 +39,7 @@ DEFAULT_ENV = ROOT / ".env"
 
 def usage_error(msg):
     """Input or usage problem: clear message on stderr, exit 2, no traceback."""
-    print(msg, file=sys.stderr)
+    print("error: " + msg, file=sys.stderr)
     sys.exit(2)
 
 
@@ -84,7 +84,7 @@ def require_creds(env_path=None):
     if missing:
         where = env_path or default_env_file()
         usage_error("missing credentials: " + ", ".join(missing)
-                    + "  (put them in %s - see docs/app-registration.md)" % where)
+                    + " - copy .env.example to %s and fill them in (docs/app-registration.md)" % where)
     return tuple(os.environ[k] for k in ENV_KEYS)
 
 

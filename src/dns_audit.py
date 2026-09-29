@@ -156,6 +156,11 @@ def resolve_ex(resolver, name, rtype):
     cross-checked over DoH: interception fakes NXDOMAIN as easily as SERVFAIL.
     """
     p53 = None
+    if resolver is None and dns is None and not _net["doh_notice"]:
+        _net["doh_notice"] = True
+        print("note: dnspython is not installed, so there is no port-53 path (pip install -r "
+              "requirements.txt adds it); every lookup goes over DNS-over-HTTPS via dns.google",
+              file=sys.stderr, flush=True)
     if resolver is not None and time.time() >= _net["p53_skip_until"]:
         for tcp in (False, True):
             recs, p53 = _port53(resolver, name, rtype, tcp)

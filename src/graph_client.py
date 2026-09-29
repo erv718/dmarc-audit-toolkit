@@ -36,8 +36,12 @@ def creds(env_file=None):
     """(tenant, client_id, secret) from .env or the environment, or None."""
     try:
         run_hunting.load_env(env_file)
-    except SystemExit as err:
-        raise GraphError("credentials file unreadable: %s" % err)
+    except SystemExit:
+        # load_env's only exit is a file that is not UTF-8; SystemExit(2)
+        # carries no text, so say what went wrong rather than "unreadable: 2"
+        where = env_file or run_hunting.default_env_file()
+        raise GraphError("credentials file %s is not UTF-8 (PowerShell may have written "
+                         "UTF-16; re-save it as UTF-8)" % where)
     values = [os.environ.get(k) for k in run_hunting.ENV_KEYS]
     if not all(values):
         return None

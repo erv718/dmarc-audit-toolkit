@@ -83,11 +83,11 @@ FIELD_CLIP = 300
 MAX_DOMAINS = 25
 
 # Every row a tool returns is copied into the client's conversation, which
-# may be logged or synced off this machine - CLAUDE.md rule 3.
+# may be logged or synced off this machine - AGENTS.md rule 3.
 TENANT_DATA_NOTE = (
     "preview rows are live tenant data and have now left this machine via the "
     "conversation; redact company domains, names and IPs before any of it is "
-    "published or pasted externally (CLAUDE.md rule 3). Pass out_csv to keep "
+    "published or pasted externally (AGENTS.md rule 3). Pass out_csv to keep "
     "the full result set local, and preview_rows=0 to send no rows at all.")
 
 
@@ -323,7 +323,7 @@ def run_hunting_query(
     missing = [k for k, v in creds.items() if not v]
     if missing:
         return {"error": "missing credentials: " + ", ".join(missing)
-                         + " - put them in .env, see docs/app-registration.md"}
+                         + " - copy .env.example to .env and fill them in (docs/app-registration.md)"}
     try:
         limit = max(0, min(int(preview_rows), ROW_PREVIEW_CAP))
     except (TypeError, ValueError):
@@ -522,7 +522,7 @@ def run_audit(
         "offline": report["offline"],
         "note": ("full detail is in the two report files on this machine; the "
                  "preview below may contain tenant data now in the conversation "
-                 "- redact before publishing (CLAUDE.md rule 3)."),
+                 "- redact before publishing (AGENTS.md rule 3)."),
     }
     reply.update(_cap_list(report["findings"], "findings"))
     try:
@@ -538,9 +538,9 @@ if __name__ == "__main__":
     if not ai_analysis_enabled():
         # exit 2 (usage), the same status as a missing MCP SDK: the server
         # was asked to run without its prerequisite, nothing failed inside it
-        print("AI analysis is off: no tool here runs for an AI client until"
-              " AI_ANALYSIS_ENABLED=true is set in the repo's .env or as an"
-              " environment variable (see .env.example). That is a deliberate"
-              " opt-in, not a bug.", file=sys.stderr)
+        print("AI analysis is off (the deliberate default): set"
+              " AI_ANALYSIS_ENABLED=true in the repo's .env, or in the"
+              " environment, to start this server. See .env.example.",
+              file=sys.stderr)
         sys.exit(2)
     server.run()

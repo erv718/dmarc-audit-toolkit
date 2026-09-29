@@ -784,7 +784,9 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
         raise UsageError("--offline with no inputs: pass --rua, --maillog, --headers and/or "
                          "--rules-json, --bypasses-json, --groups-json")
     if not offline and not domains:
-        raise UsageError("no domains given (or pass --offline with input files)")
+        raise UsageError("no domains to audit: name them on the command line, pass --file, or put "
+                         "app registration credentials in .env so the tenant's list is read "
+                         "(docs/app-registration.md); --offline audits the given files only")
     _known_path_check(known)
 
     dns_reports = None

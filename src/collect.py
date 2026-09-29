@@ -7,7 +7,8 @@ What it does, in order, and what it skips when it cannot:
   2. discover the domains: command line, --file, the tenant's own list,
      and with --mailflow every subdomain seen sending in 30 days
   3. pull the raw mail log for each organizational domain through advanced
-     hunting (skipped with no credentials; --maillog uses a file instead)
+     hunting; a domain that lands on the 100,000-row API cap is pulled in
+     window slices (skipped with no credentials; --maillog uses a file instead)
   4. pull new aggregate reports from the report mailbox (RUA_MAILBOX in .env;
      --rua uses saved files instead)
   5. run the audit: DNS posture, deduplicated mail log, outside view, headers
