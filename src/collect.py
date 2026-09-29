@@ -46,6 +46,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import audit
+import console
 import discover
 import graph_client
 import notify
@@ -66,7 +67,7 @@ RUN_FILES = ("report.md", "report.json", "plan.md", "plan.json", "inventory.json
 
 
 def die(msg):
-    print("error: " + msg, file=sys.stderr)
+    print(console.painter(sys.stderr).red("error: ") + msg, file=sys.stderr)
     sys.exit(2)
 
 
@@ -231,10 +232,12 @@ def main():
     except OSError as err:
         die("cannot create %s: %s" % (run_dir, err))
     notes = []
+    paint = console.painter(sys.stderr)
 
-    def note(msg):
+    def note(msg, shown=None):
+        """Record msg for run.json; print it, or a painted variant of it, to stderr."""
         notes.append(msg)
-        print("note: " + msg, file=sys.stderr)
+        print(paint.dim("note: ") + (shown if shown is not None else msg), file=sys.stderr)
 
     # 1. credentials and setup
     cred = None
@@ -252,7 +255,8 @@ def main():
         failed = [r for r in results if r["status"] == "FAIL"]
         for r in results:
             if r["status"] != "PASS":
-                note("setup %s: %s - %s" % (r["status"], r["check"], r["detail"]))
+                note("setup %s: %s - %s" % (r["status"], r["check"], r["detail"]),
+                     "setup %s: %s - %s" % (paint.status(r["status"]), r["check"], r["detail"]))
         if failed and not args.ignore_setup:
             die("setup check failed (%s); fix it or pass --ignore-setup" % "; ".join(r["check"] for r in failed))
         try:
@@ -372,8 +376,9 @@ def main():
         else:
             print(text)
 
-    print("run %s: %s" % (stamp, run_dir))
-    print("latest: %s" % latest)
+    out_paint = console.painter()
+    print(out_paint.bold("run %s:" % stamp) + " %s" % run_dir)
+    print(out_paint.bold("latest:") + " %s" % latest)
     sys.exit(1 if report.get("exit_code") == 1 else 0)
 
 

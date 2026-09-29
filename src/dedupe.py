@@ -59,6 +59,8 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import console
+
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -424,26 +426,33 @@ def _list(title, why, items, top):
 
 
 def print_report(c, verdicts, findings, auth_column=None, top=20):
+    paint = console.painter()
     scope = ""
     if c["rows_in_scope"] != c["raw_rows"]:
         scope = "   (%d in scope after --sender-domain)" % c["rows_in_scope"]
     print(f"rows read                   : {c['raw_rows']}{scope}")
     if c["rows_without_msgid"]:
-        print(f"  without a Message-ID      : {c['rows_without_msgid']}   <-- cannot be deduplicated, left out below")
+        print(f"  without a Message-ID      : {c['rows_without_msgid']}"
+              + paint.dim("   <-- cannot be deduplicated, left out below"))
     print(f"logical messages            : {c['logical_messages']}")
     print(f"  with more than one leg    : {c['multi_leg']}")
-    print(f"  GENUINE failures          : {c['genuine_failures']}   <-- the real number")
-    print(f"  messages with an echo leg : {c['echo_messages']}   <-- a failing copy of a message that also passed; not failures")
+    print("  GENUINE failures          : " + paint.bold(str(c["genuine_failures"]))
+          + paint.dim("   <-- the real number"))
+    print(f"  messages with an echo leg : {c['echo_messages']}"
+          + paint.dim("   <-- a failing copy of a message that also passed; not failures"))
     print(f"  delivered only via relay  : {c['relayed_only']}")
     if auth_column:
         print()
         print(f"delivery vs authentication (auth column: {auth_column}):")
-        print(f"  failed authentication but DELIVERED           : {c['delivered_despite_fail']}   <-- a local override let these through")
-        print(f"  passed authentication but BLOCKED/QUARANTINED : {c['blocked_despite_pass']}   <-- something other than DMARC caught these")
+        print(f"  failed authentication but DELIVERED           : {c['delivered_despite_fail']}"
+              + paint.dim("   <-- a local override let these through"))
+        print(f"  passed authentication but BLOCKED/QUARANTINED : {c['blocked_despite_pass']}"
+              + paint.dim("   <-- something other than DMARC caught these"))
     print()
     print(f"raw rows with a failing verdict: {c['raw_failing_rows']}")
     if c["logical_messages"]:
-        print(f"counting rows would report {c['raw_failing_rows']} failures; the true count is {c['genuine_failures']}.")
+        print(paint.bold(f"counting rows would report {c['raw_failing_rows']} failures; "
+                         f"the true count is {c['genuine_failures']}."))
 
     genuine = {k: v for k, v in verdicts.items() if v["genuine_failure"]}
     if genuine:
@@ -469,9 +478,11 @@ def print_report(c, verdicts, findings, auth_column=None, top=20):
               [(k, v) for k, v in verdicts.items() if v["blocked_despite_pass"]], top)
 
     actionable = sum(1 for f in findings if f["severity"] in ("major", "blocking"))
-    print(f"\n{len(findings)} findings, {actionable} major or blocking")
+    print("\n" + paint.banner(f"{len(findings)} findings, {actionable} major or blocking",
+                              "warn" if actionable else "ok"))
     for f in findings:
-        print(f"  [{f['severity']}] {f['id']} {f['title']}" + ("" if f["verified"] else " (heuristic, not verified)"))
+        print("  [" + paint.severity(f["severity"]) + f"] {f['id']} {f['title']}"
+              + ("" if f["verified"] else paint.dim(" (heuristic, not verified)")))
 
 
 # -------------------------------------------------------------------- cli

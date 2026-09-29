@@ -33,6 +33,9 @@ import sys
 
 import graph_client
 import run_hunting
+# The color helper lives in console.py so every tool paints the same way;
+# Paint, color_wanted and enable_windows_ansi stay importable from here.
+from console import Paint, color_wanted, enable_windows_ansi, painter
 
 REQUIRED = {"ThreatHunting.Read.All": "run the hunting queries (30-day mail-flow data)"}
 DOMAIN_ROLES = {"Domain.Read.All": "list the tenant's domains (least privilege)",
@@ -44,46 +47,6 @@ WRITE_MARKERS = ("ReadWrite", "Write", "Manage", "FullControl", "Send", "Create"
 GRANT_READERS = ("Application.Read.All", "Directory.Read.All")
 
 STATUSES = ("PASS", "WARN", "FAIL", "INFO")
-
-
-class Paint:
-    """Stdlib ANSI color, on only when the terminal can use it."""
-
-    STATUS_COLOR = {"PASS": "32", "WARN": "33", "FAIL": "31", "INFO": "36"}
-
-    def __init__(self, enabled):
-        self.enabled = enabled
-
-    def _wrap(self, code, text):
-        return "\033[%sm%s\033[0m" % (code, text) if self.enabled else text
-
-    def status(self, status):
-        return self._wrap(self.STATUS_COLOR.get(status, "0") + ";1", status)
-
-    def bold(self, text):
-        return self._wrap("1", text)
-
-    def dim(self, text):
-        return self._wrap("2", text)
-
-
-def color_wanted(stream):
-    """Color unless piped, explicitly disabled (NO_COLOR), or a dumb terminal."""
-    if os.environ.get("NO_COLOR") is not None or os.environ.get("TERM") == "dumb":
-        return False
-    return hasattr(stream, "isatty") and stream.isatty()
-
-
-def enable_windows_ansi():
-    """Ask the Windows console for VT processing; a no-op elsewhere."""
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
-    except Exception:
-        pass
 
 
 def check(results, name, status, detail, fix="", lines=None):
@@ -277,8 +240,8 @@ def print_report(results, paint):
         "OK" if not counts["WARN"] else "OK - with warnings worth fixing")
     tail = "%d passed, %d warnings, %d failed" % (counts["PASS"], counts["WARN"], failed)
     banner = "setup: %s (%s)" % (verdict, tail)
-    color = "31;1" if failed else ("33;1" if counts["WARN"] else "32;1")
-    print(paint._wrap(color, banner))
+    level = "fail" if failed else ("warn" if counts["WARN"] else "ok")
+    print(paint.banner(banner, level))
 
 
 def main():
@@ -294,8 +257,7 @@ def main():
     if args.json:
         print(json.dumps({"results": results, "ok": not failed}, indent=1))
     else:
-        enable_windows_ansi()
-        print_report(results, Paint(color_wanted(sys.stdout)))
+        print_report(results, painter(sys.stdout))
     sys.exit(1 if failed else 0)
 
 

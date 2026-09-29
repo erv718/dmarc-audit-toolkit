@@ -41,6 +41,7 @@ try:
 except ImportError:
     dns = None
 
+import console
 import spf_lookups
 from spf_lookups import get_spf, walk, LIMIT
 
@@ -495,23 +496,25 @@ def _mx_line(r):
 
 
 def print_report(r):
-    print(f"=== {r['domain']} ===")
+    paint = console.painter()
+    print(paint.bold(f"=== {r['domain']} ==="))
     if r["spf_status"] == "error":
-        spf_line = "LOOKUP FAILED - not verified"
+        spf_line = paint.red("LOOKUP FAILED - not verified")
     elif r["spf"] and r.get("spf_lookups_failed"):
-        spf_line = (f"yes, at least {r['spf_lookups']}/{LIMIT} lookups "
-                    f"({r['spf_lookups_failed']} include(s) unresolved - count not verified), {r['spf_terminator']}")
+        spf_line = paint.yellow(f"yes, at least {r['spf_lookups']}/{LIMIT} lookups "
+                                f"({r['spf_lookups_failed']} include(s) unresolved - count not verified), "
+                                f"{r['spf_terminator']}")
     elif r["spf"]:
         spf_line = f"yes, {r['spf_lookups']}/{LIMIT} lookups, {r['spf_terminator']}"
     else:
-        spf_line = "MISSING"
+        spf_line = paint.red("MISSING")
     print(f"  SPF   : {spf_line}")
 
     if r["dmarc_status"] == "error":
-        dmarc_line = "LOOKUP FAILED - not verified"
+        dmarc_line = paint.red("LOOKUP FAILED - not verified")
     elif not r["dmarc"]:
         apex = org_domain(r["domain"])
-        dmarc_line = "MISSING" + (f" (none at any ancestor up to {apex})" if apex != r["domain"] else "")
+        dmarc_line = paint.red("MISSING" + (f" (none at any ancestor up to {apex})" if apex != r["domain"] else ""))
     elif r["inherited"]:
         dmarc_line = f"inherited from {r['dmarc_source']} (effective policy {r['effective_policy']}): {r['dmarc']}"
     else:
@@ -522,7 +525,8 @@ def print_report(r):
         dkim_line = "unknown (wildcard at _domainkey)"
     elif r.get("dkim_status") == "error":
         n, m = len(r.get("dkim_unresolved") or []), len(r["dkim_probed"])
-        dkim_line = "LOOKUP FAILED - not verified" + (f" ({n} of {m} selector probes failed)" if n != m else "")
+        dkim_line = paint.red("LOOKUP FAILED - not verified"
+                              + (f" ({n} of {m} selector probes failed)" if n != m else ""))
     elif r["dkim_selectors"]:
         dkim_line = ", ".join(r["dkim_selectors"])
     elif len(r["dkim_probed"]) > len(COMMON_SELECTORS):
@@ -534,8 +538,9 @@ def print_report(r):
     print(f"  DKIM  : {dkim_line}")
     print(f"  MX    : {_mx_line(r)}")
     for f in r["findings"]:
-        print(f"  !! [{f['severity']}] {f['title']}" + ("" if f["verified"] else " (not verified)"))
-        print(f"       fix: {f['action']}")
+        print("  !! [" + paint.severity(f["severity"]) + f"] {f['title']}"
+              + ("" if f["verified"] else paint.dim(" (not verified)")))
+        print(paint.dim(f"       fix: {f['action']}"))
     print()
 
 
@@ -586,7 +591,8 @@ def main():
 
     for r in results:
         print_report(r)
-    print(f"{len(results)} domains audited, {len(all_findings)} findings, {actionable} major or blocking")
+    print(console.painter().by_exit(
+        f"{len(results)} domains audited, {len(all_findings)} findings, {actionable} major or blocking", code))
     sys.exit(code)
 
 

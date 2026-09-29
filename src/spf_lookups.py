@@ -30,6 +30,8 @@ import sys
 import urllib.parse
 import urllib.request
 
+import console
+
 try:
     import dns.resolver  # dnspython
     _NEGATIVE = (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer)  # authoritative "nothing here"
@@ -243,24 +245,27 @@ def analyse(domain, resolver):
 
 def report(r):
     """Human-readable block for one analysed domain."""
-    print(f"=== {r['domain']} ===")
+    paint = console.painter()
+    severity = r.get("severity", "info")
+    print(paint.bold(f"=== {r['domain']} ==="))
     if r["status"] == "error":
-        print(f"  SPF lookup FAILED for {r['domain']} - could not verify ({r['evidence']})")
+        print(paint.red(f"  SPF lookup FAILED for {r['domain']} - could not verify ({r['evidence']})"))
         print()
         return
     if r["status"] == "absent":
         print(f"  (no SPF record)   {r['evidence']}")
-        print(f"  verdict: {r['verdict']}")
+        print("  verdict: " + paint.by_severity(r["verdict"], severity))
         print()
         return
     print(f"  {r['record']}")
-    print(f"  source: {r['evidence']}")
+    print(paint.dim(f"  source: {r['evidence']}"))
     for m in r["mechanisms"]:
         marker = "*" if m["counts"] else " "
-        print(f"  {'  ' * m['depth']}{marker} {m['mechanism']}")
-    print(f"  lookups: {r['lookups']} / {r['limit']}   {r['verdict']}")
+        line = f"  {'  ' * m['depth']}{marker} {m['mechanism']}"
+        print(paint.red(line) if m["mechanism"].startswith("LOOKUP FAILED") else line)
+    print(f"  lookups: {r['lookups']} / {r['limit']}   " + paint.by_severity(r["verdict"], severity))
     if r["lookups"] >= LIMIT - 1:
-        print("  note: authenticate new senders with DKIM rather than an SPF include.")
+        print(paint.dim("  note: authenticate new senders with DKIM rather than an SPF include."))
     print()
 
 
