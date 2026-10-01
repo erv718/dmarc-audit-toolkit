@@ -17,7 +17,7 @@ import plan
 
 ROOT = Path(__file__).resolve().parent.parent
 OWNERS = ROOT / "samples" / "owners.csv.example"
-HEADINGS = ["## Where we stand (last 30 days, deduplicated)", "## What is failing", "## Per domain",
+HEADINGS = ["## Where we stand (", "## What is failing", "## Per domain",
             "## What happens next, by owner", "## The ask", "## Open questions"]
 DASHES = [chr(c) for c in range(0x2010, 0x2016)]  # hyphen, dashes and bar: never in the output
 # numbers the template itself carries: the 30-day window and the under-10 headline rule
@@ -164,10 +164,10 @@ def test_sample_document_has_the_template_shape(sample, tmp_path):
         c["genuine_failures"], c["raw_failing_rows"]) in md
     assert "- **Delivered despite failing: %d**" % c["delivered_despite_fail"] in md
     disp = rep["rua"]["totals"]["by_disposition"]
-    assert "- **Spoofing blocked by receivers: %d rejected / %d quarantined**" % (
+    assert "- **Mail refused or quarantined by receivers under our policy: %d rejected / %d quarantined**" % (
         disp.get("reject", 0), disp.get("quarantine", 0)) in md
     assert "- **Trend: first run, no trend yet**" in md
-    assert "| `example.com` | p=reject | no_go |" in md
+    assert "| `example.com` | p=reject | not yet |" in md
     assert doc["ask"].startswith("Nothing to approve this week: example.com is at p=reject")
     assert md.rstrip().endswith("it is not a failure.") and "Glossary. DMARC is " in md
     assert "no sentence here was written by an AI" in md
@@ -215,8 +215,8 @@ def test_with_a_plan_the_next_step_and_ids_come_from_the_plan(planned, tmp_path)
     assert "The next safe step is to raise pct to 50, ready when " in doc["one_liner"]
     assert doc["next_step"]["ref"] == ratchet["id"] and doc["next_step"]["source"] == "plan"
     assert doc["next_step"]["prerequisites"]  # the plan's holds, reworded as conditions
-    assert "| `example.com` | p=quarantine, pct=25 | no_go | raise pct to 50 (plan %s) |" % ratchet["id"] in md
-    assert ("| `news.example.com` | p=none (inherited from example.com) | go | "
+    assert "| `example.com` | p=quarantine, pct=25 | not yet | raise pct to 50 (plan %s) |" % ratchet["id"] in md
+    assert ("| `news.example.com` | p=none (inherited from example.com) | needs more data | "
             "publish a p=none monitoring record (plan %s) |" % monitor["id"]) in md
     assert ratchet["human_summary"] in md  # the plan's plain-language sentence rides along
     assert "- **1 zero-risk monitoring record** ready to publish (plan %s)" % monitor["id"] in md
@@ -268,7 +268,7 @@ def test_unassigned_group_holds_everything_without_owners_and_clears_with_them(s
     assert next_steps.UNASSIGNED not in md and "(owner: unassigned)" not in md
     assert "- **Statements platform team** (#billing-systems)" in md
     assert "  - **statements@example.com - 3 messages** DKIM-sign this sender" in md
-    assert "owners file samples/owners.csv.example (3 patterns)" in md
+    assert "owners file owners.csv.example (3 patterns)" in md
 
 
 @no_root_owners
@@ -321,8 +321,8 @@ def test_output_never_carries_a_dash_other_than_a_hyphen(sample):
     md = next_steps.render_md(doc)
     assert "Quarterly review - agenda" in md
     assert not [d for d in DASHES if d in md or d in json.dumps(doc)]
-    assert doc["one_liner"].startswith("example.com is at p=none. 1 of our own sending streams still fails "
-                                       "(crm@example.com x2).")
+    assert doc["one_liner"].startswith("example.com is at p=none. Across all audited domains, 1 of our own "
+                                       "senders still fails (crm@example.com x2).")
 
 
 # ------------------------------------------------------------------ errors and degraded inputs
@@ -355,7 +355,7 @@ def test_document_degrades_gracefully_without_a_mail_log(headers_only, tmp_path)
     doc = next_steps.build(rep, owners=owners(), owners_path=OWNERS)
     lines = doc["stand"]["lines"]
     assert lines[0].startswith("**Genuine failures: not in this run** - no mail log was read")
-    assert any(l.startswith("**Spoofing blocked by receivers: outside view not in this run**") for l in lines)
+    assert any(l.startswith("**Mail refused or quarantined by receivers: outside view not in this run**") for l in lines)
     assert lines[-1] == "**Trend: first run, no trend yet**"
     assert doc["stand"]["genuine_failures"] is None and doc["stand"]["spoofing_blocked"] is None
     assert doc["failing"]["lines"] == ["Not in this run: no mail log and no aggregate reports were read, "
@@ -379,17 +379,13 @@ def test_reports_only_run_keeps_the_outside_view():
     lines = doc["stand"]["lines"]
     assert lines[0].startswith("**Genuine failures: not in this run**")
     disp = rep["rua"]["totals"]["by_disposition"]
-    assert lines[1].startswith("**Spoofing blocked by receivers: %d rejected / %d quarantined**"
+    assert lines[1].startswith("**Mail refused or quarantined by receivers under our policy: %d rejected / %d quarantined**"
                                % (disp.get("reject", 0), disp.get("quarantine", 0)))
     assert doc["failing"]["streams"]["basis"] == "aggregate reports"
     assert "(from the aggregate reports)" in doc["one_liner"]
     assert doc["failing"]["lines"][0].startswith("From the outside (aggregate reports;")
 
 
-@pytest.mark.xfail(strict=True, reason="next_steps.org_next turns the gate's 'unknown - no DMARC policy "
-                   "determined' into a step that the one-liner calls 'ready now' and the ask requests a "
-                   "go-ahead for; with no policy the document should say no next step could be determined "
-                   "(src/next_steps.py, not owned by this test's author)")
 def test_unknown_policy_is_not_presented_as_a_ready_step(headers_only):
     doc = next_steps.build(headers_only["report"])
     assert doc["policy"]["p"] is None

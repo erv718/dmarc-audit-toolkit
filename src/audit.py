@@ -484,19 +484,28 @@ def maillog_census(maillog_doc):
     return {"by_envelope": cs["by_envelope"], "by_sender": cs["by_sender"], "note": CENSUS_NOTE}
 
 def headline_domain(domains, domain_sources=None, headline=None):
-    """The domain the overall verdict line names, and why. headline is the
-    domain the caller says was typed first on its command line (audit.py and
-    collect.py pass it; a sorted inventory cannot tell); else the shortest
-    audited apex, else the shortest audited domain - never whichever sorts
-    first. domain_sources is accepted for older callers and no longer picks
-    the headline: a provenance tag cannot prove the order the domains were
-    typed in. (domain, why)."""
+    """The domain the overall verdict line names, and why, chosen by source
+    priority so the headline is the domain the human most likely means. An
+    explicit headline (the domain the caller says was typed first) wins; else,
+    in order: the first command-line domain, the first --file domain, the
+    shortest audited apex, the shortest audited domain. domain_sources maps
+    each domain to its provenance tags (cli, file, tenant, mailflow); with no
+    sources the first domain given is used. The domains list carries the typed
+    order, so the tag only classifies - it never has to prove the order.
+    (domain, why)."""
     names = [n for n in dict.fromkeys(_norm_name(d) for d in domains) if n]
     if not names:
         return None, None
     want = _norm_name(headline)
     if want and want in names:
         return want, "first on the command line"
+    if not domain_sources:
+        return names[0], "first domain given"
+    srcs = {_norm_name(d): tags for d, tags in domain_sources.items()}
+    for tag, label in (("cli", "first on the command line"), ("file", "first in --file")):
+        tagged = [d for d in names if tag in (srcs.get(d) or ())]
+        if tagged:
+            return tagged[0], label
     apex = [d for d in names if discover.org_domain(d) == d]
     if apex:
         return min(apex, key=lambda d: (len(d), names.index(d))), "shortest audited apex"
@@ -879,9 +888,9 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
     come from its own rows (maillog.by_domain). The top-level current_policy,
     policy_source and next_step are the worst-ranked domain's (on a tie the
     headline domain, then the order given); gate.headline carries the
-    headline domain's. headline: the domain typed first on the caller's
-    command line, when there was one (headline_domain). domain_sources is
-    accepted for older callers and no longer picks the headline."""
+    headline domain's. headline: an optional explicit override; otherwise
+    headline_domain picks the headline from domain_sources by source priority
+    (first cli domain, then first --file domain, then shortest apex)."""
     evidence = evidence_summary(rua_doc, maillog_doc, headers_doc)
     if dns_reports:  # a library caller's spelling must not lose the DNS blockers
         dns_reports = {_norm_name(d): r for d, r in dns_reports.items()}
@@ -1136,8 +1145,9 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                  previous_report=None, headline=None):
     """The whole audit as one document. Raises UsageError on input problems.
     previous_report: an earlier run's report.json as a dict; adds report["delta"].
-    headline: the domain typed first on the caller's command line, if any;
-    it becomes gate.headline (else the shortest audited apex does)."""
+    headline: an optional explicit headline override; without it the headline
+    is chosen from domain_sources by source priority (cli, then --file, then
+    shortest apex) - see headline_domain."""
     domains = [part for d in domains for part in str(d).split(",")]
     if domain_file:
         domains += read_domain_file(domain_file)
