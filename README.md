@@ -36,8 +36,10 @@ notices until the record breaks.
 **1. Audit with no AI.** Python, an optional `.env`, one command. You get
 `report.md` (findings ranked by severity, a go / no-go gate per domain, the
 next policy step) and `report.json`, plus `plan.md` with the records to
-publish next whenever live DNS was checked. No AI, no MCP, nothing beyond
-`requirements.txt`.
+publish next whenever live DNS was checked. One more command,
+`src/next_steps.py`, turns that run into `next_steps.md`, the status
+document you send to the people who fix things (the weekly job below writes
+it for you). No AI, no MCP, nothing beyond `requirements.txt`.
 
 ```bash
 pip install -r requirements.txt
@@ -54,11 +56,13 @@ subdomain seen sending in the last 30 days; `--no-graph` skips the tenant.
 
 **2. Then add the AI, if you want it.** Set `AI_ANALYSIS_ENABLED=true` in
 `.env`, point Claude Code, Codex, Cursor or any agent that reads `AGENTS.md`
-at the repo, and hand it `report.json`. The contract keeps the agent
-read-only and explicit about verified versus inferred. Clients without shell
-access use the MCP server instead (`pip install -r requirements-mcp.txt`, then
-the registration command below). The AI reads what the tools produced; it
-never touches the tenant itself.
+at the repo, and hand it `next_steps.md` to polish and `report.json` for the
+evidence. The contract keeps the agent read-only and explicit about verified
+versus inferred, and it forbids writing a status document from memory when
+the generated one exists. Clients without shell access use the MCP server
+instead (`pip install -r requirements-mcp.txt`, then the registration
+command below). The AI reads what the tools produced; it never touches the
+tenant itself.
 
 ## One command, every week
 
@@ -66,9 +70,9 @@ never touches the tenant itself.
 in `.env` it verifies the registration, reads the tenant's domain list, pulls
 the raw mail log for each organizational domain, pulls new aggregate reports
 out of your report mailbox, runs the audit, writes the rollout plan, keeps a
-dated history with running metrics, and posts a one-message summary to Slack
-or Teams. Without credentials it still runs DNS, the plan, and whatever files
-you hand it.
+dated history with running metrics, writes the status document, and posts a
+one-message summary to Slack or Teams. Without credentials it still runs DNS,
+the plan, the document, and whatever files you hand it.
 
 ```bash
 python src/collect.py                       # everything, from the tenant
@@ -76,13 +80,39 @@ python src/collect.py --dry-run             # same, print the summary instead of
 .\scripts\register_weekly_task.ps1         # Windows: run it every Monday at 06:00
 ```
 
-What you get under `audit-out/`: `latest/report.md` (findings and the gate),
-`latest/plan.md` (the records to publish next, grouped by DNS host, with
-rollback), `history/<date>/` for every run, `metrics.md` across runs, and
-`latest/summary.txt` (what changed since last time: new findings, resolved
-ones, policy changes, newly seen senders, spoofing blocked). The plan is
-regenerated from each run, so the enforcement steps appear only when their
-prerequisites are met - one ratchet per domain per week.
+What you get under `audit-out/`, in the order people read it:
+
+- `latest/next_steps.md` - **the document you send.** Where the rollout
+  stands in one sentence, deduplicated failure counts with the raw number
+  alongside, what is failing by envelope domain and by sender, a per-domain
+  table (policy today, gate, next step), what happens next grouped by owner,
+  the ask for the week, the open questions, and a glossary. Written by
+  `src/next_steps.py` from the files below with no AI involved: every
+  sentence is assembled from the run and every number is copied from it, so
+  any tenant that runs the toolkit gets the same document from the same
+  inputs. `latest/next_steps.json` is the same content as data.
+- `latest/report.md` - the technical detail behind it: every finding with
+  its evidence, the gate reasoning per domain, the mail-log and outside-view
+  numbers, and what was verified versus inferred. `report.json` is what the
+  other tools and any agent read.
+- `latest/plan.md` - the DNS records to publish next, grouped by DNS host,
+  with the current value, rollback and the prerequisites of each step. The
+  plan is regenerated from each run, so an enforcement step appears only
+  when its prerequisites are met - one ratchet per domain per week.
+- `latest/summary.txt` - the one-message version posted to Slack or Teams:
+  what changed since last time (new and resolved findings, policy changes,
+  newly seen senders, spoofing blocked).
+- `history/<date>/` for every run, and `metrics.md` across runs (the trend).
+
+**Who owns what.** `next_steps.md` groups actions by owner, and the owners
+come from `owners.csv` in the repo root: one row per sender address, domain
+or glob, naming the team or person who fixes it and the channel to reach
+them (`samples/owners.csv.example` shows the three pattern kinds). The file
+is local and gitignored, and it is optional: without it the document is
+still written, with every action under "Unassigned - needs an owner" and a
+"who owns this" line in the open questions. Add a row, rerun, and the action
+moves under its owner. `--owners PATH` points at another file, `--no-owners`
+skips the lookup.
 
 ## How far back can it see?
 
@@ -113,6 +143,9 @@ python src/dedupe.py samples/sample_maillog.csv --sender-domain example.com --au
 
 # The whole sweep - DNS posture, rua reports, mail log, headers - ending in a gate verdict
 python src/audit.py example.com --offline --rua samples/rua --maillog samples/sample_maillog.csv --headers samples/headers
+
+# The same run as the document you send: status, what is failing, who fixes it, the ask
+python src/next_steps.py audit-out/report.json --owners samples/owners.csv.example
 ```
 
 The sample output shows the whole point:
@@ -144,10 +177,11 @@ Counting rows would report 33 failures; the true count is 21.
 | `src/graph_client.py` | Shared Microsoft Graph helper (token, paging, domains, hunting, mailbox). Library only. |
 | `src/collect.py` | The weekly job: verify, discover, pull mail log and reports, audit, plan, history and metrics, summary. |
 | `src/plan.py` | report.json in, plan.md out: the exact records to publish per domain, grouped by DNS host, with current value, rollback, priority, and the prerequisites for each enforcement step. |
+| `src/next_steps.py` | report.json in, `next_steps.md` + `next_steps.json` out: the status document you send. One-line status, deduplicated counts with the raw number alongside, what is failing, a per-domain table, actions grouped by owner, the ask and the open questions. Reads `plan.json`, `metrics.json`, the previous run and `owners.csv` when they exist; deterministic, no AI; `collect.py` runs it every week. |
 | `src/fetch_rua.py` | Pulls aggregate (rua) reports out of your report mailbox by Graph (Mail.Read scoped to that mailbox), with a one-time backfill and delta runs after. |
-| `src/notify.py` | One Slack or Teams message per run: policy and gate per domain, findings, failure counts, what changed since the last run. |
+| `src/notify.py` | One Slack or Teams message per run: policy and gate per domain, findings, failure counts, top failing senders, what changed since the last run. |
 | `scripts/register_weekly_task.ps1` | Registers (or removes) the Windows scheduled task that runs `collect.py` weekly. |
-| `src/dedupe.py` | Collapses mail-log rows into logical messages by (Message-ID, recipient) and classifies each one. Reports failed-but-delivered and passed-but-blocked separately, and dies loudly on a misspelled column instead of returning a silent zero. |
+| `src/dedupe.py` | Collapses mail-log rows into logical messages by (Message-ID, recipient) and classifies each one. Reports failed-but-delivered and passed-but-blocked separately, prints a census of the failing senders by envelope domain and by sender address (`--json` carries the full lists), and dies loudly on a misspelled column instead of returning a silent zero. |
 | `src/spf_lookups.py` | Recursively expands an SPF record and counts DNS-querying mechanisms against the RFC 7208 limit of ten. Falls back to DNS-over-HTTPS; reports lookup errors as errors, never as "no record". |
 | `src/dns_audit.py` | Multi-domain posture sweep: SPF strength and lookup budget, DMARC policy and subdomain inheritance, DKIM selectors (incl. dangling CNAMEs), MX. One findings list per domain with evidence. |
 | `src/rua_parse.py` | Turns rua aggregate XML (plain, .gz, or .zip) into answers: selectors still in use, unknown senders, failing streams, SPF-only senders who break at reject. |
@@ -157,8 +191,8 @@ Counting rows would report 33 failures; the true count is 21.
 | `src/run_hunting.py` | Runs the saved KQL by API through a read-only App Registration and writes CSV. The intended data plane - no portal copy-paste. |
 | `src/mcp_server.py` | Exposes the tools above to any MCP client (Claude Code, Claude Desktop, others). One registration command; nothing to deploy. |
 | `queries/` | Eight advanced-hunting queries for Microsoft 365 Defender: deduplicated census and failures, subdomain health, override audit, echo-vs-loss twins, pre-reject DKIM alignment, impersonation, and a raw per-leg export that pipes straight into `dedupe.py`. |
-| `samples/` | Synthetic mail log (clean passes, echo pairs, genuine spoofing, relay-only delivery), sample rua reports, and four annotated message headers. |
-| `docs/` | Methodology and the reasoning behind each tool. |
+| `samples/` | Synthetic mail log (clean passes, echo pairs, genuine spoofing, relay-only delivery), sample rua reports, four annotated message headers, and `owners.csv.example`, the owners file to copy. |
+| `docs/` | Methodology, the reasoning behind each tool, the AI-assisted workflow, and the shape of the generated status document (`docs/templates/next-steps.md`). |
 
 ## What you need to supply
 
@@ -207,6 +241,17 @@ touch your data until `.env` contains `AI_ANALYSIS_ENABLED=true`. The MCP
 server refuses to start without it, and `AGENTS.md` instructs every agent
 to stop without it. Running the Python tools yourself needs no toggle.
 
+The status document is not an AI product. `src/next_steps.py` writes
+`next_steps.md` from `report.json`, `plan.json`, `metrics.json` and
+`owners.csv`, deterministically, with no model in the loop, and `collect.py`
+does that on every run. An agent's job is to refine that document - sharpen
+the hooks, reorder it for the audience, split it into the Slack post, the
+owner messages and the tracker entries - never to produce it from a
+conversation. Nothing in the document depends on what an agent remembers:
+any tenant that runs the toolkit gets the same document from the same
+inputs, and `AGENTS.md` rule 13 tells the agent to edit the generated copy
+rather than write its own.
+
 Two ways to wire that up. Claude Code needs nothing: it is pointed at
 `AGENTS.md` from `CLAUDE.md` and runs the scripts directly. Agents that read
 `AGENTS.md` natively (most coding agents) need even less. Clients without
@@ -232,8 +277,8 @@ repo folder.
 The repo ships an `AGENTS.md` with agent ground rules distilled from running
 this exact project agent-assisted, including the verification habits that
 prevent the classic wrong conclusions: echo miscounts, resolver-path
-misdiagnosis, and deleting keys something still signs with. (`CLAUDE.md`
-points Claude Code at it.) See
+misdiagnosis, deleting keys something still signs with, and writing a status
+document from memory. (`CLAUDE.md` points Claude Code at it.) See
 `docs/ai-assisted-workflow.md` for the human and agent split that worked, and
 the failure modes to watch for.
 

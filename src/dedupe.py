@@ -31,6 +31,11 @@ Every genuine failure gets a "likely" label from the heuristic table below:
 likely_spoof, likely_misconfigured_sender or unknown. It points the
 investigation; it is not a verdict.
 
+The census lists every envelope (MAIL FROM) domain and every sender seen,
+with its genuine failures, worst first: the sender inventory to work through
+before enforcement. The report prints the failing top of each list; --json
+carries the full lists under "census".
+
 Usage
 -----
     python dedupe.py export.csv --sender-domain example.com --auth-column DMARC
@@ -94,6 +99,9 @@ ESP_DOMAINS = ("sendgrid.net", "amazonses.com", "mcsv.net", "mcdlv.net", "rsgsv.
 STABLE_REPEATS = 2
 
 LIKELY_LABELS = ("likely_spoof", "likely_misconfigured_sender", "unknown")
+
+# the report prints this many census entries per list; --json carries them all
+CENSUS_TOP = 10
 
 
 # ------------------------------------------------------------------ input
@@ -301,6 +309,53 @@ def summarize(verdicts):
     }
 
 
+def _dominant(counter):
+    return counter.most_common(1)[0][0] if counter else None
+
+
+def census(verdicts):
+    """Sender census over the verdicts: every envelope (MAIL FROM) domain and
+    every (sender, domain, envelope) stream seen, with its genuine failures,
+    worst first. Clean entries stay in, so a new sender shows up before it
+    fails. Takes the verdict dict from classify() or the --json verdict list.
+    {"by_envelope": [...], "by_sender": [...]}"""
+    vs = list(verdicts.values()) if isinstance(verdicts, dict) else list(verdicts)
+    envs, senders = {}, {}
+    for v in vs:
+        env = (v.get("envelope_domain") or "").strip().lower() or "(blank)"
+        sender = (v.get("sender") or "").strip().lower() or "?"
+        dom = (v.get("domain") or "").strip().lower()
+        failing = bool(v.get("genuine_failure"))
+        likely = v.get("likely") or "unknown"
+        e = envs.setdefault(env, {"messages": 0, "genuine_failures": 0,
+                                  "all": Counter(), "fail": Counter(), "likely": Counter()})
+        e["messages"] += 1
+        e["all"][sender] += 1
+        s = senders.setdefault((sender, dom, env), {"messages": 0, "genuine_failures": 0, "likely": Counter(),
+                                                    "subject": v.get("subject") or "", "fail_subject": None})
+        s["messages"] += 1
+        if failing:
+            e["genuine_failures"] += 1
+            e["fail"][sender] += 1
+            e["likely"][likely] += 1
+            s["genuine_failures"] += 1
+            s["likely"][likely] += 1
+            if s["fail_subject"] is None:
+                s["fail_subject"] = v.get("subject") or ""
+    by_env = [{"envelope_domain": env, "genuine_failures": e["genuine_failures"], "messages": e["messages"],
+               "senders": len(e["all"]), "sample_sender": _dominant(e["fail"]) or _dominant(e["all"]),
+               "likely": _dominant(e["likely"])}
+              for env, e in envs.items()]
+    by_sender = [{"sender": sender, "domain": dom, "envelope_domain": env,
+                  "genuine_failures": s["genuine_failures"], "messages": s["messages"],
+                  "likely": _dominant(s["likely"]),
+                  "sample_subject": s["fail_subject"] if s["fail_subject"] is not None else s["subject"]}
+                 for (sender, dom, env), s in senders.items()]
+    by_env.sort(key=lambda r: (-r["genuine_failures"], -r["messages"], r["envelope_domain"]))
+    by_sender.sort(key=lambda r: (-r["genuine_failures"], -r["messages"], r["sender"], r["envelope_domain"]))
+    return {"by_envelope": by_env, "by_sender": by_sender}
+
+
 def _sample(items, n=5):
     return "; ".join("%s -> %s (%s)" % (v["sender"] or "?", k[1] or "?", v["subject"] or "no subject")
                      for k, v in items[:n]) + (" ..." if len(items) > n else "")
@@ -392,6 +447,7 @@ def build_doc(source, counts, verdicts, findings, sender_domain=None, auth_colum
         "counters": counts,
         "findings": findings,
         "verdicts": [dict(v, msgid=k[0], recipient=k[1]) for k, v in verdicts.items()],
+        "census": census(verdicts),
         "heuristic": {"lure_words": list(LURE_WORDS), "esp_domains": list(ESP_DOMAINS),
                       "vendor_domains": list(vendor_domains or []), "stable_repeats": STABLE_REPEATS,
                       "note": "likely labels are a heuristic, not a verdict"},
@@ -423,6 +479,20 @@ def _list(title, why, items, top):
         print("  " + _fmt_msg(key, v))
     if len(items) > top:
         print("  ... %d more, use --json for the full list" % (len(items) - top))
+
+
+def _print_census(title, entries, name, top, detail):
+    """One census list: failing entries only, worst first, top N, a detail line
+    each. The full list, clean entries included, is in --json (census)."""
+    failing = [e for e in entries if e["genuine_failures"]]
+    if not failing:
+        return
+    print("\n%s (%d failing of %d seen; likely = heuristic):" % (title, len(failing), len(entries)))
+    for e in failing[:top]:
+        print(f"  {e['genuine_failures']:>6}  {e[name]:<40} {e['likely'] or 'unknown'}")
+        print("          " + detail(e))
+    if len(failing) > top:
+        print("  ... %d more, use --json for the full list" % (len(failing) - top))
 
 
 def print_report(c, verdicts, findings, auth_column=None, top=20):
@@ -471,6 +541,15 @@ def print_report(c, verdicts, findings, auth_column=None, top=20):
             subs = Counter(v["subject"] or "(no subject)" for v in vs).most_common()
             print(f"  {n:>6}  {(sender or '(no sender)'):<40} {label}")
             print(f"          envelope: {envs[0][0]}{_more(envs)}   subject: {subs[0][0]}{_more(subs)}")
+        cs = census(verdicts)
+        n = min(top, CENSUS_TOP)
+        _print_census("genuine failures by envelope domain", cs["by_envelope"], "envelope_domain", n,
+                      lambda e: "%d of %d messages fail   senders: %d, e.g. %s"
+                      % (e["genuine_failures"], e["messages"], e["senders"], e["sample_sender"]))
+        _print_census("genuine failures by sender", cs["by_sender"], "sender", n,
+                      lambda e: "%d of %d messages fail   domain: %s   envelope: %s   subject: %s"
+                      % (e["genuine_failures"], e["messages"], e["domain"] or "(none)", e["envelope_domain"],
+                         e["sample_subject"] or "(no subject)"))
     if auth_column:
         _list("failed authentication but DELIVERED", "a local override let these through",
               [(k, v) for k, v in verdicts.items() if v["delivered_despite_fail"]], top)

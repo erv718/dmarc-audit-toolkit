@@ -1,0 +1,4 @@
+pattern,owner,channel,note
+statements@example.com,Statements platform team,#billing-systems,exact sender address; wins over the domain rows below
+example.com,DNS and messaging team,#dns-changes,a domain matches itself and every subdomain (DNS changes and sender fixes)
+*.esp.example,Marketing operations,#marketing-ops,a glob with * matches sender addresses and envelope or DNS domains

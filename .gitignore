@@ -22,6 +22,10 @@ audit-out-ci/
 # your domain-edited query copies (keep the shipped templates pristine)
 queries/live/
 
+# who fixes what: team and people names for next_steps.md, one line per
+# sender or domain (start from samples/owners.csv.example; never committed)
+owners.csv
+
 # your private pre-push deny list (ship only the .example)
 .denylist
 

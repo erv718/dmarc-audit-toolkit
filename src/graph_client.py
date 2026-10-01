@@ -60,6 +60,32 @@ def token(cred):
         raise GraphError(str(err))
 
 
+class TokenSource:
+    """A callable that returns a valid app token, re-acquiring it on demand
+    or once it is older than max_age seconds. Pass it wherever a token
+    string is accepted: a backfill that outlives one token's lifetime keeps
+    going instead of dying with "HTTP 401 Invalid token lifetime"."""
+
+    def __init__(self, cred, max_age=45 * 60):
+        self.cred, self.max_age = cred, max_age
+        self._tok, self._at, self.acquired = None, 0.0, 0
+
+    def __call__(self, refresh=False):
+        if refresh or self._tok is None or time.time() - self._at > self.max_age:
+            self._tok = token(self.cred)
+            self._at = time.time()
+            self.acquired += 1
+        return self._tok
+
+
+def bearer(tok, refresh=False):
+    """The token string behind tok: a plain string, or a TokenSource-like
+    callable (asked for a fresh token when refresh is set)."""
+    if callable(tok):
+        return tok(refresh=True) if refresh else tok()
+    return tok
+
+
 def jwt_claims(tok):
     """Decode the payload of a JWT without verifying it - only to read the
     roles the token carries. Not a security check; the service verifies."""
@@ -78,20 +104,24 @@ def roles(tok):
 TRANSIENT_STATUS = {429, 500, 502, 503, 504}
 
 
-def get(tok, url, params=None, retries=1):
+def get(tok, url, params=None, retries=2):
     """GET a Graph URL (absolute, or a path under GRAPH). Returns JSON.
 
-    A dropped stream (IncompleteRead), a timeout, or a 429/5xx gets one
-    retry before becoming a GraphError: some catalog reads are large and a
-    flaky moment must not take the whole run down."""
+    A dropped stream (IncompleteRead), a timeout, or a 429/5xx gets
+    `retries` more attempts with a growing pause before becoming a
+    GraphError: some reads are large and a flaky moment must not take the
+    whole run down. When tok is a
+    TokenSource (or any callable), a 401 gets one fresh token and one more
+    try, so a long run survives the token's lifetime."""
     if not url.startswith("http"):
         url = GRAPH + "/" + url.lstrip("/")
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
-    for attempt in range(retries + 1):
+    attempt, refreshed = 0, False
+    while True:
         if attempt:
-            time.sleep(2)
-        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok,
+            time.sleep(2 * attempt)
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + bearer(tok),
                                                    "Accept": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
@@ -103,11 +133,17 @@ def get(tok, url, params=None, retries=1):
             except Exception:
                 pass
             detail = "".join(ch for ch in str(detail) if ch >= " ")[:300]
+            if err.code == 401 and callable(tok) and not refreshed:
+                refreshed = True
+                bearer(tok, refresh=True)
+                continue
             if err.code in TRANSIENT_STATUS and attempt < retries:
+                attempt += 1
                 continue
             raise GraphError("HTTP %d on %s: %s" % (err.code, url.split("?")[0], detail), err.code)
         except (OSError, http.client.HTTPException, json.JSONDecodeError) as err:
             if attempt < retries:
+                attempt += 1
                 continue
             raise GraphError("request did not complete: %s"
                              % getattr(err, "reason", err.__class__.__name__))
@@ -147,7 +183,7 @@ def list_domains(tok):
 def hunting(tok, kql, timespan=None):
     """Run a KQL query through the advanced hunting endpoint."""
     try:
-        return run_hunting.run_query(tok, kql, timespan)
+        return run_hunting.run_query(bearer(tok), kql, timespan)
     except SystemExit as err:
         raise GraphError(str(err))
 

@@ -8,7 +8,8 @@ Publish a DMARC record at `p=none` with a `rua` address pointed at your
 aggregate reporting tool (Valimail, dmarcian, or your own rua parser - any of
 them work; this project used Valimail). That is monitoring
 only: it changes nothing about delivery and starts receivers reporting what
-they see. Without it you are guessing.
+they see. Without it you are guessing, and the outside view in every weekly
+status document (`next_steps.md`, step 11) says "not in this run".
 
 Do this for every domain you own, including ones you believe send no mail.
 Dormant domains are attractive precisely because nobody watches them.
@@ -81,6 +82,13 @@ own logs cannot see because they deliver to external recipients.
 Gate each step on one question: **is any legitimate sender in the failing
 bucket?** If the answer is only spoofing, advance.
 
+The weekly run answers that question for you. `src/audit.py` gives the
+verdict per domain, and `next_steps.md` carries it in the "Per domain" table
+(policy today, gate, next step), with the step's prerequisites in the
+one-liner and in "The ask". A step appears in the plan only when its
+prerequisites are met, so the document either asks for this week's change
+or says what is holding it.
+
 ## 8. Enable DKIM before reject, always
 
 SPF breaks when mail is forwarded. DKIM survives it. A domain authenticating on
@@ -112,6 +120,24 @@ An attacker who registers a similar domain and puts your executive's name in
 the From header passes their own authentication perfectly. Pair enforcement
 with impersonation protection and out-of-band verification for payment changes.
 
+## 11. Report from the run, never from memory
+
+The status document is a product of the run. `src/next_steps.py` writes
+`next_steps.md` from `report.json`, the plan, the metrics history and an
+optional owners file, and `collect.py` does it every week: one sentence on
+where the rollout stands, deduplicated counts with the raw number alongside,
+what is failing, a per-domain table, actions grouped by the owner who fixes
+them, the ask, and the open questions. No AI writes any of it, and it needs
+nothing outside the repo, so it is the same document for every tenant that
+runs the toolkit.
+
+A person or an agent polishes it before it goes out: hooks first, the
+audience split (Slack post, owner messages, tracker entries), names behind
+the owner labels. Numbers, verdicts and finding ids stay as generated; when
+something is missing, fix the input (the owners file, the known-sender list,
+the missing evidence) and rerun. `docs/templates/next-steps.md` describes
+the shape and the polishing rules.
+
 ## The tool for each step
 
 | Step | Tool |
@@ -122,7 +148,8 @@ with impersonation protection and out-of-band verification for payment changes.
 | 4. Delivery vs authentication | `src/dedupe.py` two-way split; `queries/delivered_despite_failure.kql` names the override |
 | 5. Allow-rule audit | `src/audit_rules.ps1`, `src/audit_bypasses.ps1`, `src/audit_groups.ps1` |
 | 6. SPF budget | `src/spf_lookups.py`; `src/dns_audit.py` for every domain at once |
-| 7. Ratchet gates | `queries/genuine_failures.kql` at each step; `src/audit.py` gives the verdict |
+| 7. Ratchet gates | `queries/genuine_failures.kql` at each step; `src/audit.py` gives the verdict; `next_steps.md` carries it to the people who decide |
 | 8. DKIM before reject | `queries/dkim_alignment.kql` for the fleet; `src/headers.py` for one live proof |
 | 9. Vendors without DKIM | the subdomain bounce-address pattern above; verify with `src/headers.py` |
 | 10. What DMARC misses | `queries/impersonation.kql` |
+| 11. Status reporting | `src/next_steps.py`, run by `src/collect.py` every week; polishing rules in `docs/templates/next-steps.md` |

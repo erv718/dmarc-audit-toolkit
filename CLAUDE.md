@@ -8,3 +8,8 @@ Everything in AGENTS.md applies verbatim: the read-only ground rules, the
 credential-handling rule, the verification habits that prevent the classic
 wrong conclusions, the export data dictionary, and the working sequence in
 `docs/methodology.md`.
+
+The working sequence starts from `audit-out/latest/next_steps.md` and
+`next_steps.json` (the status document the toolkit itself writes, with no
+AI), then `report.json` for the evidence. Rule 13 applies: never produce a
+status document from memory when `next_steps.md` exists - edit it.

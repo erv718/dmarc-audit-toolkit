@@ -26,6 +26,13 @@ The rules are the methodology, encoded (docs/methodology.md):
                        sender still failing holds that domain's next
                        enforcement step, and says why.
 
+Every change also carries a plain-language layer for the next-steps document
+(src/next_steps.py): owner_hint (the domain whose DNS the change touches),
+human_summary (one sentence for a reader who does not read DNS) and
+prerequisite_items (each prerequisite typed by what would prove it; met stays
+null for the reader to decide). next_step_for(plan, domain) picks a domain's
+pending enforcement step.
+
 Nothing here changes DNS. Every change carries the current value and the
 rollback so the human can apply and revert it.
 
@@ -175,6 +182,117 @@ def evidence_for(report, domain):
 
 
 # --------------------------------------------------------------------------
+# the plain-language layer (what src/next_steps.py reads)
+
+PREREQ_KINDS = ("dkim_proof", "list_proof", "spf_budget", "evidence", "verify_unused", "reports", "other")
+# first match wins, so the order matters: an evidence hold can mention DKIM and
+# a DKIM prerequisite can mention forwarding
+PREREQ_RULES = (
+    ("verify_unused", re.compile(r"verif(?:y|ied) unused", re.I)),
+    ("spf_budget", re.compile(r"\blookups?\b", re.I)),
+    ("other", re.compile(r"sender inventory", re.I)),
+    ("evidence", re.compile(r"mail log|aggregate reports|failure evidence|failure check|--maillog|--rua", re.I)),
+    ("reports", re.compile(r"\breports?\b|stable for \d+ days", re.I)),
+    ("dkim_proof", re.compile(r"\bdkim\b|_domainkey", re.I)),
+    ("list_proof", re.compile(r"\blist\b|forwarder|forwarding|canary|delivered_twin", re.I)),
+)
+ENFORCEMENT_PRIORITIES = (3, 4, 5)
+
+
+def prereq_kind(text):
+    """What would prove a prerequisite, by keyword: one of PREREQ_KINDS."""
+    for kind, rx in PREREQ_RULES:
+        if rx.search(text or ""):
+            return kind
+    return "other"
+
+
+def prereq_items(prereqs):
+    """The structured twin of a prerequisites list. met stays None: the reader decides."""
+    return [{"text": p, "kind": prereq_kind(p), "met": None} for p in prereqs]
+
+
+def _share(pct):
+    n = int(pct) if str(pct or "").isdigit() else 100
+    return {25: "a quarter of", 50: "half of", 100: "all of"}.get(n, "%d percent of" % n)
+
+
+def human_summary(change):
+    """One plain sentence about a change for a reader who does not read DNS."""
+    domain = change.get("domain") or change.get("hostname") or "the domain"
+    kind = change.get("kind")
+    host = str(change.get("hostname") or "")
+    value = str(change.get("value") or "")
+    current = str(change.get("current") or "")
+    why = str(change.get("why") or "")
+    is_spf = value.lower().startswith("v=spf1")
+    is_dmarc = host.startswith("_dmarc.") or value.lower().startswith("v=dmarc1")
+    new = dmarc_tags(value) if is_dmarc else {}
+    old = dmarc_tags(current) if current.lower().startswith("v=dmarc1") else {}
+    if kind == "park":
+        if is_spf:
+            return ("Declare that no server may send mail as %s, which sends nothing today; this stops the parked "
+                    "domain being used for spoofing and affects no legitimate mail." % domain)
+        return ("Tell receivers to refuse anything claiming to come from %s, which sends no mail; the reporting "
+                "address still shows every attempt." % domain)
+    if kind == "new":
+        return "Publish a monitoring-only DMARC record for %s so its reports start flowing; no effect on delivery." % domain
+    if kind == "modify":
+        if is_spf:
+            parts = value.split()
+            return ("Change the end of the %s SPF record to %s so mail from unlisted servers is treated as suspicious "
+                    "instead of ignored; listed senders are unaffected." % (domain, parts[-1] if parts else "~all"))
+        return ("Add a reporting address to the %s DMARC record so receivers start telling us what fails; "
+                "no effect on delivery." % domain)
+    if kind == "todo":
+        if "_domainkey" in host:
+            return ("Turn on DKIM signing at every platform that sends as %s so its mail carries a signature that "
+                    "survives forwarding; this comes before any enforcement step." % domain)
+        if "lookup" in why.lower():
+            return ("Trim the %s SPF record below the 10-lookup limit; today every SPF check for it returns an error, "
+                    "so this can only help delivery." % domain)
+        return ("Publish an SPF record for %s naming the systems that send its mail, built from the sender "
+                "inventory; until then receivers cannot check its senders." % domain)
+    if kind == "ratchet":
+        if is_spf:
+            return ("Change the %s SPF record to a hard fail (-all) so mail from unlisted servers is refused "
+                    "outright; only after reject is stable and every sender signs with DKIM." % domain)
+        if new.get("p") == "quarantine" and old.get("p") != "quarantine":
+            return ("Move %s to quarantine for %s the mail that fails checks, so spoofed mail starts landing in "
+                    "junk while reports confirm no legitimate sender is caught." % (domain, _share(new.get("pct"))))
+        if new.get("p") == "reject" and old.get("p") != "reject":
+            return ("Move %s to reject so mail that fails checks is refused instead of junked; subdomains are a "
+                    "separate later step." % domain)
+        if new.get("pct") and new.get("pct") != old.get("pct"):
+            return ("Raise the %s quarantine share from %s to %s percent of failing mail; mail that passes is "
+                    "untouched." % (domain, old.get("pct", "100"), new["pct"]))
+        if new.get("sp") and new.get("sp") != old.get("sp"):
+            return ("Apply %s to subdomains of %s that have no record of their own, so mail failing checks from "
+                    "them is %s; subdomains with their own record are unaffected."
+                    % (new["sp"], domain, "sent to junk" if new["sp"] == "quarantine" else "refused"))
+    first = why.split(":")[0].strip()
+    return "%s for %s%s." % (KIND_LABEL.get(kind, kind or "change").capitalize(), domain, (": " + first) if first else "")
+
+
+def next_step_for(plan, domain):
+    """The change dict for this domain's most urgent enforcement step (priority
+    3 to 5, lowest number first), or None. Every change in a generated plan is
+    pending: a step that has been applied is absent from the next run's plan."""
+    domain = (domain or "").strip().lower().rstrip(".")
+    best = None
+    for c in (plan or {}).get("changes") or []:
+        if not isinstance(c, dict) or (c.get("domain") or "").lower().rstrip(".") != domain:
+            continue
+        try:
+            prio = int(c.get("priority"))
+        except (TypeError, ValueError):
+            continue
+        if prio in ENFORCEMENT_PRIORITIES and (best is None or prio < best[0]):
+            best = (prio, c)
+    return best[1] if best else None
+
+
+# --------------------------------------------------------------------------
 # the rules
 
 def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domains):
@@ -202,10 +320,13 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     subdomains = sorted(d for d in all_domains if d != domain and d.endswith("." + domain))
 
     def add(kind, priority, record, host, value, current, rollback, why, prereqs=(), fids=()):
-        changes.append({"domain": domain, "zone": zone, "zone_host": zone_host, "kind": kind,
-                        "priority": priority, "record": record, "hostname": host, "value": value,
-                        "ttl": ttl, "current": current, "rollback": rollback, "why": why,
-                        "prerequisites": list(prereqs), "finding_ids": sorted(set(fids))})
+        c = {"domain": domain, "zone": zone, "zone_host": zone_host, "kind": kind,
+             "priority": priority, "record": record, "hostname": host, "value": value,
+             "ttl": ttl, "current": current, "rollback": rollback, "why": why,
+             "prerequisites": list(prereqs), "finding_ids": sorted(set(fids)),
+             "owner_hint": domain, "prerequisite_items": prereq_items(list(prereqs))}
+        c["human_summary"] = human_summary(c)
+        changes.append(c)
 
     # Not verified: do not plan against a guess.
     if dns_doc.get("dmarc_status") == "error" or spf_status == "error":
@@ -402,6 +523,8 @@ def render_md(plan):
                 L.append("  - rollback: %s" % c["rollback"])
                 for p in c["prerequisites"]:
                     L.append("  - before applying: %s" % p)
+                if c.get("human_summary"):
+                    L.append("  - *in plain words:* %s" % c["human_summary"])
             L.append("")
     L.append("## How to use this")
     L.append("")

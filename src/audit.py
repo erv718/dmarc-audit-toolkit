@@ -41,6 +41,21 @@ The gate rule, deliberately conservative:
   - at p=reject there is nothing to ratchet; every branch says so, and the
     verdict then describes the state of enforcement rather than a move
 
+With several domains the mail log is attributed per sender domain (the
+verdict's domain field): each gate sees only its own rows, an audited apex
+carries a separate subdomains_total for unaudited subdomains under it, and
+rows under no audited domain count once under "(other)", attached to no gate
+(maillog.by_domain). A domain with no rows of its own in the mail log and
+none in the aggregate reports is insufficient_data, whatever the run holds
+about other domains. The overall verdict is the worst of all domains, and
+gate.current_policy, gate.policy_source and gate.next_step describe that
+worst-ranked domain (on a tie the headline domain, then the order given).
+gate.headline describes the headline domain: the one typed first on the
+command line (audit.py and collect.py both pass it), else the shortest
+audited apex - the label says which. A sender census (maillog.census, from
+dedupe.census) and, with --previous, a delta against an earlier report.json
+(report.delta) round the report out.
+
 Outputs: report.md (human) and report.json (machine) in the output directory
 (default audit-out/). Those two files are the only writes - everything else
 stays read-only.
@@ -48,6 +63,7 @@ stays read-only.
 Usage:
     python src/audit.py example.com
     python src/audit.py --file domains.txt --rua exports/rua --maillog exports/log.csv
+    python src/audit.py example.com --previous audit-out/history/<stamp>/report.json
     python src/audit.py example.com --offline --rua samples/rua \
         --maillog samples/sample_maillog.csv --headers samples/headers
     python src/audit.py example.com --rules-json exports/rules.json \
@@ -68,6 +84,7 @@ import ipaddress
 import json
 import re
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -104,6 +121,22 @@ MAILLOG_COLUMNS = {"msgid": "Internet message ID", "recipient": "Recipients",
                    "sender": "Sender address", "domain": "Sender domain",
                    "action": "Delivery action", "location": "Latest delivery location",
                    "subject": "Subject", "envelope": "Sender mail from domain"}
+# maillog.by_domain bucket for rows whose sender domain is under no audited domain
+OTHER = "(other)"
+# census entries under this many genuine failures are notes, not headlines
+# (docs/templates/next-steps.md voice rule)
+CENSUS_HEADLINE_MIN = 10
+CENSUS_TOP = 15
+# maillog.census comes from dedupe.census; these are the fields the report, the
+# delta and the markdown read from it, and the note the report adds to it
+CENSUS_FIELDS = {
+    "by_envelope": ("envelope_domain", "genuine_failures", "messages", "senders", "sample_sender", "likely"),
+    "by_sender": ("sender", "domain", "envelope_domain", "genuine_failures", "messages", "likely", "sample_subject"),
+}
+CENSUS_NOTE = (f"sorted by genuine failures; entries under {CENSUS_HEADLINE_MIN} are notes, "
+               "not headlines; likely labels are heuristics")
+CENSUS_UNAVAILABLE = ("sender census unavailable: this dedupe.py has no census() with the expected "
+                      "fields - update src/dedupe.py and rerun")
 # The three PowerShell exports: report key -> (script, tool tag, default finding area, title).
 TENANT_SECTIONS = {
     "rules": ("audit_rules.ps1", "audit_rules", "rules", "Transport rules"),
@@ -181,6 +214,12 @@ def _source_list(paths):
 
 def _under(name, domain):
     return bool(name) and bool(domain) and (name == domain or name.endswith("." + domain))
+
+
+def _norm_name(name):
+    """A domain name the way every gate key is spelled: lower-case, no
+    surrounding space, no trailing dot. None and '' become ''."""
+    return str(name or "").strip().lower().rstrip(".")
 
 
 def _as_list(value):
@@ -358,6 +397,111 @@ def run_maillog(csv_path, sender_domain=None, auth_column=None, vendor_domains=(
     return doc
 
 
+# ------------------------------------------- per-domain attribution, census
+
+def _counters(verdicts):
+    """dedupe.summarize-style counters over one slice of verdicts, plus the
+    senders behind its genuine failures."""
+    failing = [v for v in verdicts if v.get("genuine_failure")]
+    by_likely = Counter(v.get("likely") or "unknown" for v in failing)
+    senders = Counter((v.get("sender") or "?").lower() for v in failing)
+    return {"logical_messages": len(verdicts),
+            "genuine_failures": len(failing),
+            "echo_messages": sum(1 for v in verdicts if v.get("echo_present")),
+            "delivered_despite_fail": sum(1 for v in verdicts if v.get("delivered_despite_fail")),
+            "blocked_despite_pass": sum(1 for v in verdicts if v.get("blocked_despite_pass")),
+            "by_likely": {k: by_likely.get(k, 0) for k in dedupe.LIKELY_LABELS},
+            "top_senders": [{"sender": s, "genuine_failures": n} for s, n in senders.most_common(5)]}
+
+
+def _home_domain(domain, audited):
+    """(audited domain, is_unaudited_subdomain) for one sender domain: itself
+    when audited, else its closest audited parent, else (None, False)."""
+    if domain in audited:
+        return domain, False
+    parents = [a for a in audited if domain.endswith("." + a)]
+    if parents:
+        return max(parents, key=len), True
+    return None, False
+
+
+def maillog_by_domain(maillog_doc, domains=()):
+    """Mail-log counters per audited sender domain, from each verdict's domain
+    field (lower-cased). A subdomain's rows belong to the subdomain; an audited
+    apex gets its own rows only, plus subdomains_total for rows from subdomains
+    of it that are not audited themselves. Rows under no audited domain land
+    under OTHER and count once, attached to no gate."""
+    audited = [d for d in dict.fromkeys((d or "").strip().lower().rstrip(".") for d in domains) if d]
+    own = {d: [] for d in audited}
+    under = {d: {} for d in audited}
+    other = {}
+    for v in maillog_doc.get("verdicts") or []:
+        dom = (v.get("domain") or "").strip().lower()
+        home, is_sub = _home_domain(dom, audited)
+        if home is None:
+            other.setdefault(dom or "(blank)", []).append(v)
+        elif is_sub:
+            under[home].setdefault(dom, []).append(v)
+        else:
+            own[home].append(v)
+    out = {}
+    for d in audited:
+        c = _counters(own[d])
+        subs = under[d]
+        c["subdomains_total"] = dict(_counters([v for vs in subs.values() for v in vs]), domains=sorted(subs))
+        out[d] = c
+    c = _counters([v for vs in other.values() for v in vs])
+    c["sender_domains"] = sorted(
+        ({"domain": d, "logical_messages": len(vs),
+          "genuine_failures": sum(1 for v in vs if v.get("genuine_failure"))} for d, vs in other.items()),
+        key=lambda r: (-r["genuine_failures"], -r["logical_messages"], r["domain"]))
+    out[OTHER] = c
+    return out
+
+
+def _census_fields_match(cs):
+    """True when a census document carries both lists with every field the
+    report, the delta and the markdown read (CENSUS_FIELDS)."""
+    if not isinstance(cs, dict):
+        return False
+    for key, fields in CENSUS_FIELDS.items():
+        rows = cs.get(key)
+        if not isinstance(rows, list) or not all(isinstance(r, dict) and set(fields) <= set(r) for r in rows):
+            return False
+    return True
+
+
+def maillog_census(maillog_doc):
+    """Sender census over the verdicts: dedupe.census, the one implementation
+    behind dedupe.py --json and this report, plus the note the report adds.
+    An older dedupe.py without census(), or one whose fields differ, yields
+    empty lists and CENSUS_UNAVAILABLE as the note - never a second census
+    computed here."""
+    fn = getattr(dedupe, "census", None)
+    cs = fn(maillog_doc.get("verdicts") or []) if callable(fn) else None
+    if not _census_fields_match(cs):
+        return {"by_envelope": [], "by_sender": [], "note": CENSUS_UNAVAILABLE}
+    return {"by_envelope": cs["by_envelope"], "by_sender": cs["by_sender"], "note": CENSUS_NOTE}
+
+def headline_domain(domains, domain_sources=None, headline=None):
+    """The domain the overall verdict line names, and why. headline is the
+    domain the caller says was typed first on its command line (audit.py and
+    collect.py pass it; a sorted inventory cannot tell); else the shortest
+    audited apex, else the shortest audited domain - never whichever sorts
+    first. domain_sources is accepted for older callers and no longer picks
+    the headline: a provenance tag cannot prove the order the domains were
+    typed in. (domain, why)."""
+    names = [n for n in dict.fromkeys(_norm_name(d) for d in domains) if n]
+    if not names:
+        return None, None
+    want = _norm_name(headline)
+    if want and want in names:
+        return want, "first on the command line"
+    apex = [d for d in names if discover.org_domain(d) == d]
+    if apex:
+        return min(apex, key=lambda d: (len(d), names.index(d))), "shortest audited apex"
+    return min(names, key=lambda d: (len(d), names.index(d))), "shortest audited domain"
+
 def run_headers(files, authserv_id=None, strict=False):
     """headers.analyze per file; directories are recursed for .txt/.eml.
     DNS selector verification stays off: it is a live lookup, and
@@ -481,9 +625,9 @@ def domain_policy(domain, dns_reports=None, rua_doc=None):
             if domain is None:
                 hit, policy = True, s["p"]
             elif exact:
-                hit, policy = s["domain"] == domain, s["p"]
+                hit, policy = _norm_name(s["domain"]) == domain, s["p"]
             else:  # a subdomain of a reported domain: the org record's sp= (else p=) governs it
-                hit, policy = _under(domain, s["domain"]), (s.get("sp") or s["p"])
+                hit, policy = _under(domain, _norm_name(s["domain"])), (s.get("sp") or s["p"])
             if not hit:
                 continue
             tags = {"p": (s["p"] or "none").lower()}
@@ -553,7 +697,9 @@ def evidence_summary(rua_doc, maillog_doc, headers_doc=None):
 
 
 def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None):
-    """Blockers that apply to every domain in the run."""
+    """Blockers that apply to every domain in the run. maillog_doc counts here
+    only on the no-domain path: with named domains the mail log is attributed
+    per sender domain (_maillog_blockers), so no gate inherits another's rows."""
     blockers = []
     if rua_doc:
         for f in rua_doc["failing_streams"]:
@@ -587,11 +733,64 @@ def _dns_blockers(r, domain):
             if f["severity"] == "blocking" or f["id"] in DNS_GATE_BLOCKS]
 
 
-def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence):
+def _maillog_blockers(domain, c):
+    """One domain's mail-log blockers, from its own counters only."""
+    out = []
+    if c["genuine_failures"]:
+        tops = ", ".join(f"{t['sender']} x{t['genuine_failures']}" for t in (c.get("top_senders") or [])[:3])
+        out.append(f"{domain}: {c['genuine_failures']} logical message(s) from this domain failed with "
+                   "no passing copy (deduplicated)" + (f"; top senders: {tops}" if tops else ""))
+    if c["delivered_despite_fail"]:
+        out.append(f"{domain}: {c['delivered_despite_fail']} message(s) from this domain failed authentication "
+                   "but reached a mailbox - a local override is masking failures external receivers enforce")
+    return out
+
+
+def _maillog_notes(domain, c, scope=None):
+    """Non-blocking mail-log facts about one domain: no rows at all, and
+    rows from its unaudited subdomains (counted separately, never inherited)."""
+    out = []
+    if not c["logical_messages"]:
+        line = f"{domain}: no mail-log rows for this domain in the window"
+        if scope and not _under(domain, scope):
+            line += f" (the mail log was restricted to --sender-domain {scope})"
+        out.append(line)
+    st = c.get("subdomains_total") or {}
+    if st.get("logical_messages"):
+        subs = st.get("domains") or []
+        shown = ", ".join(subs[:5]) + (f" (+{len(subs) - 5} more)" if len(subs) > 5 else "")
+        out.append(f"{domain}: unaudited subdomain(s) {shown} carry {st['logical_messages']} logical "
+                   f"message(s), {st['genuine_failures']} genuine failure(s) - counted separately under "
+                   "this record's sp=, not gated here; add them to the domain list to gate them")
+    return out
+
+
+def _rua_covers(rua_doc, domain):
+    """True when the aggregate reports carry evidence about this domain: a
+    policy record seen for it (policy_check.seen) or rows with it as the
+    header From (by_header_from). Reports about other domains say nothing
+    about this one."""
+    if not rua_doc or not domain:
+        return False
+    seen = (rua_doc.get("policy_check") or {}).get("seen") or []
+    froms = rua_doc.get("by_header_from") or []
+    names = {_norm_name(s.get("domain")) for s in seen if isinstance(s, dict)}
+    names |= {_norm_name(f.get("domain")) for f in froms if isinstance(f, dict)}
+    return domain in names
+
+
+def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence, maillog=None, scope=None):
     """One domain's verdict. Every branch names the step being gated and
-    whether failure evidence was supplied."""
+    whether failure evidence was supplied. maillog: this domain's own
+    counters from maillog_by_domain (None when no mail log was supplied)."""
     policy, policy_from = info["policy"], info["source"]
     blockers = list(dns_blockers) + list(shared)
+    notes = []
+    if maillog is not None and domain:
+        blockers += _maillog_blockers(domain, maillog)
+        notes = _maillog_notes(domain, maillog, scope)
+    own_rows = maillog["logical_messages"] if maillog is not None and domain else 0
+    no_rows = bool(domain) and not own_rows and not _rua_covers(rua_doc, domain)
     if policy == "quarantine" and rua_doc:
         spf_only = [f for f in rua_doc["spf_only_senders"]
                     if domain is None or any(_under(hf, domain) for hf in f["header_from"])]
@@ -626,6 +825,19 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence):
             reasons = [f"policy is p={policy} ({policy_from}) but no failure evidence was supplied: "
                        "pass --rua reports and/or --maillog; a ratchet on zero data is a guess; "
                        f"step being gated: {step}"]
+    elif no_rows:
+        # the run has evidence, but none of it is about this domain: no mail-log
+        # rows of its own, no aggregate-report rows with it as the From domain
+        verdict = "insufficient_data"
+        if at_end:
+            reasons = [f"policy is already p=reject ({policy_from}); nothing to ratchet - the evidence "
+                       f"supplied has no rows for {name} (none in the mail log, none in the aggregate "
+                       f"reports), so enforcement cannot be confirmed safe for it; next step: {step}"]
+        else:
+            reasons = [f"policy is p={policy} ({policy_from}) but the evidence supplied has no rows for "
+                       f"{name} (none in the mail log, none in the aggregate reports): a zero count is "
+                       f"not evidence of health - supply a mail log or aggregate reports that cover it; "
+                       f"step being gated: {step}"]
     else:
         verdict = "go"
         if at_end:
@@ -641,28 +853,70 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence):
                 if spoof:
                     reasons.append(f"{len(spoof)} failing stream(s) look like spoofs - moving p= forward "
                                    "is exactly what stops them")
+    reasons += notes
     reasons.append(evidence["statement"])
     return {"verdict": verdict, "current_policy": policy, "policy_source": policy_from,
-            "next_step": step, "reasons": reasons}
+            "next_step": step, "reasons": reasons,
+            "maillog_rows": maillog["logical_messages"] if maillog is not None else None}
 
 
-def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None, tenant_docs=None):
-    """The ratchet decision, per domain, plus the overall verdict (the worst).
-    See the module docstring for the rule."""
-    evidence = evidence_summary(rua_doc, maillog_doc, headers_doc)
-    shared = _shared_blockers(rua_doc, maillog_doc, tenant_docs)
-    names = list(dict.fromkeys(domains)) or list((dns_reports or {}).keys())
+def _gate_names(dns_reports, rua_doc, domains=()):
+    """The domains the gate decides on, in the order they were given, each
+    spelled the way every gate key is (_norm_name) so a library caller's
+    Mixed.Case or trailing dot keeps its mail-log attribution."""
+    names = [n for n in dict.fromkeys(_norm_name(d) for d in domains) if n]
+    if not names:
+        names = [n for n in dict.fromkeys(_norm_name(d) for d in (dns_reports or {})) if n]
     if not names and rua_doc:
-        names = list(dict.fromkeys(s["domain"] for s in rua_doc["policy_check"]["seen"] if s["domain"]))
+        names = [n for n in dict.fromkeys(_norm_name(s["domain"]) for s in rua_doc["policy_check"]["seen"]) if n]
+    return names
+
+
+def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None, tenant_docs=None,
+                 domain_sources=None, headline=None):
+    """The ratchet decision, per domain, plus the overall verdict (the worst).
+    See the module docstring for the rule. Each domain's mail-log blockers
+    come from its own rows (maillog.by_domain). The top-level current_policy,
+    policy_source and next_step are the worst-ranked domain's (on a tie the
+    headline domain, then the order given); gate.headline carries the
+    headline domain's. headline: the domain typed first on the caller's
+    command line, when there was one (headline_domain). domain_sources is
+    accepted for older callers and no longer picks the headline."""
+    evidence = evidence_summary(rua_doc, maillog_doc, headers_doc)
+    if dns_reports:  # a library caller's spelling must not lose the DNS blockers
+        dns_reports = {_norm_name(d): r for d, r in dns_reports.items()}
+    names = _gate_names(dns_reports, rua_doc, domains)
+    shared = _shared_blockers(rua_doc, None if names else maillog_doc, tenant_docs)
+    by_domain, scope = None, None
+    if maillog_doc and names:
+        by_domain = maillog_doc.get("by_domain")
+        if not by_domain or any(d not in by_domain for d in names):
+            by_domain = maillog_by_domain(maillog_doc, names)
+        scope = _norm_name(maillog_doc.get("sender_domain")) or None
     per_domain = {}
     for d in names:
         info = domain_policy(d, dns_reports, rua_doc)
         dns_b = _dns_blockers(dns_reports[d], d) if dns_reports and d in dns_reports else []
-        per_domain[d] = _domain_gate(d, info, shared, dns_b, rua_doc, evidence)
+        per_domain[d] = _domain_gate(d, info, shared, dns_b, rua_doc, evidence,
+                                     by_domain.get(d) if by_domain else None, scope)
+    head_name, why = headline_domain(names, domain_sources, headline)
+    worst, head = None, None
     if per_domain:
-        lead = max(per_domain, key=lambda d: GATE_RANK[per_domain[d]["verdict"]])
-        overall = per_domain[lead]
-        merged = {}
+        ranked = [head_name] + [d for d in per_domain if d != head_name]  # a tie goes to the headline
+        worst = max(ranked, key=lambda d: GATE_RANK[per_domain[d]["verdict"]])
+        top, head, verdict = per_domain[worst], per_domain[head_name], per_domain[worst]["verdict"]
+        n = len(per_domain)
+        if n == 1:
+            overall = "1 domain audited"
+            lead = f"overall: {overall}; {head_name} ({why}): {verdict}"
+        else:
+            overall = f"worst of {n} domains"
+            if head_name == worst:
+                lead = f"overall: {overall}; headline domain {head_name} ({why}) is the worst: {verdict}"
+            else:
+                lead = (f"overall: {overall}; worst is {worst} ({verdict}); headline domain {head_name} "
+                        f"({why}) is {head['verdict']}")
+        merged = {lead: None}
         for d, g in per_domain.items():
             for r in g["reasons"]:
                 if r == evidence["statement"] or r in shared or len(per_domain) == 1 or r.startswith(f"{d}: "):
@@ -672,16 +926,21 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
         merged.pop(evidence["statement"], None)
         reasons = list(merged) + [evidence["statement"]]
     else:
-        overall = _domain_gate(None, domain_policy(None, dns_reports, rua_doc), shared, [], rua_doc, evidence)
-        reasons = overall["reasons"]
-    return {"verdict": overall["verdict"], "current_policy": overall["current_policy"],
-            "policy_source": overall["policy_source"], "next_step": overall["next_step"],
+        top = _domain_gate(None, domain_policy(None, dns_reports, rua_doc), shared, [], rua_doc, evidence)
+        verdict, overall = top["verdict"], "no domain named - one verdict over the files given"
+        reasons = top["reasons"]
+    return {"verdict": verdict, "current_policy": top["current_policy"],
+            "policy_source": top["policy_source"], "next_step": top["next_step"],
             "reasons": reasons,
             "policies": {d: g["current_policy"] for d, g in per_domain.items()},
             "domains": per_domain,
             "evidence": evidence,
-            "rule": GATE_RULE}
-
+            "rule": GATE_RULE,
+            "overall": overall, "domain_count": len(per_domain),
+            "headline": ({"domain": head_name, "source_label": why, "verdict": head["verdict"],
+                          "current_policy": head["current_policy"], "policy_source": head["policy_source"],
+                          "next_step": head["next_step"]} if head else None),
+            "headline_domain": head_name, "headline_source": why, "worst_domain": worst}
 
 # ------------------------------------------------------------------ report
 
@@ -712,7 +971,7 @@ def reword_for_reject(findings, gate):
                   else gate.get("current_policy") == "reject")
     for f in findings:
         src = f.get("source", "")
-        at_end = policies.get(src[4:]) == "reject" if src.startswith("dns:") else all_reject
+        at_end = policies.get(_norm_name(src[4:])) == "reject" if src.startswith("dns:") else all_reject
         if at_end and RATCHET_PHRASE in (f.get("action") or ""):
             f["action"] = f["action"].replace(RATCHET_PHRASE, RATCHET_AT_END)
             f["note"] = "reworded: the policy is already p=reject, so there is no ratchet to wait for"
@@ -742,6 +1001,13 @@ def verified_vs_inferred(report):
         verified.append(f"mail log: {c['raw_rows']} rows deduplicated to {c['logical_messages']} logical "
                         f"messages, {c['genuine_failures']} genuine failures, "
                         f"{c['delivered_despite_fail']} delivered despite fail")
+        bd = report["maillog"].get("by_domain") or {}
+        if bd:
+            named = [d for d in bd if d != OTHER]
+            with_rows = [d for d in named if bd[d]["logical_messages"]]
+            verified.append(f"mail log attributed per sender domain (maillog.by_domain): {len(with_rows)} of "
+                            f"{len(named)} audited domain(s) have rows, "
+                            f"{(bd.get(OTHER) or {}).get('logical_messages', 0)} message(s) under {OTHER}")
     if report["headers"]:
         verified.append(f"{len(report['headers']['messages'])} message header file(s) parsed")
         if report["headers"]["ar_note"]:
@@ -769,13 +1035,109 @@ def verified_vs_inferred(report):
             "note": "finding ids listed under inferred carry verified=false (heuristic or unconfirmed lookup)"}
 
 
+def read_previous_report(path):
+    """An earlier run's report.json (or the folder holding one) as a dict;
+    UsageError otherwise. utf-8-sig: a BOM from a Windows editor is fine."""
+    p = repo_path(path)
+    if p.is_dir():
+        p = p / "report.json"
+    try:
+        with open(p, encoding="utf-8-sig") as fh:
+            doc = json.load(fh)
+    except OSError as exc:
+        raise UsageError(f"cannot read --previous {p}: {exc.strerror or exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise UsageError(f"--previous {p} is not UTF-8 text") from exc
+    except json.JSONDecodeError as exc:
+        raise UsageError(f"--previous {p} is not JSON ({exc.msg} at line {exc.lineno})") from exc
+    if not isinstance(doc, dict) or "gate" not in doc:
+        raise UsageError(f"--previous {p} is not an audit.py report.json (no gate section)")
+    return doc
+
+
+def _finding_keys(doc):
+    return {((f.get("source") or ""), (f.get("id") or "")): f for f in doc.get("findings") or []}
+
+
+def _sender_key(s):
+    return (s.get("sender"), s.get("domain"), s.get("envelope_domain"))
+
+
+def build_delta(report, previous):
+    """What changed since an earlier report.json: whole-log and per-domain
+    counters, findings, policies, gates and census senders. A counter delta
+    is None when either side lacks the data; notes say why."""
+    notes = []
+    now_c = (report.get("maillog") or {}).get("counters") or {}
+    prev_c = (previous.get("maillog") or {}).get("counters") or {}
+
+    def diff(key):
+        return now_c[key] - prev_c[key] if key in now_c and key in prev_c else None
+
+    if bool(now_c) != bool(prev_c):
+        notes.append("a mail log on one side only: counter deltas not computed")
+    now_f, prev_f = _finding_keys(report), _finding_keys(previous)
+
+    def brief(f, key):
+        return {"id": key[1], "source": key[0], "severity": f.get("severity"), "title": f.get("title")}
+
+    findings_new = sorted((brief(now_f[k], k) for k in now_f if k not in prev_f),
+                          key=lambda f: (-SEVERITY_RANK.get(f["severity"], 0), f["source"], f["id"]))
+    findings_resolved = sorted((brief(prev_f[k], k) for k in prev_f if k not in now_f),
+                               key=lambda f: (f["source"], f["id"]))
+    now_g = (report.get("gate") or {}).get("domains") or {}
+    prev_g = (previous.get("gate") or {}).get("domains") or {}
+    policy_changes, gate_changes = {}, {}
+    for d, g in now_g.items():
+        p = prev_g.get(d)
+        if not p:
+            continue
+        if p.get("current_policy") != g.get("current_policy"):
+            policy_changes[d] = {"from": p.get("current_policy"), "to": g.get("current_policy")}
+        if p.get("verdict") != g.get("verdict"):
+            gate_changes[d] = {"from": p.get("verdict"), "to": g.get("verdict")}
+    now_s = ((report.get("maillog") or {}).get("census") or {}).get("by_sender")
+    prev_s = ((previous.get("maillog") or {}).get("census") or {}).get("by_sender")
+    new_senders, gone_senders = [], []
+    if now_s is None or prev_s is None:
+        if now_c or prev_c:
+            notes.append("sender census missing on one side (older report, or no mail log): "
+                         "new_senders not computed")
+    else:
+        prev_keys = {_sender_key(s) for s in prev_s}
+        now_keys = {_sender_key(s) for s in now_s}
+        new_senders = [s for s in now_s if _sender_key(s) not in prev_keys]
+        gone_senders = [s for s in prev_s if _sender_key(s) not in now_keys]
+    by_domain = {}
+    now_bd = (report.get("maillog") or {}).get("by_domain") or {}
+    prev_bd = (previous.get("maillog") or {}).get("by_domain") or {}
+    for d, c in now_bd.items():
+        p = prev_bd.get(d)
+        if p:
+            by_domain[d] = {k: c.get(k, 0) - p.get(k, 0) for k in ("genuine_failures", "delivered_despite_fail")}
+    return {"previous_generated_utc": previous.get("generated_utc"),
+            "previous_version": previous.get("version"),
+            "genuine_failures": diff("genuine_failures"),
+            "delivered_despite_fail": diff("delivered_despite_fail"),
+            "findings_new": findings_new, "findings_resolved": findings_resolved,
+            "policy_changes": policy_changes, "gate_changes": gate_changes,
+            "domains_added": [d for d in now_g if d not in prev_g],
+            "domains_removed": [d for d in prev_g if d not in now_g],
+            "new_senders": new_senders, "gone_senders": gone_senders,
+            "by_domain": by_domain, "notes": notes}
+
+
 def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offline=False,
                  resolver_addr="8.8.8.8", selectors=(), known=None, sender_domain=None,
                  auth_column=None, vendor_domains=(), authserv_id=None, strict=False,
                  min_volume=20, fail_threshold=0.5, since=None, until=None,
                  expect_policy=None, retiring=(), columns=None, domain_file=None,
-                 rules_json=None, bypasses_json=None, groups_json=None, domain_sources=None):
-    """The whole audit as one document. Raises UsageError on input problems."""
+                 rules_json=None, bypasses_json=None, groups_json=None, domain_sources=None,
+                 previous_report=None, headline=None):
+    """The whole audit as one document. Raises UsageError on input problems.
+    previous_report: an earlier run's report.json as a dict; adds report["delta"].
+    headline: the domain typed first on the caller's command line, if any;
+    it becomes gate.headline (else the shortest audited apex does)."""
     domains = [part for d in domains for part in str(d).split(",")]
     if domain_file:
         domains += read_domain_file(domain_file)
@@ -800,12 +1162,19 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
     headers_doc = run_headers(header_files, authserv_id, strict) if header_files else None
     tenant_docs = {name: (run_tenant_export(path, name) if path else None)
                    for name, path in tenant_paths.items()}
+    if maillog_doc:
+        # each gate reads its own rows from here; the census is the sender inventory
+        maillog_doc["by_domain"] = maillog_by_domain(maillog_doc, _gate_names(dns_reports, rua_doc, domains))
+        maillog_doc["census"] = maillog_census(maillog_doc)
+    if previous_report is not None and not isinstance(previous_report, dict):
+        raise UsageError("previous_report must be an earlier run's report.json document (a dict)")
+    headline = _norm_name(headline) or None
 
     report = {
         "tool": "audit.py", "version": VERSION,
         "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "offline": offline,
-        "inputs": {"domains": domains, "domain_sources": domain_sources or {},
+        "inputs": {"domains": domains, "domain_sources": domain_sources or {}, "headline": headline,
                    "domain_file": str(repo_path(domain_file)) if domain_file else None,
                    "rua": _source_list(rua_paths),
                    "maillog": str(repo_path(maillog)) if maillog else None,
@@ -816,14 +1185,16 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                    "groups": str(repo_path(groups_json)) if groups_json else None,
                    "authserv_id": authserv_id, "sender_domain": sender_domain,
                    "known": known, "since": since, "until": until,
-                   "expect_policy": expect_policy, "retiring_selectors": list(retiring)},
+                   "expect_policy": expect_policy, "retiring_selectors": list(retiring),
+                   "previous": (previous_report.get("generated_utc") or "unknown") if previous_report else None},
         "dns": dns_reports,
         "rua": rua_doc,
         "maillog": maillog_doc,
         "headers": headers_doc,
     }
     report.update(tenant_docs)
-    report["gate"] = gate_verdict(dns_reports, rua_doc, maillog_doc, domains, headers_doc, tenant_docs)
+    report["gate"] = gate_verdict(dns_reports, rua_doc, maillog_doc, domains, headers_doc, tenant_docs,
+                                  domain_sources, headline)
     findings = reword_for_reject(flatten_findings(report), report["gate"])
     report["findings"] = findings
     by_sev, by_area = {}, {}
@@ -836,6 +1207,8 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                          "worst": worst_severity(findings), "exit_code": code,
                          "gate": report["gate"]["verdict"], "next_step": report["gate"]["next_step"]}
     report["verified_vs_inferred"] = verified_vs_inferred(report)
+    if previous_report:
+        report["delta"] = build_delta(report, previous_report)
     report["exit_code"] = code
     return report
 
@@ -967,6 +1340,129 @@ def _mx_line(r):
     return ", ".join(r["mx"])
 
 
+def _md_domain_counters(c):
+    """One domain's mail-log line, from its own counters."""
+    if not c["logical_messages"]:
+        return "no mail-log rows for this domain in the window"
+    likely = ", ".join(f"{n} {label}" for label, n in c["by_likely"].items() if n) or "none"
+    tops = ", ".join(f"{t['sender']} x{t['genuine_failures']}" for t in (c.get("top_senders") or [])[:3])
+    return (f"{c['logical_messages']} logical messages, {c['genuine_failures']} genuine failures, "
+            f"{c['echo_messages']} echo; delivered despite fail {c['delivered_despite_fail']}, "
+            f"blocked despite pass {c['blocked_despite_pass']}; likely split: {likely}"
+            + (f"; top failing senders: {tops}" if tops else ""))
+
+
+def _md_by_domain(L, bd):
+    L.append("")
+    L.append("Per sender domain (each gate uses only its own rows):")
+    L.append("")
+    oc = bd.get(OTHER) or {}
+    if not any(d != OTHER for d in bd):
+        doms = oc.get("sender_domains") or []
+        shown = ", ".join(f"{r['domain']} {r['genuine_failures']} failing of {r['logical_messages']}"
+                          for r in doms[:8]) + (f" (+{len(doms) - 8} more)" if len(doms) > 8 else "")
+        L.append(f"- no domain named: all {oc.get('logical_messages', 0)} logical messages "
+                 f"({oc.get('genuine_failures', 0)} genuine failures) counted once under {OTHER}"
+                 + (f"; sender domains seen: {shown}" if shown else ""))
+        return
+    for d, dc in bd.items():
+        if d == OTHER:
+            continue
+        L.append(f"- {d}: {_md_domain_counters(dc)}")
+        st = dc.get("subdomains_total") or {}
+        if st.get("logical_messages"):
+            subs = st.get("domains") or []
+            shown = ", ".join(subs[:8]) + (f" (+{len(subs) - 8} more)" if len(subs) > 8 else "")
+            L.append(f"  - unaudited subdomains ({shown}): {st['logical_messages']} logical messages, "
+                     f"{st['genuine_failures']} genuine failures - counted separately, not gated; "
+                     "add them to the domain list to gate them")
+    if oc.get("logical_messages"):
+        doms = oc.get("sender_domains") or []
+        shown = ", ".join(f"{r['domain']} {r['genuine_failures']} failing of {r['logical_messages']}"
+                          for r in doms[:8]) + (f" (+{len(doms) - 8} more)" if len(doms) > 8 else "")
+        L.append(f"- {OTHER} - sender domains outside the audited list: {oc['logical_messages']} logical "
+                 f"messages, {oc['genuine_failures']} genuine failures ({shown}) - reported once, "
+                 "attached to no gate")
+    else:
+        L.append(f"- {OTHER}: no rows from sender domains outside the audited list")
+
+
+def _md_census(L, cs):
+    L.append("## Failing senders (census)")
+    L.append("")
+    L.append(f"Top {CENSUS_TOP} of each list, worst first; the full census is in report.json "
+             f"(maillog.census). Entries under {CENSUS_HEADLINE_MIN} genuine failures are listed "
+             "but are notes, not headlines. Likely labels are heuristics, not verdicts.")
+    L.append("")
+    env_all, snd_all = cs.get("by_envelope") or [], cs.get("by_sender") or []
+    if cs.get("note") == CENSUS_UNAVAILABLE:
+        L.append(f"- {CENSUS_UNAVAILABLE}")
+        L.append("")
+        return
+    env = [r for r in env_all if r["genuine_failures"]]
+    snd = [r for r in snd_all if r["genuine_failures"]]
+    L.append(f"- by envelope (MAIL FROM) domain: {len(env)} failing, {len(env_all) - len(env)} clean")
+    for r in env[:CENSUS_TOP]:
+        L.append(f"  - {r['envelope_domain']}: {r['genuine_failures']} failing of {r['messages']} message(s), "
+                 f"{r['senders']} sender(s), for example {r['sample_sender']}; {r['likely'] or 'n/a'}")
+    if len(env) > CENSUS_TOP:
+        L.append(f"  - (+{len(env) - CENSUS_TOP} more in report.json)")
+    L.append(f"- by sender: {len(snd)} failing, {len(snd_all) - len(snd)} clean")
+    for r in snd[:CENSUS_TOP]:
+        L.append(f"  - {r['sender']} (envelope {r['envelope_domain']}): {r['genuine_failures']} failing of "
+                 f"{r['messages']} message(s); {r['likely'] or 'n/a'}; \"{r['sample_subject'] or 'no subject'}\"")
+    if len(snd) > CENSUS_TOP:
+        L.append(f"  - (+{len(snd) - CENSUS_TOP} more in report.json)")
+    L.append("")
+
+
+def _md_delta(L, dl):
+    def signed(n):
+        return "n/a (no mail log on one side)" if n is None else f"{n:+d}"
+
+    def more(items, cap=10):
+        return " ..." if len(items) > cap else ""
+
+    L.append("## Since the previous run")
+    L.append("")
+    L.append(f"Compared with the report generated {dl.get('previous_generated_utc') or 'unknown'}"
+             + (f" (audit.py {dl['previous_version']})" if dl.get("previous_version") else "") + ".")
+    L.append("")
+    L.append(f"- genuine failures: {signed(dl.get('genuine_failures'))}; delivered despite fail: "
+             f"{signed(dl.get('delivered_despite_fail'))} (whole mail log, deduplicated)")
+    bd = dl.get("by_domain") or {}
+    if bd:
+        L.append("- per domain: " + "; ".join(f"{d} {v['genuine_failures']:+d} genuine, "
+                                              f"{v['delivered_despite_fail']:+d} delivered despite fail"
+                                              for d, v in bd.items()))
+    new = dl.get("findings_new") or []
+    L.append(f"- new findings ({len(new)}): " + (", ".join(
+        f"[{f['severity']}] {f['id']} ({_display_source(f['source'])})" for f in new[:10]) + more(new)
+        if new else "none"))
+    gone = dl.get("findings_resolved") or []
+    L.append(f"- resolved findings ({len(gone)}): " + (", ".join(
+        f"{f['id']} ({_display_source(f['source'])})" for f in gone[:10]) + more(gone) if gone else "none"))
+    pc = dl.get("policy_changes") or {}
+    L.append("- policy changes: " + (", ".join(f"{d} p={v['from']} -> p={v['to']}" for d, v in pc.items())
+                                     if pc else "none"))
+    gc = dl.get("gate_changes") or {}
+    if gc:
+        L.append("- gate changes: " + ", ".join(f"{d} {v['from']} -> {v['to']}" for d, v in gc.items()))
+    added, removed = dl.get("domains_added") or [], dl.get("domains_removed") or []
+    if added or removed:
+        L.append(f"- domains added: {', '.join(added) or 'none'}; removed: {', '.join(removed) or 'none'}")
+    ns = dl.get("new_senders") or []
+    L.append(f"- new senders ({len(ns)}): " + (", ".join(
+        f"{s['sender']} (envelope {s['envelope_domain']}) {s['genuine_failures']} failing of {s['messages']}"
+        for s in ns[:10]) + more(ns) if ns else "none"))
+    gs = dl.get("gone_senders") or []
+    if gs:
+        L.append(f"- senders no longer seen ({len(gs)}): " + ", ".join(s["sender"] for s in gs[:10]) + more(gs))
+    for n in dl.get("notes") or []:
+        L.append(f"- note: {n}")
+    L.append("")
+
+
 def render_md(report):
     g = report["gate"]
     ev = g.get("evidence") or {}
@@ -980,16 +1476,34 @@ def render_md(report):
     L.append("")
     L.append("## Gate verdict")
     L.append("")
-    head = f"**{g['verdict']}**"
-    if g["current_policy"]:
-        head += f" - current policy p={g['current_policy']} ({g['policy_source']})"
-    L.append(head)
-    L.append(f"- step being gated: {g.get('next_step') or 'unknown'}")
-    L.append(f"- evidence: {ev.get('statement') or 'not recorded'}")
     per = g.get("domains") or {}
+    hl = g.get("headline") or {}
+    hd, worst = hl.get("domain"), g.get("worst_domain")
+    if per and hd in per:
+        head = f"**{g['verdict']}** - {g.get('overall')}"
+        if worst and worst != hd:
+            head += f"; worst: {worst} ({per[worst]['verdict']})"
+        L.append(head)
+        pol = (f"current policy p={hl['current_policy']} ({hl['policy_source']})" if hl.get("current_policy")
+               else "policy unknown")
+        L.append(f"- headline domain: {hd} ({hl.get('source_label')}) - **{hl.get('verdict')}**; {pol}")
+        L.append(f"- step being gated for {hd}: {hl.get('next_step') or 'unknown'}")
+        if worst and worst != hd:
+            wpol = (f"current policy p={g['current_policy']} ({g['policy_source']})" if g.get("current_policy")
+                    else "policy unknown")
+            L.append(f"- worst domain: {worst} - **{per[worst]['verdict']}**; {wpol}; next step: "
+                     f"{g.get('next_step') or 'unknown'} (gate.current_policy and gate.next_step describe it)")
+    else:
+        head = f"**{g['verdict']}**"
+        if g["current_policy"]:
+            head += f" - current policy p={g['current_policy']} ({g['policy_source']})"
+        L.append(head)
+        L.append(f"- step being gated: {g.get('next_step') or 'unknown'}")
+    L.append(f"- evidence: {ev.get('statement') or 'not recorded'}")
     if per:
         L.append("")
-        L.append("Per domain (the overall verdict is the worst of these):")
+        L.append(f"Per domain ({g.get('overall') or 'the overall verdict is the worst of these'}; "
+                 "each gate uses only its own mail-log rows):")
         L.append("")
         for d, dg in per.items():
             pol = f"p={dg['current_policy']} ({dg['policy_source']})" if dg["current_policy"] else "policy unknown"
@@ -1005,6 +1519,9 @@ def render_md(report):
     L.append(f"Gate rule: {g['rule']}.")
     L.append("")
 
+    if report.get("delta"):
+        _md_delta(L, report["delta"])
+
     L.append("## Inputs")
     L.append("")
     L.append(f"- domains: {', '.join(inp['domains']) or 'none'}"
@@ -1015,6 +1532,8 @@ def render_md(report):
     L.append(f"- headers: {', '.join(display_path(p) for p in inp['headers']) or 'none'}")
     for name in TENANT_SECTIONS:
         L.append(f"- {name} export: {display_path(inp[name]) if inp.get(name) else 'none'}")
+    if inp.get("previous"):
+        L.append(f"- previous run: report generated {inp['previous']}")
     opts = {k: inp[k] for k in ("known", "sender_domain", "authserv_id", "since", "until", "expect_policy")
             if inp.get(k)}
     if inp.get("retiring_selectors"):
@@ -1088,7 +1607,11 @@ def render_md(report):
         elif report["maillog"].get("auth_column"):
             L.append(f"- verdict basis: column '{report['maillog']['auth_column']}'"
                      + (" (auto-detected)" if report["maillog"].get("auth_column_detected") else ""))
+        if report["maillog"].get("by_domain"):
+            _md_by_domain(L, report["maillog"]["by_domain"])
         L.append("")
+        if report["maillog"].get("census"):
+            _md_census(L, report["maillog"]["census"])
 
     if report["headers"]:
         L.append("## Message headers")
@@ -1151,6 +1674,9 @@ def main():
     ap.add_argument("--rules-json", metavar="JSON", help="audit_rules.ps1 -Json export")
     ap.add_argument("--bypasses-json", metavar="JSON", help="audit_bypasses.ps1 -Json export")
     ap.add_argument("--groups-json", metavar="JSON", help="audit_groups.ps1 -Json export")
+    ap.add_argument("--previous", metavar="PATH",
+                    help="an earlier run's report.json (or the folder holding it), for the "
+                         "'since the previous run' deltas")
     ap.add_argument("--out", default="audit-out", metavar="DIR",
                     help="output directory for report.md, report.json, plan.md, plan.json (default audit-out/)")
     ap.add_argument("--no-plan", action="store_true", help="do not write the rollout plan (plan.md, plan.json)")
@@ -1191,6 +1717,7 @@ def main():
     # --no-graph or --offline - the tenant's own verified domain list, merged
     # with duplicates dropped. No domains at all means "audit the tenant".
     domains, bad = discover.parse_domains(list(args.domains))
+    headline = domains[0] if domains else None  # typed first: the report's headline domain
     domain_sources = {d: ["cli"] for d in domains}
     if args.file:
         try:
@@ -1236,6 +1763,7 @@ def main():
                if getattr(args, f"{key}_column")}
 
     try:
+        previous = read_previous_report(args.previous) if args.previous else None
         report = build_report(
             domains=domains, domain_sources=domain_sources, rua_paths=args.rua, maillog=args.maillog, header_files=args.headers,
             offline=args.offline, resolver_addr=args.resolver,
@@ -1245,7 +1773,8 @@ def main():
             min_volume=args.min_volume, fail_threshold=args.fail_threshold,
             since=args.since, until=args.until, expect_policy=args.expect_policy,
             retiring=args.retiring_selector, columns=columns,
-            rules_json=args.rules_json, bypasses_json=args.bypasses_json, groups_json=args.groups_json)
+            rules_json=args.rules_json, bypasses_json=args.bypasses_json, groups_json=args.groups_json,
+            previous_report=previous, headline=headline)
     except UsageError as exc:
         die(str(exc))
 
@@ -1258,8 +1787,18 @@ def main():
     s = report["summary"]
     statement = g["evidence"]["statement"]
     paint = console.painter()
-    print("gate: " + paint.status(g["verdict"])
-          + (f" (current policy p={g['current_policy']})" if g["current_policy"] else ""))
+    hl = g.get("headline") or {}
+    line = "gate: " + paint.status(g["verdict"])
+    if hl.get("domain"):
+        line += f" - {g['overall']}"
+        if g.get("worst_domain") and g["worst_domain"] != hl["domain"]:
+            line += f" (worst: {g['worst_domain']})"
+        line += f"; headline {hl['domain']} ({hl['source_label']})"
+        if hl.get("current_policy"):
+            line += f" p={hl['current_policy']}"
+    elif g["current_policy"]:
+        line += f" (current policy p={g['current_policy']})"
+    print(line)
     if g["domains"]:
         for d, dg in g["domains"].items():
             pol = f"p={dg['current_policy']} ({dg['policy_source']})" if dg["current_policy"] else "policy unknown"
@@ -1274,6 +1813,13 @@ def main():
     print(paint.dim(f"  evidence: {statement}"))
     print(paint.by_exit(f"findings: {s['findings']} (worst {s['worst'] or 'none'}), "
                         f"{s['actionable']} major or blocking", report["exit_code"]))
+    dl = report.get("delta")
+    if dl:
+        gf = dl.get("genuine_failures")
+        print(paint.dim(f"since the previous run ({dl.get('previous_generated_utc') or 'unknown'}): "
+                        + (f"genuine failures {gf:+d}, " if gf is not None else "")
+                        + f"{len(dl['findings_new'])} new finding(s), {len(dl['findings_resolved'])} resolved, "
+                          f"{len(dl['policy_changes'])} policy change(s), {len(dl['new_senders'])} new sender(s)"))
     print(f"wrote {mpath}")
     print(f"wrote {jpath}")
     if not args.no_plan and report.get("dns"):

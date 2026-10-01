@@ -57,8 +57,26 @@ def load_state(path):
         return {}
 
 
+STATE_EVERY = 50  # messages between state saves: a crash loses at most this much progress
+
+
+def save_state(state_file, newest, mailbox, notes):
+    """Remember the newest message seen; a failure is a note, never a crash."""
+    if not (state_file and newest):
+        return
+    try:
+        Path(state_file).write_text(json.dumps({"last_received": newest, "mailbox": mailbox}), encoding="utf-8")
+    except OSError as err:
+        notes.append("state not saved: %s" % err)
+
+
 def fetch(tok, mailbox, dest_dir, state_file=None, since=None, max_messages=500):
-    """Download new report attachments. Returns (saved_count, notes)."""
+    """Download new report attachments. Returns (saved_count, notes).
+
+    tok may be a token string or a graph_client.TokenSource: the second
+    keeps a backfill alive past one token's lifetime. Messages come oldest
+    first, so the state file is safe to save every STATE_EVERY messages:
+    everything before the saved timestamp has been handled."""
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
     state = load_state(state_file) if state_file else {}
@@ -70,13 +88,24 @@ def fetch(tok, mailbox, dest_dir, state_file=None, since=None, max_messages=500)
               "$select": "id,receivedDateTime,subject,hasAttachments",
               "$orderby": "receivedDateTime asc", "$top": "50"}
     saved, seen, notes, newest = 0, 0, [], state.get("last_received")
+    skipped, hold = 0, None  # hold: the first skipped message's time; the state never moves past it
     for msg in graph_client.get_all(tok, "users/%s/messages" % box, params):
         seen += 1
         if seen > max_messages:
             notes.append("stopped after %d messages; run again to continue the backfill" % max_messages)
             seen -= 1
             break
-        atts = graph_client.get(tok, "users/%s/messages/%s/attachments" % (box, msg["id"]))
+        try:
+            atts = graph_client.get(tok, "users/%s/messages/%s/attachments" % (box, msg["id"]))
+        except graph_client.GraphError as err:
+            # one unreadable message must not end a backfill of thousands;
+            # the state stays before it, so the next run tries it again
+            skipped += 1
+            hold = hold or msg.get("receivedDateTime")
+            if skipped <= 5:
+                notes.append("message received %s skipped, attachments not read: %s"
+                             % (msg.get("receivedDateTime"), err))
+            continue
         for att in atts.get("value", []):
             name = att.get("name", "")
             if not is_report_name(name):
@@ -98,13 +127,22 @@ def fetch(tok, mailbox, dest_dir, state_file=None, since=None, max_messages=500)
         received = msg.get("receivedDateTime")
         if received and (newest is None or received > newest):
             newest = received
-    if state_file and newest:
-        try:
-            Path(state_file).write_text(json.dumps({"last_received": newest, "mailbox": mailbox}), encoding="utf-8")
-        except OSError as err:
-            notes.append("state not saved: %s" % err)
+        if seen % STATE_EVERY == 0:
+            save_state(state_file, resume_point(newest, hold), mailbox, notes)
+    save_state(state_file, resume_point(newest, hold), mailbox, notes)
+    if skipped:
+        notes.append("%d message(s) skipped this run; the state file stays at %s so they are tried again"
+                     % (skipped, resume_point(newest, hold)))
     notes.append("report mailbox: %d message(s) checked, %d new report file(s) saved to %s" % (seen, saved, dest))
     return saved, notes
+
+
+def resume_point(newest, hold):
+    """The timestamp to remember: the newest message handled, unless one was
+    skipped earlier, in which case that one, so a rerun starts there."""
+    if hold and (newest is None or hold < newest):
+        return hold
+    return newest
 
 
 def main():
@@ -129,7 +167,7 @@ def main():
         die("no mailbox: pass --mailbox or set RUA_MAILBOX in .env")
     state = args.state or str(Path(args.out).parent / "rua_state.json")
     try:
-        tok = graph_client.token(cred)
+        tok = graph_client.TokenSource(cred)  # re-acquires past the token lifetime
         saved, notes = fetch(tok, mailbox, args.out, state, args.since, args.max)
     except graph_client.GraphError as err:
         print("error: " + str(err), file=sys.stderr)

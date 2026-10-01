@@ -71,19 +71,36 @@ file only.)
     world. Build domain and sender inventories from the aggregate-reporting
     account and DNS, cross-checked against the mail system - never from one
     source alone.
+13. **Never produce a status document from memory when `next_steps.md`
+    exists; edit it.** `src/next_steps.py` writes
+    `audit-out/latest/next_steps.md` from the run itself (report, plan,
+    metrics history, owners file), so the document is the same for every
+    tenant that runs the toolkit and depends on nothing you remember. Your
+    job is the polish - hooks, order, audience, the person behind an owner
+    label - never the numbers, the verdicts or the finding ids. When
+    something is missing from it, it is missing from the inputs: add the
+    `owners.csv` row, the `--known` list or the missing evidence, then
+    rerun. The shape and the polishing rules are in
+    `docs/templates/next-steps.md`.
 
 ## The working sequence
 
-`src/collect.py` runs the whole sweep and writes `report.md`, `plan.md`, the
-history and the summary; read `latest/report.json` and `latest/plan.json`
-before anything else, and `verify_setup.py` output when a tenant step is
-missing. Then follow `docs/methodology.md`. In short: reporting on before anything changes,
-then sender inventory, then deduplicated failure analysis, then fix senders
-(DKIM preferred - check the SPF lookup budget with `src/spf_lookups.py`
-before adding any include), then ratchet policy with a deduplicated gate check
-at every step, then DKIM-before-reject, always. `src/audit.py` is the same
-sweep run once, on demand, ending with the gate verdict; the individual tools
-are for digging into one question at a time.
+`src/collect.py` runs the whole sweep and writes `next_steps.md`,
+`report.md`, `plan.md`, the history and the summary. Start from
+`audit-out/latest/next_steps.md` and `next_steps.json`: that is the status
+as the run states it, and the document the human will send. Then read
+`latest/report.json` for the evidence behind every line (and
+`latest/plan.json` for the records), and `verify_setup.py` output when a
+tenant step is missing. Then follow `docs/methodology.md`. In short:
+reporting on before anything changes, then sender inventory, then
+deduplicated failure analysis, then fix senders (DKIM preferred - check the
+SPF lookup budget with `src/spf_lookups.py` before adding any include), then
+ratchet policy with a deduplicated gate check at every step, then
+DKIM-before-reject, always, and a status document written from the run,
+never from memory (rule 13). `src/audit.py` is the same sweep run once, on
+demand, ending with the gate verdict; `src/next_steps.py` turns any run into
+the document; the individual tools are for digging into one question at a
+time.
 
 ## Analyzing pulled exports
 
@@ -143,7 +160,9 @@ Starter tasks, in order:
 - Draft DNS changes as diffs with a rollback line and TTL noted
 - Draft tickets and vendor messages; the human sends them
 - A clear "verified" vs "assumed" split in every status summary
-- For the stakeholder-facing next-steps document: fill
-  `docs/templates/next-steps.md` from `audit-out/latest/report.json`,
-  `plan.md`, and `metrics.md`. Every number must come from those files;
-  never from raw row counts, never invented.
+- The stakeholder-facing next-steps document: the polished copy of
+  `audit-out/latest/next_steps.md`, which `src/next_steps.py` wrote from
+  `report.json`, `plan.json`, `metrics.json` and `owners.csv`. Polish the
+  hooks, the order and the audience split as `docs/templates/next-steps.md`
+  describes; every number, verdict and finding id stays the generator's,
+  never a raw row count, never invented (rule 13).

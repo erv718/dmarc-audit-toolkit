@@ -11,8 +11,8 @@ it, including the failure modes we hit.
 - Deduplication analysis - the echo problem is exactly the kind of systematic
   error agents catch well once instructed (see AGENTS.md rule 4)
 - Fingerprinting senders from VERP addresses, headers, and reverse DNS
-- Drafting tickets, PR bodies, vendor emails, and status updates in your house
-  format
+- Drafting tickets, PR bodies and vendor emails, and polishing the generated
+  status document (`next_steps.md`) into your house format
 - Keeping the running state of a 30-sender remediation across weeks
 - Building the change history afterward from merged PRs
 
@@ -47,6 +47,23 @@ challenging its conclusions is a load-bearing part of the system. Treat agent
 confidence as a claim to verify, not a fact - the same way this toolkit treats
 dashboard numbers.
 
+## Where the narrative comes from
+
+The lesson that reshaped this toolkit: for most of the rollout the weekly
+narrative - where we stand, what is failing, who does what next - was
+written by an AI session out of its own context: the conversation so far, a
+private tracker, the names of people and vendors, what was said in a
+meeting. It read well and it was mostly right, but no other tenant has that
+context, so nobody else could reproduce the document, and nobody could tell
+which sentence came from a file and which from the session's memory. Now
+the toolkit produces it: `src/next_steps.py` writes `next_steps.md` from
+`report.json`, `plan.json`, `metrics.json` and an owners file, on every
+`collect.py` run, with no model in the loop and nothing in it that is not
+in those files. Any tenant gets the same document from the same inputs. The
+agent's job moved from author to editor: sharpen the hooks, split it by
+audience, name the person behind an owner label, and leave every number,
+verdict and finding id as the run wrote it (`AGENTS.md` rule 13).
+
 ## Setup
 
 Opt in first: set `AI_ANALYSIS_ENABLED=true` in `.env`. Without it the MCP
@@ -55,7 +72,8 @@ AI-facing runs by accident.
 
 Point your agent at this repo and tell it to read `AGENTS.md` first (most
 coding agents load it automatically; Claude Code gets pointed there from
-`CLAUDE.md`). Agents without shell access connect through the bundled MCP
+`CLAUDE.md`), then to start from `audit-out/latest/next_steps.md` rather than
+a blank page. Agents without shell access connect through the bundled MCP
 server instead - see the README's AI-agent section; it is one registration
 command carrying the path to your clone, not something each user builds.
 Set up the read-only app registration (`docs/app-registration.md`) and put

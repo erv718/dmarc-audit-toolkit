@@ -17,10 +17,12 @@ error (missing credentials, unreadable file, bad path).
 
 import argparse
 import csv
+import http.client
 import io
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -113,38 +115,61 @@ def get_token(tenant, client_id, client_secret):
     return token
 
 
-def run_query(token, kql, timespan=None):
+TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+RETRY_PAUSE = 3  # seconds, multiplied by the attempt number
+
+
+def run_query(token, kql, timespan=None, retries=2):
+    """POST the KQL and return the parsed JSON.
+
+    A hunting query is idempotent, so a dropped stream (IncompleteRead on a
+    large chunked body), a timeout, or a 429/5xx gets `retries` more attempts
+    with a growing pause before it becomes a failure. The apex domain's
+    30-day log runs to tens of megabytes; one flaky moment must not take the
+    whole run down."""
     payload = {"Query": kql}
     if timespan:
         payload["Timespan"] = timespan
-    req = urllib.request.Request(
-        HUNT_URL,
-        data=json.dumps(payload).encode(),
-        headers={"Authorization": "Bearer " + token,
-                 "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as err:
-        detail = ""
+    body = json.dumps(payload).encode()
+    last = None
+    for attempt in range(retries + 1):
+        if attempt:
+            time.sleep(RETRY_PAUSE * attempt)
+        req = urllib.request.Request(
+            HUNT_URL, data=body,
+            headers={"Authorization": "Bearer " + token,
+                     "Content-Type": "application/json"},
+        )
         try:
-            detail = json.loads(err.read()).get("error", {}).get("message", "")
-        except Exception:
-            pass
-        # Remote text: cap length and drop control characters before printing.
-        detail = "".join(ch for ch in str(detail) if ch >= " ")[:300]
-        hint = {
-            400: "the service rejected the query - test the KQL in the portal first",
-            401: "token rejected - was admin consent granted?",
-            403: "permission denied - the app registration needs the"
-                 " ThreatHunting.Read.All application permission with admin consent",
-            429: "rate limited - wait a minute and retry",
-        }.get(err.code, "")
-        sys.exit(("query failed: HTTP %d  %s  %s" % (err.code, hint, detail)).rstrip())
-    except (OSError, json.JSONDecodeError) as err:
-        sys.exit("query did not complete (network drop or timeout): %s"
-                 % getattr(err, "reason", err.__class__.__name__))
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as err:
+            detail = ""
+            try:
+                detail = json.loads(err.read()).get("error", {}).get("message", "")
+            except Exception:
+                pass
+            # Remote text: cap length and drop control characters before printing.
+            detail = "".join(ch for ch in str(detail) if ch >= " ")[:300]
+            if err.code in TRANSIENT_STATUS and attempt < retries:
+                last = "HTTP %d" % err.code
+                continue
+            hint = {
+                400: "the service rejected the query - test the KQL in the portal first",
+                401: "token rejected - was admin consent granted?",
+                403: "permission denied - the app registration needs the"
+                     " ThreatHunting.Read.All application permission with admin consent",
+                429: "rate limited - wait a minute and retry",
+            }.get(err.code, "")
+            sys.exit(("query failed: HTTP %d  %s  %s" % (err.code, hint, detail)).rstrip())
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as err:
+            # IncompleteRead is an HTTPException, not an OSError: a chunked
+            # body that stops early lands here, not in the OSError branch.
+            last = getattr(err, "reason", None) or err.__class__.__name__
+            if attempt < retries:
+                continue
+            sys.exit("query did not complete after %d attempts (network drop or timeout): %s"
+                     % (retries + 1, last))
 
 
 def columns(result):
