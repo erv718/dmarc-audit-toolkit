@@ -79,10 +79,10 @@ TEMPLATE = ('let sender_domain = "example.com";\n'
 
 
 def test_kql_window_rewrite():
-    out = collect.kql_for_domain(TEMPLATE, "x.example", start_days=7)
-    assert "ago(7d);" in out and "now();" in out
-    out = collect.kql_for_domain(TEMPLATE, "x.example", start_days=14, end_days=7)
-    assert "let window_start  = ago(14d);" in out and "let window_end    = ago(7d);" in out
+    out = collect.kql_for_domain(TEMPLATE, "x.example", start_hours=168)
+    assert "ago(168h);" in out and "now();" in out
+    out = collect.kql_for_domain(TEMPLATE, "x.example", start_hours=336, end_hours=168)
+    assert "let window_start  = ago(336h);" in out and "let window_end    = ago(168h);" in out
     assert "ago(30d)" not in out
 
 
@@ -90,18 +90,19 @@ def test_pull_domain_splits_at_the_row_cap(monkeypatch):
     import re as _re
 
     def fake_hunting(tok, kql, ts=None):
-        start = int(_re.search(r"window_start\s*=\s*ago\((\d+)d\)", kql).group(1))
-        m = _re.search(r"window_end\s*=\s*ago\((\d+)d\)", kql)
+        start = int(_re.search(r"window_start\s*=\s*ago\((\d+)h\)", kql).group(1))
+        m = _re.search(r"window_end\s*=\s*ago\((\d+)h\)", kql)
         end = int(m.group(1)) if m else 0
-        if start - end > 10:  # any window wider than 10 days comes back capped
+        if start - end > 240:  # any window wider than ten days comes back capped
             return {"results": [{"Internet message ID": str(i)} for i in range(100000)],
                     "schema": [{"name": "Internet message ID"}]}
         return {"results": [{"Internet message ID": "x"}],
                 "schema": [{"name": "Internet message ID"}]}
     monkeypatch.setattr(collect.graph_client, "hunting", fake_hunting)
     notes = []
-    rows, cols, calls = collect.pull_domain("tok", TEMPLATE, "x.example", 30, 0, notes)
-    # (30,0) -> (30,15)+(15,0), both still capped -> four small leaf slices
+    rows, cols, calls = collect.pull_domain("tok", TEMPLATE, "x.example", 720, 0, notes)
+    # no projection line to size by, so the cap splits: (720h,0) -> (720,360)+(360,0),
+    # both still capped -> four small leaf slices
     assert calls == 4 and len(rows) == 4
     assert any("cap" in n for n in notes)
 

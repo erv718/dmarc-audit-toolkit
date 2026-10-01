@@ -96,89 +96,221 @@ def unique_run_dir(history, stamp):
 
 
 ROW_CAP = 100000  # one hunting call never returns more than this
-ROW_BUDGET = 250000  # rows kept per domain before older slices are skipped (0 = no limit)
+SLICE_TARGET = 90000  # rows planned per call: headroom under the cap for mail that lands meanwhile
+ROW_BUDGET = 250000  # rows kept per domain before older hours are skipped (0 = no limit)
+RUA_MAX = 10000  # report-mailbox messages read per run; a run that stops resumes next time
+ARCHIVE_DAYS = 30  # the report archive window: a first run, or a stale saved position, starts here
 
 
-def kql_for_domain(template, domain, start_days=30, end_days=0):
+def _ago(hours):
+    """A span for notes: whole days as Nd, anything else as Nh."""
+    return "%dd" % (hours // 24) if hours and hours % 24 == 0 else "%dh" % hours
+
+
+def _window(start_hours, end_hours):
+    """A window for notes, one unit throughout: days when both edges fall on
+    whole days, else hours."""
+    if start_hours % 24 == 0 and end_hours % 24 == 0:
+        return "%dd..%dd" % (start_hours // 24, end_hours // 24)
+    return "%dh..%dh" % (start_hours, end_hours)
+
+
+def _timespan(start_hours):
+    """The Timespan reaching back to a slice's own start, in whole days rounded
+    up. The API applies Timespan from now, so a Timespan shorter than the
+    slice's start empties the slice."""
+    return "P%dD" % max(1, -(-start_hours // 24))
+
+
+def kql_for_domain(template, domain, start_hours=720, end_hours=0):
+    """raw_maillog.kql for one domain over ago(start)..ago(end), in hours."""
     if PLACEHOLDER not in template:
         raise ValueError("the sender_domain placeholder line was not found in queries/raw_maillog.kql")
     kql = template.replace(PLACEHOLDER, 'let sender_domain = "%s";' % domain, 1)
-    kql = re.sub(r"let window_start\s*=[^;]+;", "let window_start  = ago(%dd);" % start_days, kql, count=1)
-    if end_days:
-        kql = re.sub(r"let window_end\s*=[^;]+;", "let window_end    = ago(%dd);" % end_days, kql, count=1)
+    kql = re.sub(r"let window_start\s*=[^;]+;", "let window_start  = ago(%dh);" % start_hours, kql, count=1)
+    if end_hours:
+        kql = re.sub(r"let window_end\s*=[^;]+;", "let window_end    = ago(%dh);" % end_hours, kql, count=1)
     return kql
 
 
-def pull_domain(tok, template, org, start_days, end_days, notes, budget=None):
-    """One domain's rows for ago(start)..ago(end), splitting the window when
-    a call lands exactly on the 100,000-row API cap - that many rows means
-    rows were silently dropped, so the window halves until every call fits.
-    A window whose response keeps dropping mid-stream after the retries in
-    run_hunting is halved the same way: a smaller body survives a flaky
-    connection that a 30-day apex log does not.
+COUNT_TAIL = "| summarize n = count() by hago = toint((now() - Timestamp) / 1h), dir = tostring(EmailDirection)"
 
-    The Timespan sent with every call reaches back to the slice's own start.
-    The API applies Timespan from now, so a Timespan equal to the slice
-    length empties every slice that does not end today; that bug left runs
-    with apex rows from the newest day only. The newer half of a split is
-    pulled first, and budget, a dict holding {"rows": n}, stops the walk at
-    the older slices once n rows are in hand, so a domain busier than the
-    cap on a single day cannot flood memory with thirty truncated days."""
+
+def count_kql(template, domain, start_hours, end_hours=0):
+    """The row query's own filters summarized to rows per hour-ago and mail
+    direction, or None when the query has no extend/project line to cut at
+    (a customized template): the caller then falls back to splitting on the
+    row cap."""
+    kql = kql_for_domain(template, domain, start_hours, end_hours)
+    m = re.search(r"^[ \t]*\|[ \t]*(extend|project)\b", kql, flags=re.M)
+    if not m:
+        return None
+    if re.search(r"^[ \t]*\|[ \t]*where\b", kql[m.start():], flags=re.M):
+        return None  # a filter after the cut: sizing here would count rows the row query drops
+    return kql[:m.start()].rstrip() + "\n" + COUNT_TAIL
+
+
+def hourly_counts(tok, template, org, start_hours, end_hours=0, info=None):
+    """{hours ago: rows} over the window, or None when sizing is unavailable
+    (no line to cut at, a failed call, or an answer that is not a count). An
+    empty answer is a valid count: the domain has no rows. With info, records
+    the window's total rows and its internal (Intra-org) rows - mail the
+    tenant's own people sent, which spoofing cannot inflate."""
+    kql = count_kql(template, org, start_hours, end_hours)
+    if not kql:
+        return None
+    try:
+        res = graph_client.hunting(tok, kql, _timespan(start_hours))
+    except graph_client.GraphError:
+        return None
+    results = res.get("results") or []
+    cols = set(run_hunting.columns(res))
+    if results and not {"hago", "n"} <= cols:
+        return None
+    counts, internal = {}, 0
+    for r in results:
+        try:
+            h, n = int(r["hago"]), int(r["n"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        counts[h] = counts.get(h, 0) + n
+        if str(r.get("dir") or "").lower() == "intra-org":
+            internal += n
+    if info is not None:
+        info["total"] = sum(counts.values())
+        if "dir" in cols or not results:
+            info["internal"] = internal
+    return counts
+
+
+def plan_slices(counts, start_hours, end_hours=0, target=SLICE_TARGET):
+    """Contiguous (start, end) hour windows, newest first, covering the whole
+    window: each holds at most target rows by the hourly counts, except an
+    hour above target, which is a slice of its own (a run of empty hours
+    ahead of it is a cheap slice of its own too, so the busy hour never
+    shares a call). The last slice always reaches the window start, so rows
+    that land between the sizing call and the pull are not dropped."""
+    slices, end, acc = [], end_hours, 0
+    for h in range(end_hours, start_hours):
+        n = counts.get(h, 0)
+        if acc and acc + n > target:
+            slices.append((h, end))
+            end, acc = h, 0
+        elif not acc and n > target and h > end:
+            slices.append((h, end))
+            end = h
+        acc += n
+    if end < start_hours:
+        slices.append((start_hours, end))
+    return slices
+
+
+def pull_domain(tok, template, org, start_hours, end_hours, notes, budget=None, sized=False, info=None):
+    """One domain's rows for ago(start)..ago(end), in hours.
+
+    A cheap count query first sizes the window by the hour, with the same
+    filters as the row query, so a busy domain comes back in complete windows
+    of at most SLICE_TARGET rows, newest first, instead of a 100,000-row
+    download thrown away only to learn it was capped; a domain with no rows
+    costs only the count. A truncated day can orphan a message's passing copy
+    and overcount genuine failures, so complete windows matter. When sizing
+    is unavailable (a customized query, a failed count call), or a planned
+    slice still lands on the cap, the window halves until each call fits,
+    down to one hour; a single hour still at the cap is kept and noted as
+    truncated. A window whose response keeps dropping mid-stream after the
+    retries in run_hunting halves the same way.
+
+    Every call's Timespan reaches back to the slice's own start (the API
+    applies Timespan from now). budget, a dict holding {"rows": n}, stops the
+    walk at the older slices once n rows are in hand. info, a dict, receives
+    the sizing totals (total, internal) and the planned and pulled slice
+    counts. Returns (rows, columns, data calls)."""
     if budget is not None and budget.get("rows", 0) <= 0:
         if not budget.get("noted"):
-            notes.append("mail log: %s row budget reached at %dd..%dd ago - older slices skipped; "
-                         "the rows cover the newest days only (raise --max-rows or narrow the query)"
-                         % (org, start_days, end_days))
+            notes.append("mail log: %s row budget reached at %s ago - older rows skipped; the rows "
+                         "cover only the last %s (raise --max-rows to keep more)"
+                         % (org, _window(start_hours, end_hours), _ago(end_hours)))
             budget["noted"] = True
         return [], None, 0
-    span = start_days - end_days
+    if not sized:
+        counts = hourly_counts(tok, template, org, start_hours, end_hours, info)
+        if counts is not None:
+            total = sum(counts.values())
+            if not total:
+                return [], None, 0
+            slices = plan_slices(counts, start_hours, end_hours, SLICE_TARGET)
+            if info is not None:
+                info["planned"] = len(slices)
+            if len(slices) > 1:
+                notes.append("mail log: %s has about %d rows in the window (%d planned slices of up to %d "
+                             "rows, newest first)" % (org, total, len(slices), SLICE_TARGET))
+            rows, cols, calls, pulled = [], None, 0, 0
+            for a, b in slices:
+                got, c, n = pull_domain(tok, template, org, a, b, notes, budget, sized=True)
+                rows.extend(got)
+                cols = cols or c
+                calls += n
+                pulled += 1 if n else 0
+            if info is not None:
+                info["pulled"] = pulled
+            return rows, cols, calls
+    span = start_hours - end_hours
     try:
-        res = graph_client.hunting(tok, kql_for_domain(template, org, start_days, end_days),
-                                   "P%dD" % start_days)
+        res = graph_client.hunting(tok, kql_for_domain(template, org, start_hours, end_hours),
+                                   _timespan(start_hours))
     except graph_client.GraphError as err:
         if "did not complete" not in str(err) or span <= 1:
             raise
-        notes.append("mail log: %s window %dd..%dd ago dropped mid-stream after retries - "
-                     "splitting the window" % (org, start_days, end_days))
-        return pull_halves(tok, template, org, start_days, end_days, notes, budget)
+        notes.append("mail log: %s window %s ago dropped mid-stream after retries - splitting "
+                     "the window" % (org, _window(start_hours, end_hours)))
+        return pull_halves(tok, template, org, start_hours, end_hours, notes, budget)
     got = res.get("results") or []
     cols = run_hunting.columns(res)
     if len(got) < ROW_CAP or span <= 1:
-        if span <= 1 and len(got) >= ROW_CAP:
-            notes.append("mail log: %s STILL at the 100,000-row cap on a single day "
-                         "(%dd..%dd ago) - that slice is truncated; split the query "
-                         "by subdomain for this domain" % (org, start_days, end_days))
+        if len(got) >= ROW_CAP:
+            notes.append("mail log: %s has more than 100,000 rows within one hour (%s ago) - that "
+                         "hour is truncated" % (org, _window(start_hours, end_hours)))
         if budget is not None:
             budget["rows"] -= len(got)
         return got, cols, 1
-    notes.append("mail log: %s hit the 100,000-row API cap (%dd..%dd ago) - splitting the window"
-                 % (org, start_days, end_days))
-    return pull_halves(tok, template, org, start_days, end_days, notes, budget)
+    notes.append("mail log: %s hit the 100,000-row API cap (%s ago) - splitting the window"
+                 % (org, _window(start_hours, end_hours)))
+    return pull_halves(tok, template, org, start_hours, end_hours, notes, budget)
 
 
-def pull_halves(tok, template, org, start_days, end_days, notes, budget):
+def pull_halves(tok, template, org, start_hours, end_hours, notes, budget):
     """Both halves of a window, the newer one first so a row budget keeps
-    the days that matter most."""
-    mid = end_days + (start_days - end_days) // 2
-    right, cols_r, n2 = pull_domain(tok, template, org, mid, end_days, notes, budget)
-    left, cols_l, n1 = pull_domain(tok, template, org, start_days, mid, notes, budget)
-    return left + right, cols_l or cols_r, n1 + n2
+    the hours that matter most."""
+    mid = end_hours + (start_hours - end_hours) // 2
+    right, cols_r, n2 = pull_domain(tok, template, org, mid, end_hours, notes, budget, sized=True)
+    left, cols_l, n1 = pull_domain(tok, template, org, start_hours, mid, notes, budget, sized=True)
+    return right + left, cols_r or cols_l, n1 + n2
 
 
-def pull_maillog(tok, org_domains, out_csv, days=30, max_rows=ROW_BUDGET):
+def pull_maillog(tok, org_domains, out_csv, days=30, max_rows=ROW_BUDGET, volumes=None):
     """raw_maillog.kql per organizational domain, merged into one CSV. Each
-    domain's note names the rows it got and the time span they cover: when
-    the API cap or the row budget cut the walk short, that span is the real
-    window, whatever `days` asked for."""
+    domain's note names the rows it got and the time span they cover; when
+    the row budget kept only the newest part of a busy domain, the note says
+    so, with the sized total. volumes, a dict, receives each org domain's
+    internal (Intra-org) row count from its sizing call: the uncapped,
+    spoof-proof volume collect.py hands audit.py for the headline."""
     template = QUERY.read_text(encoding="utf-8-sig")
     rows, cols, notes = [], None, []
     seen = set()
     for org in org_domains:
         budget = {"rows": max_rows} if max_rows else None
+        info = {}
         try:
-            got, res_cols, calls = pull_domain(tok, template, org, days, 0, notes, budget)
+            got, res_cols, calls = pull_domain(tok, template, org, days * 24, 0, notes, budget, info=info)
         except (graph_client.GraphError, ValueError) as err:
             notes.append("mail log for %s not pulled: %s" % (org, err))
+            got = None
+        if volumes is not None:
+            if "internal" not in info:  # the sizing did not answer: one more try, for the volume alone
+                hourly_counts(tok, template, org, days * 24, 0, info)
+            if "internal" in info:
+                volumes[org] = info["internal"]  # measured even when the rows themselves failed
+        if got is None:
             continue
         cols = cols or res_cols
         before = len(rows)
@@ -187,11 +319,17 @@ def pull_maillog(tok, org_domains, out_csv, days=30, max_rows=ROW_BUDGET):
             if key not in seen:
                 seen.add(key)
                 rows.append(r)
-        suffix = " (%d window slices)" % calls if calls > 1 else ""
         stamps = sorted(str(r.get("Timestamp")) for r in rows[before:] if r.get("Timestamp"))
         span = "; rows span %s to %s" % (stamps[0], stamps[-1]) if stamps else ""
-        notes.append("mail log: %d rows for %s (last %d days)%s%s"
-                     % (len(rows) - before, org, days, suffix, span))
+        if budget is not None and budget.get("noted") and info.get("total"):
+            notes.append("mail log: %d rows for %s - the newest part of about %d rows in the last %d days "
+                         "(%d of %d planned slices, row budget %d)%s"
+                         % (len(rows) - before, org, info["total"], days, info.get("pulled", 0),
+                            info.get("planned", 0), max_rows, span))
+        else:
+            suffix = " (%d window slices)" % calls if calls > 1 else ""
+            notes.append("mail log: %d rows for %s (last %d days)%s%s"
+                         % (len(rows) - before, org, days, suffix, span))
     if not rows:
         return None, notes
     with open(out_csv, "w", newline="", encoding="utf-8") as fh:
@@ -312,8 +450,11 @@ def main():
     ap.add_argument("--offline", action="store_true", help="no DNS and no tenant; audit the given files only")
     ap.add_argument("--days", type=int, default=30, help="mail-log window in days (max 30)")
     ap.add_argument("--max-rows", type=int, default=ROW_BUDGET, metavar="N",
-                    help="mail-log rows kept per domain before older days are skipped "
+                    help="mail-log rows kept per domain before older hours are skipped "
                          "(0 = no limit, default %d)" % ROW_BUDGET)
+    ap.add_argument("--rua-max", type=int, default=RUA_MAX, metavar="N",
+                    help="report-mailbox messages read per run (0 = no limit, default %d); a run "
+                         "that stops resumes where it left off" % RUA_MAX)
     ap.add_argument("--report-days", type=int, default=30, help="aggregate-report window in days for this run's analysis")
     ap.add_argument("--maillog", metavar="CSV", help="use this mail-log export instead of pulling one")
     ap.add_argument("--auth-column", help="mail-log column holding the DMARC verdict (default DMARC when pulled)")
@@ -380,8 +521,10 @@ def main():
         if failed and not args.ignore_setup:
             die("setup check failed (%s); fix it or pass --ignore-setup" % "; ".join(r["check"] for r in failed))
         try:
-            tok = graph_client.token(cred)
+            tok = graph_client.TokenSource(cred)  # re-acquired on demand: a long run outlives one token
+            tok()  # fail here, early, when the credentials are wrong
         except graph_client.GraphError as err:
+            tok = None
             note("token failed, tenant steps skipped: %s" % err)
 
     # 2. domains
@@ -395,14 +538,22 @@ def main():
     domain_sources = {r["domain"]: r["sources"] for r in inventory}
     typed, _ = discover.parse_domains(list(args.domains))  # the inventory is sorted; this is the order typed
     headline = typed[0] if typed and typed[0] in domain_sources else None
+    if headline is None and args.file:  # nothing typed: the file's first line, in the order written
+        try:
+            listed, _ = discover.parse_domains(discover.read_domain_file(args.file))
+        except Exception:  # discover read it already; failing again here only costs the hint
+            listed = []
+        headline = listed[0] if listed and listed[0] in domain_sources else None
     orgs = sorted({r["org_domain"] for r in inventory})
     (run_dir / "inventory.json").write_text(json.dumps({"domains": inventory, "notes": dnotes}, indent=1), encoding="utf-8")
     (run_dir / "domains.txt").write_text("\n".join(domains) + "\n", encoding="utf-8")
 
     # 3. mail log
     maillog, auth_column = args.maillog, args.auth_column
+    volumes = {}  # internal mail per org domain, from the sizing calls: the headline signal
     if tok and not maillog:
-        maillog, mnotes = pull_maillog(tok, orgs, run_dir / "maillog.csv", min(args.days, 30), args.max_rows)
+        maillog, mnotes = pull_maillog(tok, orgs, run_dir / "maillog.csv", min(args.days, 30), args.max_rows,
+                                       volumes)
         for n in mnotes:
             note(n)
         if maillog and not auth_column:
@@ -411,17 +562,26 @@ def main():
     # 4. aggregate reports
     rua_paths = list(args.rua)
     since = None
+    now = datetime.now(timezone.utc)
+    window_start = (now - timedelta(days=args.report_days)).strftime("%Y-%m-%d")
+    archive_floor = (now - timedelta(days=max(args.report_days, ARCHIVE_DAYS))).strftime("%Y-%m-%d")
     mailbox = args.rua_mailbox or os.environ.get("RUA_MAILBOX")
     if tok and mailbox and fetch_rua is not None:
         try:
-            saved, rnotes = fetch_rua.fetch(tok, mailbox, out / "rua", out / "rua_state.json")
-            for n in rnotes:
-                note(n)
-            if any((out / "rua").iterdir()):
-                rua_paths.append(str(out / "rua"))
-                since = (datetime.now(timezone.utc) - timedelta(days=args.report_days)).strftime("%Y-%m-%d")
+            saved, rnotes = fetch_rua.fetch(tok, mailbox, out / "rua", out / "rua_state.json",
+                                            max_messages=args.rua_max, floor=archive_floor)
         except graph_client.GraphError as err:
-            note("report mailbox not read: %s" % err)
+            # what was read before the failure is on disk and still counts
+            rnotes = list(getattr(err, "notes", None) or [])
+            rnotes.append("report mailbox read stopped early: %s - the reports saved so far are still used" % err)
+        for n in rnotes:
+            note(n)
+    archived = (out / "rua").is_dir() and any((out / "rua").iterdir())
+    if archived and mailbox and not args.offline:
+        if not tok:
+            note("report mailbox not read this run (no token) - analysing the reports already archived")
+        rua_paths.append(str(out / "rua"))
+        since = window_start
 
     # the run before this one: its report.json feeds the delta section, the summary and the trend
     prev_dir = previous_run(out / "history", stamp)
@@ -435,6 +595,13 @@ def main():
         extra["previous_report"] = prev_report
     if headline and accepts(audit.build_report, "headline"):
         extra["headline"] = headline
+    if volumes and len(volumes) == len(orgs) and accepts(audit.build_report, "volume"):
+        extra["volume"] = volumes  # only a complete set ranks: a missing org would lose by default
+        top = sorted(volumes.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        note("headline signal: internal mail per org domain - %s" % ", ".join("%s %d" % kv for kv in top))
+    elif tok and not args.maillog and orgs:
+        note("headline signal: internal-mail volume missing for %s - the headline falls back to passing "
+             "mail in the mail log" % ", ".join(o for o in orgs if o not in volumes))
     try:
         report = audit.build_report(
             domains=domains, domain_sources=domain_sources, rua_paths=rua_paths, maillog=maillog,
@@ -445,6 +612,11 @@ def main():
         die(str(err))
     (run_dir / "report.json").write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
     (run_dir / "report.md").write_text(audit.render_md(report), encoding="utf-8")
+    covered = str(fetch_rua.load_state(out / "rua_state.json").get("covered_from") or "")[:10] if fetch_rua else ""
+    if since and covered and covered > since:
+        note("the report archive starts at %s, after the %s start of this run's %d-day report window: reports "
+             "before it were never read (fetch_rua.py --since %s fills them in)"
+             % (covered, since, args.report_days, since))
 
     # 6. plan
     plan, plan_doc = {"changes": [], "holds": []}, None  # plan_doc: only a plan that was written

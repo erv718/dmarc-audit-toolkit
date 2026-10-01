@@ -302,3 +302,99 @@ def test_cli_prints_the_headline_and_writes_the_delta(maillog, tmp_path):
     (tmp_path / "nogate.json").write_text('{"hello": 1}', encoding="utf-8")
     bad = run_cli(*args, "--out", str(tmp_path / "run3"), "--previous", str(tmp_path / "nogate.json"))
     assert bad.returncode == 2 and "no gate section" in bad.stderr
+
+
+def test_discovered_domains_headline_the_busiest_org_family():
+    names = ["alpha.example", "short.example", "busy.example", "sub.busy.example"]
+    tags = {d: ["tenant"] for d in names}
+    vol = {"alpha.example": 30, "busy.example": 99000, "sub.busy.example": 120000}
+    # the busiest org family wins and its audited apex leads - never the alphabet or the shortest name
+    assert audit.headline_domain(names, tags, volume=vol, volume_label="most internal mail") == (
+        "busy.example", "most internal mail")
+    # an exact tie goes to the family holding the tenant default domain
+    tags["short.example"] = ["tenant", "default"]
+    assert audit.headline_domain(names, tags, volume={"alpha.example": 50, "short.example": 50}) == (
+        "short.example", "most mail in this run")
+    # with no volume, the tenant's default domain
+    assert audit.headline_domain(names, tags) == ("short.example", "tenant default domain")
+    # a typed domain still wins over both
+    tags["alpha.example"] = ["cli", "tenant"]
+    assert audit.headline_domain(names, tags, volume=vol) == ("alpha.example", "first on the command line")
+
+
+def test_a_family_whose_apex_was_not_audited_leads_with_its_busiest_member():
+    names = ["sub.quiet.example", "alpha.example"]
+    tags = {d: ["tenant"] for d in names}
+    vol = {"sub.quiet.example": 900, "other.quiet.example": 50, "alpha.example": 100}
+    assert audit.headline_domain(names, tags, volume=vol) == ("sub.quiet.example", "most mail in this run")
+    # an apex with no mail of its own, when a member carries it, cedes to the member
+    names = ["busy.example", "mail.busy.example", "alpha.example"]
+    tags = {d: ["tenant"] for d in names}
+    v = {"mail.busy.example": 900, "alpha.example": 100}
+    assert audit.headline_domain(names, tags, volume=v, own_volume=v) == ("mail.busy.example", "most mail in this run")
+
+
+def test_an_explicit_headline_is_labelled_by_its_own_source():
+    srcs = {"b.example": ["file"], "a.example": ["file"]}
+    assert audit.headline_domain(["b.example", "a.example"], srcs, headline="a.example") == (
+        "a.example", "first in --file")
+    srcs["a.example"] = ["cli", "file"]
+    assert audit.headline_domain(["b.example", "a.example"], srcs, headline="a.example") == (
+        "a.example", "first on the command line")
+
+
+def test_mail_volume_counts_passing_mail_in_the_log_then_the_reports():
+    by_domain = {"example.com": {"logical_messages": 6, "genuine_failures": 2,
+                                 "subdomains_total": {"logical_messages": 7, "genuine_failures": 7}},
+                 "quiet.example": {"logical_messages": 0, "genuine_failures": 0, "subdomains_total": {}}}
+    assert audit.mail_volume(by_domain, None, ["example.com", "quiet.example"]) == (
+        {"example.com": 4}, "most passing mail in the mail log")
+    # a log scoped to one --sender-domain cannot rank the others: the reports decide
+    rua = {"by_header_from": [{"domain": "m.example.com", "count": 500, "pass": 480, "fail": 20},
+                              {"domain": "example.com", "count": 20, "pass": 20, "fail": 0}]}
+    assert audit.mail_volume(by_domain, rua, ["example.com"], {"sender_domain": "example.com"}) == (
+        {"example.com": 500}, "most passing mail in the reports")  # m.example.com counts for its audited apex
+    assert audit.mail_volume(None, None, ["example.com"]) == ({}, None)
+
+
+def test_names_taken_from_the_reports_are_ranked_not_taken_in_order():
+    doc = audit.build_report(domains=[], rua_paths=["samples/rua"], offline=True)
+    g = doc["gate"]
+    assert g["headline_domain"] and g["headline_source"] != "first domain given"
+
+
+def test_collect_volume_outranks_the_mail_log(maillog):
+    domains = ["aaa.example", "example.com", "quiet.example"]
+    doc = audit.build_report(domains=domains, maillog=str(maillog), offline=True, auth_column="DMARC",
+                             domain_sources={d: ["tenant"] for d in domains},
+                             volume={"aaa.example": 5000, "example.com": 40, "quiet.example": 0})
+    assert (doc["gate"]["headline_domain"], doc["gate"]["headline_source"]) == ("aaa.example", "most internal mail")
+    assert doc["inputs"]["volume"] == {"aaa.example": 5000, "example.com": 40, "quiet.example": 0}  # traceable
+
+
+def test_a_tenant_run_headlines_the_busiest_domain_not_the_first_alphabetically(maillog):
+    domains = ["aaa.example", "example.com", "quiet.example"]  # sorted, as a tenant inventory is
+    doc = audit.build_report(domains=domains, maillog=str(maillog), offline=True, auth_column="DMARC",
+                             domain_sources={d: ["tenant"] for d in domains})
+    g = doc["gate"]
+    assert (g["headline_domain"], g["headline_source"]) == ("example.com", "most passing mail in the mail log")
+
+
+def test_org_totals_pick_the_family_and_each_domains_own_mail_picks_the_member():
+    names = ["a.org.example", "b.org.example", "other.example"]  # the family's apex was not audited
+    tags = {d: ["tenant"] for d in names}
+    vol = {"org.example": 5000, "other.example": 100}  # collect's per-org totals
+    own = {"b.org.example": 300, "other.example": 50}  # each audited domain's own passing mail
+    assert audit.headline_domain(names, tags, volume=vol, volume_label="most internal mail", own_volume=own) == (
+        "b.org.example", "most internal mail")
+    # an audited apex with no mail of its own cedes to the member that carries it
+    names = ["org.example", "mail.org.example"]
+    tags = {d: ["tenant"] for d in names}
+    assert audit.headline_domain(names, tags, volume={"org.example": 5000},
+                                 own_volume={"mail.org.example": 90}) == ("mail.org.example", "most mail in this run")
+
+
+def test_report_volume_lands_on_the_closest_audited_domain():
+    rua = {"by_header_from": [{"domain": "m.example.com", "pass": 500}, {"domain": "sub.example.com", "pass": 10}]}
+    assert audit.mail_volume(None, rua, ["example.com", "sub.example.com"]) == (
+        {"example.com": 500, "sub.example.com": 10}, "most passing mail in the reports")

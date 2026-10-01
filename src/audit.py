@@ -50,9 +50,12 @@ none in the aggregate reports is insufficient_data, whatever the run holds
 about other domains. The overall verdict is the worst of all domains, and
 gate.current_policy, gate.policy_source and gate.next_step describe that
 worst-ranked domain (on a tie the headline domain, then the order given).
-gate.headline describes the headline domain: the one typed first on the
-command line (audit.py and collect.py both pass it), else the shortest
-audited apex - the label says which. A sender census (maillog.census, from
+gate.headline describes the headline domain: a typed one (command line,
+then --file) when there is one; among discovered domains the org family
+carrying the most internal mail (collect.py's hourly sizing), else the most
+passing mail in the mail log or the reports, else the tenant default
+domain, else the shortest audited apex - the label says which. A sender
+census (maillog.census, from
 dedupe.census) and, with --previous, a delta against an earlier report.json
 (report.delta) round the report out.
 
@@ -483,33 +486,101 @@ def maillog_census(maillog_doc):
         return {"by_envelope": [], "by_sender": [], "note": CENSUS_UNAVAILABLE}
     return {"by_envelope": cs["by_envelope"], "by_sender": cs["by_sender"], "note": CENSUS_NOTE}
 
-def headline_domain(domains, domain_sources=None, headline=None):
-    """The domain the overall verdict line names, and why, chosen by source
-    priority so the headline is the domain the human most likely means. An
-    explicit headline (the domain the caller says was typed first) wins; else,
-    in order: the first command-line domain, the first --file domain, the
-    shortest audited apex, the shortest audited domain. domain_sources maps
-    each domain to its provenance tags (cli, file, tenant, mailflow); with no
-    sources the first domain given is used. The domains list carries the typed
-    order, so the tag only classifies - it never has to prove the order.
-    (domain, why)."""
+def headline_domain(domains, domain_sources=None, headline=None, volume=None,
+                    volume_label="most mail in this run", own_volume=None):
+    """The domain the overall verdict line names, and why. Domains a human
+    named win: an explicit headline (labelled by its own source tag), the
+    first command-line domain, the first --file domain; with no source tags
+    at all, the first domain given. Discovered domains (tenant, mail flow,
+    reports) carry no order a human chose, so for them volume decides:
+    volume (per org domain, or per domain rolled up to its org domain)
+    picks the busiest family with an audited member - an exact tie goes to
+    the family holding the tenant default domain - and own_volume, each
+    audited domain's own mail (mail_volume), picks inside it: the audited
+    apex when it carries mail of its own or no member does, else the member
+    carrying the most. With no volume: the tenant's default domain (the
+    "default" source tag), else the shortest audited apex, else the shortest
+    audited domain - never whichever happens to sort first. (domain, why)."""
     names = [n for n in dict.fromkeys(_norm_name(d) for d in domains) if n]
     if not names:
         return None, None
+    srcs = {_norm_name(d): tags for d, tags in (domain_sources or {}).items()}
     want = _norm_name(headline)
     if want and want in names:
-        return want, "first on the command line"
+        tags = srcs.get(want) or ()
+        return want, ("first in --file" if "file" in tags and "cli" not in tags else "first on the command line")
     if not domain_sources:
         return names[0], "first domain given"
-    srcs = {_norm_name(d): tags for d, tags in domain_sources.items()}
     for tag, label in (("cli", "first on the command line"), ("file", "first in --file")):
         tagged = [d for d in names if tag in (srcs.get(d) or ())]
         if tagged:
             return tagged[0], label
+    defaults = [d for d in names if "default" in (srcs.get(d) or ())]
+    family = {}
+    for d, n in (volume or {}).items():
+        d = _norm_name(d)
+        if d and n and n > 0:
+            org = discover.org_domain(d)
+            family[org] = family.get(org, 0) + n
+    if family:
+        members = {}
+        for d in names:
+            members.setdefault(discover.org_domain(d), []).append(d)
+        ranked = [o for o in family if o in members]
+        if ranked:
+            default_orgs = {discover.org_domain(d) for d in defaults}
+            best = max(ranked, key=lambda o: (family[o], o in default_orgs, -names.index(members[o][0])))
+            audited = members[best]
+            own = {}
+            for d, n in (own_volume or {}).items():
+                d = _norm_name(d)
+                if d in audited and n and n > 0:
+                    own[d] = own.get(d, 0) + n
+            busy = [d for d in audited if own.get(d, 0) > 0]
+            if best in audited and (own.get(best, 0) > 0 or not busy):
+                return best, volume_label
+            pool = busy or audited
+            return max(pool, key=lambda d: (own.get(d, 0), d in defaults, -len(d), -names.index(d))), volume_label
+    if defaults:
+        return defaults[0], "tenant default domain"
     apex = [d for d in names if discover.org_domain(d) == d]
     if apex:
         return min(apex, key=lambda d: (len(d), names.index(d))), "shortest audited apex"
     return min(names, key=lambda d: (len(d), names.index(d))), "shortest audited domain"
+
+
+def mail_volume(by_domain, rua_doc, names, maillog_doc=None):
+    """Passing messages per domain, the headline signal when collect.py's
+    internal-mail totals are not available: the mail log's logical messages
+    minus its genuine failures, for each audited domain plus its unaudited
+    subdomains - unless the log was scoped to one --sender-domain, which
+    cannot rank the rest; else the aggregate reports' passing counts per
+    header-from domain. Spoofed mail fails, so it does not count. Returns
+    (volume, label), or ({}, None) when neither source carries passing mail."""
+    vol = {}
+    scoped = bool(maillog_doc and maillog_doc.get("sender_domain"))
+    if by_domain and not scoped:
+        for d in names:
+            c = by_domain.get(d) or {}
+            sub = c.get("subdomains_total") or {}
+            for part in (c, sub):
+                ok = (part.get("logical_messages") or 0) - (part.get("genuine_failures") or 0)
+                if ok > 0:
+                    vol[d] = vol.get(d, 0) + ok
+        if vol:
+            return vol, "most passing mail in the mail log"
+    audited = set(names)
+    for h in ((rua_doc or {}).get("by_header_from") or []):
+        dom = _norm_name(h.get("domain"))
+        ok = h.get("pass")
+        if ok is None:
+            ok = (h.get("count") or 0) - (h.get("fail") or 0)
+        if dom and ok and ok > 0:
+            home, _ = _home_domain(dom, audited)  # an unaudited subdomain counts for its closest audited parent
+            key = home or dom
+            vol[key] = vol.get(key, 0) + ok
+    return (vol, "most passing mail in the reports") if vol else ({}, None)
+
 
 def run_headers(files, authserv_id=None, strict=False):
     """headers.analyze per file; directories are recursed for .txt/.eml.
@@ -882,15 +953,18 @@ def _gate_names(dns_reports, rua_doc, domains=()):
 
 
 def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None, tenant_docs=None,
-                 domain_sources=None, headline=None):
+                 domain_sources=None, headline=None, volume=None):
     """The ratchet decision, per domain, plus the overall verdict (the worst).
     See the module docstring for the rule. Each domain's mail-log blockers
     come from its own rows (maillog.by_domain). The top-level current_policy,
     policy_source and next_step are the worst-ranked domain's (on a tie the
     headline domain, then the order given); gate.headline carries the
     headline domain's. headline: an optional explicit override; otherwise
-    headline_domain picks the headline from domain_sources by source priority
-    (first cli domain, then first --file domain, then shortest apex)."""
+    headline_domain picks it: a typed domain first (command line, then
+    --file), else the org family carrying the most mail - volume, the
+    internal-mail totals per org that collect.py measures, else passing
+    mail from the mail log or the reports (mail_volume) - else the tenant
+    default domain, else the shortest apex."""
     evidence = evidence_summary(rua_doc, maillog_doc, headers_doc)
     if dns_reports:  # a library caller's spelling must not lose the DNS blockers
         dns_reports = {_norm_name(d): r for d, r in dns_reports.items()}
@@ -908,7 +982,15 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
         dns_b = _dns_blockers(dns_reports[d], d) if dns_reports and d in dns_reports else []
         per_domain[d] = _domain_gate(d, info, shared, dns_b, rua_doc, evidence,
                                      by_domain.get(d) if by_domain else None, scope)
-    head_name, why = headline_domain(names, domain_sources, headline)
+    head_sources = domain_sources
+    if not domains and not domain_sources and names:
+        head_sources = {d: ["reports"] for d in names}  # nothing was named: every name came from the files
+    own, own_label = mail_volume(by_domain, rua_doc, names, maillog_doc)
+    if volume and any(v and v > 0 for v in volume.values()):
+        vol, vlabel = volume, "most internal mail"
+    else:
+        vol, vlabel = own, own_label
+    head_name, why = headline_domain(names, head_sources, headline, vol, vlabel or "most mail in this run", own)
     worst, head = None, None
     if per_domain:
         ranked = [head_name] + [d for d in per_domain if d != head_name]  # a tie goes to the headline
@@ -1142,12 +1224,14 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                  min_volume=20, fail_threshold=0.5, since=None, until=None,
                  expect_policy=None, retiring=(), columns=None, domain_file=None,
                  rules_json=None, bypasses_json=None, groups_json=None, domain_sources=None,
-                 previous_report=None, headline=None):
+                 previous_report=None, headline=None, volume=None):
     """The whole audit as one document. Raises UsageError on input problems.
     previous_report: an earlier run's report.json as a dict; adds report["delta"].
     headline: an optional explicit headline override; without it the headline
-    is chosen from domain_sources by source priority (cli, then --file, then
-    shortest apex) - see headline_domain."""
+    is a typed domain (cli, then --file), else the org family carrying the
+    most mail, else the tenant default domain - see headline_domain.
+    volume: internal-mail rows per org domain (collect.py's sizing calls),
+    the preferred headline signal for discovered domains."""
     domains = [part for d in domains for part in str(d).split(",")]
     if domain_file:
         domains += read_domain_file(domain_file)
@@ -1185,6 +1269,7 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
         "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "offline": offline,
         "inputs": {"domains": domains, "domain_sources": domain_sources or {}, "headline": headline,
+                   "volume": volume or {},
                    "domain_file": str(repo_path(domain_file)) if domain_file else None,
                    "rua": _source_list(rua_paths),
                    "maillog": str(repo_path(maillog)) if maillog else None,
@@ -1204,7 +1289,7 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
     }
     report.update(tenant_docs)
     report["gate"] = gate_verdict(dns_reports, rua_doc, maillog_doc, domains, headers_doc, tenant_docs,
-                                  domain_sources, headline)
+                                  domain_sources, headline, volume)
     findings = reword_for_reject(flatten_findings(report), report["gate"])
     report["findings"] = findings
     by_sev, by_area = {}, {}
@@ -1751,6 +1836,8 @@ def main():
             if d.endswith(".onmicrosoft.com") or not t.get("verified"):
                 continue
             domain_sources.setdefault(d, []).append("tenant")
+            if t.get("default"):
+                domain_sources[d].append("default")
             if d not in domains:
                 domains.append(d)
                 new += 1

@@ -452,3 +452,37 @@ def test_reruns_are_byte_identical_and_json_flag_prints_the_document(sample, tmp
     assert p.returncode == 0, p.stderr
     assert p.stdout.startswith("# DMARC rollout - status and next steps, ")
     assert p.stdout.strip() == (a / "next_steps.md").read_text(encoding="utf-8").strip()
+
+
+def test_the_org_follows_the_gate_headline_not_the_alphabet():
+    names = ["aaa.example", "example.com", "news.example.com"]
+    rep = {"inputs": {"domains": list(names)}, "gate": {}}
+    assert next_steps.pick_org(rep) == "aaa.example"  # no headline in the report: the old fallback
+    rep["gate"] = {"headline_domain": "example.com", "domains": {d: {} for d in names}}
+    assert next_steps.pick_org(rep) == "example.com"
+    rep["gate"]["headline_domain"] = "news.example.com"  # a subdomain headline maps to its audited apex
+    assert next_steps.pick_org(rep) == "example.com"
+    # ...but not to an apex seen only in the reports: the audited headline itself leads
+    only = {"inputs": {"domains": ["news.example.com"]},
+            "gate": {"headline_domain": "news.example.com", "domains": {"news.example.com": {}}},
+            "rua": {"totals": {"domains": ["example.com", "news.example.com"]}}}
+    assert next_steps.pick_org(only) == "news.example.com"
+    assert next_steps.pick_org(rep, org_name="Other.Example.") == "other.example"
+
+
+def test_the_org_stays_on_a_member_when_the_apex_has_no_rows_of_its_own():
+    rep = {"inputs": {"domains": ["mail.org.example", "org.example"]}, "maillog": {"by_domain": {}},
+           "gate": {"headline_domain": "mail.org.example",
+                    "domains": {"org.example": {"maillog_rows": 0}, "mail.org.example": {"maillog_rows": 900}}}}
+    assert next_steps.pick_org(rep) == "mail.org.example"
+    rep["gate"]["domains"]["org.example"]["maillog_rows"] = 12
+    assert next_steps.pick_org(rep) == "org.example"
+
+
+def test_an_old_reports_weak_headline_is_reranked_by_passing_mail():
+    rep = {"inputs": {"domains": ["chosen.example", "busy.example"]},
+           "gate": {"headline_domain": "chosen.example", "headline_source": "shortest audited apex",
+                    "domains": {"chosen.example": {}, "busy.example": {}}},
+           "maillog": {"by_domain": {"chosen.example": {"logical_messages": 3, "genuine_failures": 0},
+                                     "busy.example": {"logical_messages": 900, "genuine_failures": 10}}}}
+    assert next_steps.pick_org(rep) == "busy.example"

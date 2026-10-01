@@ -118,8 +118,9 @@ skips the lookup.
 
 The hunting API shows a rolling 30 days - that is Microsoft's retention
 ceiling, not a setting, and no query gets past it. The long view comes from
-accumulation instead: the first run does a one-time backfill of your report
-mailbox, every weekly run archives the new aggregate reports and stamps a
+accumulation instead: the first run reads the last 30 days of your report
+mailbox (`fetch_rua.py --since` backfills older history once, if you want
+it), every weekly run archives the new aggregate reports and stamps a
 dated copy of everything under `audit-out/history/`. By week six you are
 reading six weeks of local history even though the API still only shows 30
 days - and `metrics.md` turns that into the trend line. Those files are
@@ -178,7 +179,7 @@ Counting rows would report 33 failures; the true count is 21.
 | `src/collect.py` | The weekly job: verify, discover, pull mail log and reports, audit, plan, history and metrics, summary. |
 | `src/plan.py` | report.json in, plan.md out: the exact records to publish per domain, grouped by DNS host, with current value, rollback, priority, and the prerequisites for each enforcement step. |
 | `src/next_steps.py` | report.json in, `next_steps.md` + `next_steps.json` out: the status document you send. One-line status, deduplicated counts with the raw number alongside, what is failing, a per-domain table, actions grouped by owner, the ask and the open questions. Reads `plan.json`, `metrics.json`, the previous run and `owners.csv` when they exist; deterministic, no AI; `collect.py` runs it every week. |
-| `src/fetch_rua.py` | Pulls aggregate (rua) reports out of your report mailbox by Graph (Mail.Read scoped to that mailbox), with a one-time backfill and delta runs after. |
+| `src/fetch_rua.py` | Pulls aggregate (rua) reports out of your report mailbox by Graph (Mail.Read scoped to that mailbox), collect.py's weekly job reads the last 30 days on a first run and only new reports after; run standalone it backfills the whole mailbox, up to `--max` messages per run, and `--since` starts anywhere. Attachments come back inline, about 20 per call. |
 | `src/notify.py` | One Slack or Teams message per run: policy and gate per domain, findings, failure counts, top failing senders, what changed since the last run. |
 | `scripts/register_weekly_task.ps1` | Registers (or removes) the Windows scheduled task that runs `collect.py` weekly. |
 | `src/dedupe.py` | Collapses mail-log rows into logical messages by (Message-ID, recipient) and classifies each one. Reports failed-but-delivered and passed-but-blocked separately, prints a census of the failing senders by envelope domain and by sender address (`--json` carries the full lists), and dies loudly on a misspelled column instead of returning a silent zero. |

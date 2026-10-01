@@ -278,6 +278,8 @@ def discover(domains=(), domain_file=None, use_graph=True, mailflow=False,
             if d.endswith(".onmicrosoft.com"):
                 continue
             add(d, "tenant", tenant_verified=t["verified"], tenant_services=t["services"])
+            if t.get("default"):
+                add(d, "default")  # the tenant's default domain: a headline hint, nothing more
         if tenant:
             notes.append("tenant: %d domains (%d verified)" % (len(tenant), sum(1 for t in tenant if t["verified"])))
 

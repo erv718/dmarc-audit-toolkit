@@ -864,9 +864,20 @@ def holds_for(plan, domain=None):
 
 # ------------------------------------------------------------------ the document
 
+WEAK_HEADLINES = ("shortest audited apex", "shortest audited domain")
+
+
 def pick_org(report, org_name=None):
-    """--org-name, else the first audited apex (in the order the domains were
-    given), else the gate's headline domain, else the first audited domain."""
+    """--org-name, else the gate's headline domain - or its org domain, when
+    the headline is a subdomain and that apex has a gate entry with mail-log
+    rows of its own (an apex seen only in the reports, or one whose mail all
+    sits in its subdomains, does not count) - else the first audited apex in
+    the order given, else the first audited domain. A report written before
+    the volume rule, whose headline is only the shortest name, has its
+    audited apexes ranked by passing mail instead. The gate headline
+    already prefers typed domains and, among discovered ones, the domain
+    carrying the most mail; the first apex in list order is only the fallback
+    for a report that names no headline."""
     if org_name:
         return org_name.strip().lower().rstrip(".")
     gate = report.get("gate") or {}
@@ -876,10 +887,34 @@ def pick_org(report, org_name=None):
     names = list(dict.fromkeys(names))
     if not names:
         raise UsageError("the report names no audited domain; pass --org-name")
+    head = str(gate.get("headline_domain") or "").strip().lower().rstrip(".")
+    by = (report.get("maillog") or {}).get("by_domain") or {}
+    if head and gate.get("headline_source") in WEAK_HEADLINES and by:
+        # a report from before the volume rule: rank its audited apexes by passing mail instead
+        scored = []
+        for d, c in by.items():
+            d = str(d).strip().lower().rstrip(".")
+            if d in names and org_domain(d) == d:
+                parts = (c or {}, (c or {}).get("subdomains_total") or {})
+                ok = sum(max(0, (p.get("logical_messages") or 0) - (p.get("genuine_failures") or 0)) for p in parts)
+                if ok > 0:
+                    scored.append((ok, -names.index(d), d))
+        if scored:
+            return max(scored)[2]
+    if head:
+        apex = org_domain(head)
+        if apex == head:
+            return head
+        gd = {str(d).strip().lower().rstrip("."): g for d, g in (gate.get("domains") or {}).items()}
+        if apex in gd:
+            rows = (gd[apex] or {}).get("maillog_rows")
+            if rows is None or rows > 0 or not report.get("maillog"):
+                return apex
+        return head
     for d in names:
         if org_domain(d) == d:
             return d
-    return str(gate.get("headline_domain") or names[0]).lower()
+    return head or names[0]
 
 
 def policy_tags(report, domain):
@@ -1842,7 +1877,7 @@ def main(argv=None):
                     help="the previous run's report.json, for the trend when the report carries no delta")
     ap.add_argument("--date", help="date in the title (default: the report's generation date)")
     ap.add_argument("--org-name", metavar="DOMAIN",
-                    help="the organization domain the one-liner is about (default: the first audited apex)")
+                    help="the organization domain the one-liner is about (default: the report's headline domain, else the first audited apex)")
     ap.add_argument("--audience", metavar="TEXT", default=None,
                     help="the first sentence of the audience line (default: '%s')" % DEFAULT_AUDIENCE)
     ap.add_argument("--out", metavar="DIR",

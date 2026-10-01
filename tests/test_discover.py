@@ -85,3 +85,14 @@ def test_cli_writes_domains_txt_and_inventory(tmp_path):
     assert (tmp_path / "domains.txt").read_text(encoding="utf-8").strip() == "example.com"
     inv = json.loads((tmp_path / "inventory.json").read_text(encoding="utf-8"))
     assert inv["domains"][0]["sources"] == ["cli"]
+
+
+def test_the_tenant_default_domain_is_tagged(monkeypatch):
+    monkeypatch.setattr(discover, "graph_domains", lambda env_file=None: ([
+        {"domain": "main.example", "verified": True, "services": ["Email"], "default": True},
+        {"domain": "brand.example", "verified": True, "services": [], "default": False},
+    ], None))
+    inv, notes = discover.discover([], use_graph=True, ns_lookup=False)
+    by = {r["domain"]: r for r in inv}
+    assert by["main.example"]["sources"] == ["tenant", "default"]
+    assert by["brand.example"]["sources"] == ["tenant"]
