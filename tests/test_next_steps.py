@@ -44,14 +44,25 @@ def numbers_in(text):
     return set(re.findall(r"\d+(?:\.\d+)*", text))
 
 
+PATH_RX = re.compile(r'"(?:[A-Za-z]:\\\\|/)[^"\n]*"')  # a quoted absolute path in report.json
+
+
 def check_numbers(md, report, corpus_texts):
     """Every number token in the markdown occurs, as a whole token, in one of
-    the input files; the pass rate as a percentage is the one derived figure."""
-    corpus = "\n".join(corpus_texts)
+    the input files. The input paths are blanked first: a digit in a temp
+    folder's name is not evidence. Two figures are derived rather than
+    copied: the pass rate as a percentage, and the mail log's span, which
+    next_steps computes from the window's own stamps."""
+    corpus = "\n".join(PATH_RX.sub('""', t) for t in corpus_texts)
     allowed = set(TEMPLATE_NUMBERS)
     rate = ((report.get("rua") or {}).get("totals") or {}).get("pass_rate")
     if rate is not None:
         allowed.add("%.1f" % (100 * rate))
+    ml = report.get("maillog") or {}
+    for window in [ml.get("window"), *(ml.get("window_by_domain") or {}).values()]:
+        phrase = next_steps.span_phrase(window)
+        if phrase:
+            allowed |= numbers_in(phrase)
     missing = sorted(t for t in numbers_in(md) if t not in allowed
                      and not re.search(r"(?<![\d.])%s(?![\d.])" % re.escape(t), corpus))
     assert not missing, "numbers in next_steps.md with no source in the inputs: %s" % missing
