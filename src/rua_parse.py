@@ -19,10 +19,12 @@ What it answers
 
 Input: files or directories (recursed). Files may be .xml, .xml.gz, .gz or
 .zip; the format is sniffed, so a mislabeled file still parses. A malformed
-file or archive member is skipped with a warning, never a crash, and
-decompression is capped at 50 MB per file: the declared size is checked
-before anything is inflated, and the cap stops the read at the first byte
-over it. Relative paths resolve from the repo root, not the cwd.
+file or archive member is skipped with a warning, never a crash. Reports
+are parsed as a stream, so a large report costs memory for its records, not
+for its text, and decompression is capped at 256 MB per file: the declared
+size is checked before anything is inflated, and the cap stops the read at
+the first byte over it. Relative paths resolve from the repo root, not the
+cwd.
 
 Per record: a missing or unparsable <count> is counted as one message with a
 warning (the record exists, so at least one message did), a negative <count>
@@ -81,10 +83,12 @@ except ImportError:  # running outside the repo: a small local copy
 ROOT = Path(__file__).resolve().parent.parent
 
 AREA = "outside_view"
-MAX_BYTES = 50 * 1024 * 1024        # decompressed cap per file: zip bombs and runaway reports
+MAX_BYTES = 256 * 1024 * 1024       # decompressed cap per file: zip bombs and runaway reports
 CHUNK_BYTES = 1024 * 1024           # inflate in pieces so the cap stops the read, not the heap
 MAX_NUM_CHARS = 24                  # longest <count> or epoch text worth parsing (2^64 is 20 digits)
 MAX_LABEL_CHARS = 100               # archive member names are clipped to this in warnings and findings
+PROBE_TAIL = 16                     # bytes carried between chunks so a DTD marker split across two is still seen
+DTD_MARKERS = (b"<!ENTITY", b"<!DOCTYPE")
 REPORT_SUFFIXES = (".xml", ".gz", ".zip")
 RDNS_TIMEOUT = 3
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocking": 3}
@@ -154,17 +158,39 @@ def _mb(n):
     return f"{n / (1024 * 1024):.0f} MB"
 
 
+class _Capped:
+    """A binary stream read in CHUNK_BYTES pieces, giving up at the first byte
+    over MAX_BYTES so a bomb costs at most cap + one chunk, never twice the
+    cap. Closing it closes the streams it was built from."""
+
+    def __init__(self, fh, what="", owned=()):
+        self.fh, self.what, self.total, self.owned = fh, what, 0, list(owned)
+
+    def read(self, n=-1):
+        if n is None or n < 0 or n > CHUNK_BYTES:
+            n = CHUNK_BYTES
+        chunk = self.fh.read(min(n, MAX_BYTES + 1 - self.total))
+        if chunk:
+            self.total += len(chunk)
+            if self.total > MAX_BYTES:
+                raise ValueError(f"{self.what}decompressed size over the {_mb(MAX_BYTES)} cap")
+        return chunk
+
+    def close(self):
+        for s in [self.fh] + self.owned:
+            try:
+                s.close()
+            except Exception:  # a stream already closed by its owner: nothing to do
+                pass
+
+
 def _capped(fh, what=""):
-    """Read fh to the end in CHUNK_BYTES pieces, giving up at the first byte
-    over MAX_BYTES so a bomb costs at most cap + one chunk, never twice the cap."""
-    chunks, total = [], 0
+    """Read fh to the end under the cap, as bytes (archive members)."""
+    src, chunks = fh if isinstance(fh, _Capped) else _Capped(fh, what), []
     while True:
-        chunk = fh.read(min(CHUNK_BYTES, MAX_BYTES + 1 - total))
+        chunk = src.read(CHUNK_BYTES)
         if not chunk:
             break
-        total += len(chunk)
-        if total > MAX_BYTES:
-            raise ValueError(f"{what}decompressed size over the {_mb(MAX_BYTES)} cap")
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -177,14 +203,18 @@ def _gzip_declared_size(tail):
     return int.from_bytes(tail[-4:], "little") if len(tail) >= 4 else 0
 
 
-def _gunzip_capped(fh, declared, what=""):
+def _gunzip_capped(fh, declared, what="", owned=()):
+    """A capped stream over the gzip data in fh; the declared size is checked first."""
     if declared > MAX_BYTES:
         raise ValueError(f"{what}declared decompressed size {_mb(declared)} is over the {_mb(MAX_BYTES)} cap, not inflated")
-    return _capped(gzip.GzipFile(fileobj=fh), what)
+    return _Capped(gzip.GzipFile(fileobj=fh), what, owned)
 
 
 def read_payloads(path, warnings=None):
-    """(label, xml_bytes) for every report inside one file.
+    """(label, payload) for every report inside one file: bytes for an archive
+    member, a capped binary stream for a plain or gzipped file, which
+    parse_report reads as it parses (a large report costs memory for its
+    records, not for its text).
 
     The container format is sniffed from magic bytes, not trusted from the
     name. A zip may hold several reports; a gzipped member inside it is
@@ -221,7 +251,7 @@ def read_payloads(path, warnings=None):
                     with zf.open(info) as member:
                         data = _capped(member, "member: ")
                     if data[:2] == b"\x1f\x8b":
-                        data = _gunzip_capped(io.BytesIO(data), _gzip_declared_size(data), "gzipped member: ")
+                        data = _capped(_gunzip_capped(io.BytesIO(data), _gzip_declared_size(data), "gzipped member: "))
                 except Exception as exc:  # bad CRC, truncated, encrypted, over the cap: this member only
                     skip(label, str(exc) or exc.__class__.__name__)
                     continue
@@ -234,17 +264,20 @@ def read_payloads(path, warnings=None):
             raise ValueError("empty zip")
         return out
     if head.startswith(b"\x1f\x8b"):
-        with open(path, "rb") as fh:
+        fh = open(path, "rb")
+        try:
             fh.seek(0, io.SEEK_END)
             size = fh.tell()
             fh.seek(max(0, size - 4))
             declared = _gzip_declared_size(fh.read(4)) if size >= 18 else 0
             fh.seek(0)
-            return [(path.name, _gunzip_capped(fh, declared))]
+            return [(path.name, _gunzip_capped(fh, declared, owned=[fh]))]
+        except Exception:
+            fh.close()
+            raise
     if path.stat().st_size > MAX_BYTES:
         raise ValueError(f"over the {_mb(MAX_BYTES)} cap")
-    with open(path, "rb") as fh:
-        return [(path.name, fh.read())]
+    return [(path.name, _Capped(open(path, "rb")))]
 
 
 # ---------------------------------------------------------------- parsing
@@ -335,6 +368,58 @@ def canon_ip(text):
     return str(addr), raw
 
 
+def _record(rec, i, rep, label):
+    """One <record> into rep: a missing or unparsable <count> counts as 1 with
+    a warning, a negative one rejects the record with a warning."""
+    row = _child(rec, "row")
+    pe = _child(row, "policy_evaluated")
+    ids = _child(rec, "identifiers")
+    auth = _child(rec, "auth_results")
+    n, note = _count(row)
+    if note:
+        rep["warnings"].append(f"{label}: record {i}: {note}")
+    if n is None:
+        rep["records_rejected"] += 1
+        return
+    if note:
+        rep["count_defaulted"] += 1
+    ip, ip_raw = canon_ip(_text(row, "source_ip"))
+    rep["records"].append({
+        "source_ip": ip,
+        "source_ip_raw": ip_raw,
+        "count": n,
+        "disposition": _text(pe, "disposition", lower=True),
+        "dkim": _text(pe, "dkim", lower=True),
+        "spf": _text(pe, "spf", lower=True),
+        "reasons": [t for t in (_text(rs, "type", lower=True) for rs in _children(pe, "reason")) if t],
+        "header_from": _text(ids, "header_from", lower=True),
+        "envelope_from": _text(ids, "envelope_from", lower=True),
+        "envelope_to": _text(ids, "envelope_to", lower=True),
+        "dkim_auth": [{"domain": _text(d, "domain", lower=True), "selector": _text(d, "selector", lower=True),
+                       "result": _text(d, "result", lower=True)} for d in _children(auth, "dkim")],
+        "spf_auth": [{"domain": _text(s, "domain", lower=True), "scope": _text(s, "scope", lower=True),
+                      "result": _text(s, "result", lower=True)} for s in _children(auth, "spf")],
+    })
+
+
+class _DtdGuard:
+    """A reader that refuses a document carrying a DTD or entity declaration:
+    every chunk is checked (with the tail of the one before, so a marker split
+    across two chunks is still seen) before the parser gets it."""
+
+    def __init__(self, fh):
+        self.fh, self.tail = fh, b""
+
+    def read(self, n=-1):
+        chunk = self.fh.read(n)
+        if chunk:
+            probe = self.tail + chunk
+            if any(m in probe for m in DTD_MARKERS):
+                raise ValueError("DTD or entity declaration present - not an aggregate report")
+            self.tail = chunk[-PROBE_TAIL:]
+        return chunk
+
+
 def _find_root(root):
     """The <feedback> element: the document root, or the first one below it."""
     if _local(root.tag) == "feedback":
@@ -348,62 +433,44 @@ def _find_root(root):
 
 
 def parse_report(data, label="report"):
-    """One aggregate report as a dict. Tolerates namespaces, missing elements
-    and odd casing; raises ValueError or ET.ParseError on a broken file.
+    """One aggregate report as a dict, from bytes or from a binary stream that
+    is read as it is parsed (a large report costs memory for its records, not
+    for its text; the stream is closed afterwards). Tolerates namespaces,
+    missing elements and odd casing; raises ValueError or ET.ParseError on a
+    broken file, and ValueError when a DTD or entity declaration appears
+    anywhere in the document.
 
     Record-level problems never raise: rep["warnings"] lists them, a record
     with a missing or unparsable <count> is kept with count 1 and counted in
     rep["count_defaulted"], a record with a negative <count> is dropped and
     counted in rep["records_rejected"]."""
-    if b"<!ENTITY" in data or b"<!DOCTYPE" in data:
-        raise ValueError("DTD or entity declaration present - not an aggregate report")
-    root = _find_root(ET.fromstring(data))
-    meta = _child(root, "report_metadata")
-    pol = _child(root, "policy_published")
-    rep = {
-        "source": label,
-        "org_name": _text(meta, "org_name"),
-        "email": _text(meta, "email"),
-        "report_id": _text(meta, "report_id"),
-        "begin": _int(_text(meta, "date_range", "begin")),
-        "end": _int(_text(meta, "date_range", "end")),
-        "policy": {k: _text(pol, k, lower=True) for k in ("domain", "adkim", "aspf", "p", "sp", "pct")},
-        "records": [],
-        "warnings": [],
-        "count_defaulted": 0,
-        "records_rejected": 0,
-    }
-    for i, rec in enumerate(_children(root, "record"), 1):
-        row = _child(rec, "row")
-        pe = _child(row, "policy_evaluated")
-        ids = _child(rec, "identifiers")
-        auth = _child(rec, "auth_results")
-        n, note = _count(row)
-        if note:
-            rep["warnings"].append(f"{label}: record {i}: {note}")
-        if n is None:
-            rep["records_rejected"] += 1
-            continue
-        if note:
-            rep["count_defaulted"] += 1
-        ip, ip_raw = canon_ip(_text(row, "source_ip"))
-        rep["records"].append({
-            "source_ip": ip,
-            "source_ip_raw": ip_raw,
-            "count": n,
-            "disposition": _text(pe, "disposition", lower=True),
-            "dkim": _text(pe, "dkim", lower=True),
-            "spf": _text(pe, "spf", lower=True),
-            "reasons": [t for t in (_text(rs, "type", lower=True) for rs in _children(pe, "reason")) if t],
-            "header_from": _text(ids, "header_from", lower=True),
-            "envelope_from": _text(ids, "envelope_from", lower=True),
-            "envelope_to": _text(ids, "envelope_to", lower=True),
-            "dkim_auth": [{"domain": _text(d, "domain", lower=True), "selector": _text(d, "selector", lower=True),
-                           "result": _text(d, "result", lower=True)} for d in _children(auth, "dkim")],
-            "spf_auth": [{"domain": _text(s, "domain", lower=True), "scope": _text(s, "scope", lower=True),
-                          "result": _text(s, "result", lower=True)} for s in _children(auth, "spf")],
-        })
-    return rep
+    stream = io.BytesIO(data) if isinstance(data, (bytes, bytearray)) else data
+    try:
+        rep = {"source": label, "org_name": None, "email": None, "report_id": None, "begin": None, "end": None,
+               "policy": {k: None for k in ("domain", "adkim", "aspf", "p", "sp", "pct")},
+               "records": [], "warnings": [], "count_defaulted": 0, "records_rejected": 0}
+        meta = pol = None
+        i = 0
+        events = ET.iterparse(_DtdGuard(stream), events=("end",))
+        for _, el in events:
+            tag = el.tag.lower() if isinstance(el.tag, str) else ""
+            if tag.endswith("record"):
+                i += 1
+                _record(el, i, rep, label)
+                el.clear()  # the records are the bulk of a report; only the empty shell stays in the tree
+            elif meta is None and tag.endswith("report_metadata"):
+                meta = el
+                rep.update(org_name=_text(el, "org_name"), email=_text(el, "email"), report_id=_text(el, "report_id"),
+                           begin=_int(_text(el, "date_range", "begin")), end=_int(_text(el, "date_range", "end")))
+            elif pol is None and tag.endswith("policy_published"):
+                pol = el
+                rep["policy"] = {k: _text(el, k, lower=True) for k in ("domain", "adkim", "aspf", "p", "sp", "pct")}
+        _find_root(events.root)  # a document with none of the report parts is not a report
+        return rep
+    finally:
+        close = getattr(stream, "close", None)
+        if close:
+            close()
 
 
 def load_reports(files, warnings=None):
@@ -435,7 +502,8 @@ def load_reports(files, warnings=None):
             try:
                 rep = parse_report(data, label)
             except (ET.ParseError, ValueError, OverflowError, RecursionError) as exc:
-                warn(f"skipped {label}: not an aggregate report ({_clean(str(exc), 200)})")
+                msg = _clean(str(exc), 200)
+                warn(f"skipped {label}: {msg}" if " cap" in msg else f"skipped {label}: not an aggregate report ({msg})")
                 skipped += 1
                 continue
             for msg in rep["warnings"]:

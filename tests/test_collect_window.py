@@ -260,3 +260,14 @@ def test_the_headline_note_reports_what_the_gate_chose():
     assert collect.headline_note(gate, orgs, {"aaa.example": 7}) == (
         "headline signal: internal-mail volume missing for corp.example - "
         "the headline is aaa.example (first on the command line)")
+
+
+def test_truncation_text_comes_from_the_slicers_own_notes():
+    notes = ["mail log: example.com has about 5168817 rows in the window (62 planned slices of up to 90000 rows, newest first)",
+             "mail log: example.com row budget reached at 47h..41h ago - older rows skipped; the rows cover only the last 41h "
+             "(raise --max-rows to keep more)",
+             "mail log: corp.example has more than 100,000 rows within one hour (3h..2h ago) - that hour is truncated",
+             "mail log: 30 rows for other.example (last 30 days)"]
+    assert collect.truncation_text(notes) == ("row budget kept only the newest 41h for example.com; "
+                                              "an hour of corp.example (3h..2h ago) is truncated at the API cap")
+    assert collect.truncation_text(["mail log: 30 rows for other.example (last 30 days)"]) is None

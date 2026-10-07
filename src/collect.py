@@ -458,6 +458,22 @@ def render_metrics(entries, last=12):
     return "\n".join(L)
 
 
+def truncation_text(notes):
+    """One clause for maillog.truncation (the status document's 'the log export
+    was cut short (...)' line) from the mail-log notes: a row budget that kept
+    only the newest hours, or an hour still at the API cap. None otherwise."""
+    parts = []
+    for n in notes:
+        m = re.search(r"mail log: (\S+) row budget reached .*? cover only the last (\S+)", n)
+        if m:
+            parts.append("row budget kept only the newest %s for %s" % (m.group(2), m.group(1)))
+            continue
+        m = re.search(r"mail log: (\S+) has more than [\d,]+ rows within one hour \((.+?) ago\)", n)
+        if m:
+            parts.append("an hour of %s (%s ago) is truncated at the API cap" % (m.group(1), m.group(2)))
+    return "; ".join(parts) or None
+
+
 def headline_note(gate, orgs, volumes):
     """The run note on the headline signal, written from the gate the report
     chose rather than a guess at the fallback: the internal mail per org
@@ -814,6 +830,9 @@ def main():
             caveats.append("%s - mail-log counts for that domain cover that span only" % n)
     if caveats:
         report["caveats"] = caveats
+        cut = truncation_text(notes)
+        if cut and isinstance(report.get("maillog"), dict):
+            report["maillog"]["truncation"] = cut  # the status document's 'cut short, so a floor' clause
     md = audit.render_md(report)
     if caveats:
         md += "\n## Caveats\n\n" + "\n".join("- " + c for c in caveats) + "\n"

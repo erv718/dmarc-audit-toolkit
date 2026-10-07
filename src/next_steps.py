@@ -494,6 +494,29 @@ def _from_verdicts(genuine):
     return sorted(envs, key=key), sorted(senders, key=key)
 
 
+def _stamp(value):
+    """'2026-10-05 22:25' from an ISO timestamp; the text itself when it is not one."""
+    txt = str(value or "")
+    return txt[:16].replace("T", " ") if len(txt) >= 16 and txt[10] == "T" else txt
+
+
+def span_phrase(window):
+    """'the mail log's 41-hour span (2026-10-05 22:25 to 2026-10-07 15:20 UTC)',
+    in days from 48 hours on; None without a window. The mail log often
+    reaches less far back than the report window (a row budget keeps the
+    newest hours), and every mail-log number should say how far."""
+    if not window:
+        return None
+    hours = _f(window.get("hours"))
+    if hours is None:
+        return "the mail log's span (%s to %s UTC)" % (_stamp(window.get("from")), _stamp(window.get("to")))
+    if hours >= 48:
+        return "the mail log's %d-day span (%s to %s)" % (round(hours / 24), str(window.get("from"))[:10],
+                                                         str(window.get("to"))[:10])
+    return "the mail log's %d-hour span (%s to %s UTC)" % (round(hours), _stamp(window.get("from")),
+                                                            _stamp(window.get("to")))
+
+
 def truncation_note(ml):
     """One clause when the mail-log section says its export was cut short."""
     for key in ("truncated", "truncation", "capped", "cap", "row_cap", "rows_capped"):
@@ -518,8 +541,11 @@ def maillog_view(report):
     counters = ml.get("counters") if isinstance(ml.get("counters"), dict) else {}
     verdicts = [v for v in (ml.get("verdicts") or []) if isinstance(v, dict)]
     genuine = [v for v in verdicts if v.get("genuine_failure")]
+    window = ml.get("window") if isinstance(ml.get("window"), dict) else None
+    if window and not (window.get("from") and window.get("to")):
+        window = None
     view = {"auth_column": ml.get("auth_column"), "sender_domain": ml.get("sender_domain"),
-            "truncation": truncation_note(ml), "basis": None}
+            "truncation": truncation_note(ml), "basis": None, "window": window}
     for key in ("genuine_failures", "raw_failing_rows", "raw_rows", "logical_messages",
                 "delivered_despite_fail", "blocked_despite_pass", "echo_messages"):
         view[key] = _n(counters.get(key))
@@ -606,7 +632,8 @@ def streams(view, rua, own=None):
         for s in own["senders"]:
             groups[s["likely"] if s.get("likely") in groups else "unknown"].append(s)
         scope = "unaudited subdomains" if own.get("subdomains") else "own domain"
-        return {"basis": "mail log", "scope": scope, "own": groups["likely_misconfigured_sender"],
+        return {"basis": "mail log", "scope": scope, "window": (view or {}).get("window"),
+                "own": groups["likely_misconfigured_sender"],
                 "spoof": groups["likely_spoof"], "unclear": groups["unknown"],
                 "genuine_failures": own["genuine_failures"], "logical_messages": own["logical_messages"],
                 "by_likely": own["by_likely"], "top_senders": own["top_senders"],
@@ -615,7 +642,8 @@ def streams(view, rua, own=None):
         own_s = [s for s in view["by_sender"] if s["likely"] == "likely_misconfigured_sender"]
         spoof = [s for s in view["by_sender"] if s["likely"] == "likely_spoof"]
         unclear = [s for s in view["by_sender"] if s["likely"] not in ("likely_misconfigured_sender", "likely_spoof")]
-        return {"basis": "mail log", "scope": "all audited domains", "own": own_s, "spoof": spoof, "unclear": unclear}
+        return {"basis": "mail log", "scope": "all audited domains", "window": view.get("window"),
+                "own": own_s, "spoof": spoof, "unclear": unclear}
     if isinstance(rua, dict):
         fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict)]
 
@@ -650,8 +678,9 @@ def spoof_share(rua):
 def window_of(report):
     """The date window the inputs state: the aggregate reports' own range,
     else the requested --since/--until bounds, else 'this run's window'.
-    Never a number of days the inputs do not carry. The mail-log export
-    carries no dates, and the sources line says so."""
+    Never a number of days the inputs do not carry. The mail log's own span
+    (maillog.window, when the export has a time column) is stated next to
+    every mail-log number instead: it is often far shorter."""
     rua = report.get("rua") if isinstance(report.get("rua"), dict) else {}
     tot = rua.get("totals") if isinstance(rua.get("totals"), dict) else {}
     begin, end = _day(tot.get("begin_date")), _day(tot.get("end_date"))
@@ -1178,7 +1207,9 @@ def _own_domain_sentence(org, policy, strm):
             return "None of %s's own mail failed with no passing copy in the mail log (%d %s checked)." % (
                 org, seen, _plural(seen, "message"))
         return "The mail log has no rows for %s, so nothing here can say which of its senders fail." % org
-    mid = lead + "%d %s from %s failed with no passing copy" % (gf, _plural(gf, "message"), subject)
+    span = span_phrase(strm.get("window"))
+    mid = lead + "%d %s from %s failed with no passing copy%s" % (gf, _plural(gf, "message"), subject,
+                                                                 (" in %s" % span) if span else "")
     if bl:
         own_n, spoof_n = bl.get("likely_misconfigured_sender", 0), bl.get("likely_spoof", 0)
         unclear_n = bl.get("unknown", 0)
@@ -1225,7 +1256,9 @@ def one_liner(org, policy, pct, since, strm, nxt):
         unit = "sender" if strm["basis"] == "mail log" else "source"
         ours = "senders" if strm["basis"] == "mail log" else "sending sources"
         via = " (from the aggregate reports)" if strm["basis"] != "mail log" else ""
-        lead = "Across all audited domains, " if strm["basis"] == "mail log" else ""
+        span = span_phrase(strm.get("window")) if strm["basis"] == "mail log" else None
+        lead = ("Across all audited domains, in %s, " % span if span else "Across all audited domains, ") \
+            if strm["basis"] == "mail log" else ""
         if own:
             mid = "%s%d of our own %s still %s%s (%s)" % (lead, len(own), ours, _plural(len(own), "fails", "fail"),
                                                           via, _named(own, 2))
@@ -1269,6 +1302,10 @@ def where_we_stand(report, view, trend, window=None):
         text = "**Genuine failures: %d**" % gf
         if raw is not None:
             text += " (raw counts would say %d - the gap is relay echoes, not broken senders)" % raw
+        span = span_phrase(view.get("window"))
+        data["maillog_window"] = view.get("window")
+        if span:
+            text += ", over %s" % span
         if view["truncation"]:
             text += "; the log export was cut short (%s), so this count is a floor" % view["truncation"]
         if not view["auth_column"]:
@@ -1312,6 +1349,10 @@ def where_we_stand(report, view, trend, window=None):
         data["spoofing_blocked"] = None
         lines.append("**Mail refused or quarantined by receivers: outside view not in this run** "
                      "(no aggregate reports were read)")
+    caveats = [str(c) for c in (report.get("caveats") or []) if c] if isinstance(report.get("caveats"), list) else []
+    data["caveats"] = caveats
+    for c in caveats:
+        lines.append("**Caveat:** %s" % c)
     data["trend"] = trend
     if trend is None:
         lines.append("**Trend: first run, no trend yet**")
@@ -1804,11 +1845,16 @@ def sources_line(report, plan, metrics, owners, owners_path, previous, previous_
         inputs.append("live DNS for %d %s" % (len(report["dns"]), _plural(len(report["dns"]), "domain")))
     when = str(report.get("generated_utc") or "")[:16].replace("T", " ")
     parts = ["audit report generated %s UTC (%s)" % (when or "at an unknown time", ", ".join(inputs) or "no failure evidence")]
+    mlw = (view or {}).get("window")
+    mlw_text = ("mail log %s to %s UTC (%s hours)" % (_stamp(mlw["from"]), _stamp(mlw["to"]), mlw.get("hours"))
+                if mlw else None)
     if window["source"]:
         note = ""
         if view is not None and window["source"] == "aggregate reports":
-            note = "; the mail-log export carries no dates"
+            note = ("; " + mlw_text) if mlw_text else "; the mail-log export carries no dates"
         parts.append("window %s (%s%s)" % (window["text"], window["source"], note))
+    elif mlw_text:
+        parts.append("window: " + mlw_text)
     else:
         parts.append("window not stated by the inputs (this run's window)")
     if plan is not None:

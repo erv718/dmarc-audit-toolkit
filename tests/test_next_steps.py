@@ -628,3 +628,40 @@ def test_an_old_report_is_not_reranked_by_a_scoped_log_and_falls_back_to_the_rep
     assert next_steps.pick_org(rep) == "corp.example"
     rep["inputs"]["domain_sources"]["zz.example"] = ["cli"]  # a typed domain wins before any ranking
     assert next_steps.pick_org(rep) == "zz.example"
+
+
+def test_the_report_carries_the_mail_logs_time_span_and_the_document_states_it():
+    rep = audit.build_report(domains=["example.com"], maillog=str(ROOT / "samples" / "sample_maillog.csv"),
+                             offline=True, auth_column="DMARC")
+    w = rep["maillog"]["window"]
+    assert w["column"] == "Email date (UTC)" and w["from"] < w["to"] and w["hours"] > 0 and w["rows"] > 0
+    doc = next_steps.build(rep)
+    span = next_steps.span_phrase(w)
+    assert span.startswith("the mail log's ") and ("-day span (" in span or "-hour span (" in span)
+    assert ("failed with no passing copy in %s" % span) in doc["one_liner"]
+    assert any(", over %s" % span in l for l in doc["stand"]["lines"])
+    assert doc["stand"]["maillog_window"] == w
+    assert "mail log %s to %s UTC (%s hours)" % (w["from"][:16].replace("T", " "), w["to"][:16].replace("T", " "),
+                                                 w["hours"]) in doc["sources"]["audience_line"]
+    assert "carries no dates" not in doc["sources"]["audience_line"]
+
+
+def test_span_phrase_in_hours_and_days():
+    assert next_steps.span_phrase({"from": "2026-10-05T22:25:07Z", "to": "2026-10-07T15:20:17Z", "hours": 40.9}) == (
+        "the mail log's 41-hour span (2026-10-05 22:25 to 2026-10-07 15:20 UTC)")
+    assert next_steps.span_phrase({"from": "2026-09-07T15:39:14Z", "to": "2026-10-07T15:02:21Z", "hours": 719.4}) == (
+        "the mail log's 30-day span (2026-09-07 to 2026-10-07)")
+    assert next_steps.span_phrase(None) is None
+
+
+def test_caveats_and_a_cut_short_log_reach_the_stand_section():
+    rep = audit.build_report(domains=["example.com"], maillog=str(ROOT / "samples" / "sample_maillog.csv"),
+                             offline=True, auth_column="DMARC")
+    rep["caveats"] = ["mail log: example.com row budget reached at 47h..41h ago - older rows skipped; the rows cover "
+                      "only the last 41h (raise --max-rows to keep more) - mail-log counts for that domain cover that span only"]
+    rep["maillog"]["truncation"] = "row budget kept only the newest 41h for example.com"
+    doc = next_steps.build(rep)
+    assert doc["stand"]["caveats"] == rep["caveats"]
+    assert any(l.startswith("**Caveat:** mail log: example.com row budget reached") for l in doc["stand"]["lines"])
+    assert any("the log export was cut short (row budget kept only the newest 41h for example.com), so this count "
+               "is a floor" in l for l in doc["stand"]["lines"])

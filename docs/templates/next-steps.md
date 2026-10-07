@@ -98,11 +98,11 @@ What it writes (the one-liner, the first section and the first owner group;
 the audience line above them names the sources and their sizes):
 
 ```markdown
-**example.com is at p=reject. 21 messages from example.com failed with no passing copy: 3 from 1 of our own senders (statements@example.com x3); 18 from 5 addresses that look like spoofing and are being handled by the policy. No policy step is left; what is left is keeping our own senders passing.**
+**example.com is at p=reject. 21 messages from example.com failed with no passing copy in the mail log's 9-day span (2026-05-01 to 2026-05-09): 3 from 1 of our own senders (statements@example.com x3); 18 from 5 addresses that look like spoofing and are being handled by the policy. No policy step is left; what is left is keeping our own senders passing.**
 
 ## Where we stand (last 30 days, deduplicated)
 
-- **Genuine failures: 21** (raw counts would say 33 - the gap is relay echoes, not broken senders)
+- **Genuine failures: 21** (raw counts would say 33 - the gap is relay echoes, not broken senders), over the mail log's 9-day span (2026-05-01 to 2026-05-09)
 - **Delivered despite failing: 3** - these only arrive because of our own overrides; outside receivers are not as forgiving (statements@example.com x3)
 - **Mail refused or quarantined by receivers under our policy: 300 rejected / 6 quarantined** - this includes any of our own senders that are not yet aligned, not only spoofing (1361 messages seen by 3 reports, 77.4% passing). The spoofing share: 300 messages from 1 source that looks like spoofing (300 rejected).
 - **Trend: first run, no trend yet**
@@ -126,13 +126,13 @@ In a real run you would leave both exactly as the generator wrote them.
 
 # DMARC rollout - status and next steps, 2026-09-29
 
-**example.com is at p=none. 6 senders still fail. The next safe step is
+**example.com is at p=reject. 21 messages from example.com failed with no passing copy in the mail log's 9-day span (2026-05-01 to 2026-05-09): 3 from 1 of our own senders (statements@example.com x3); 18 from 5 addresses that look like spoofing and are being handled by the policy. No policy step is left; what is left is keeping our own senders passing.**
 p=quarantine at pct=10, and it is ready once the statements system (3
 misconfigured messages) is DKIM-signed.**
 
 ## Where we stand (last 30 days, deduplicated)
 
-- **Genuine failures: 21** (raw counts would say 33)
+- **Genuine failures: 21** (raw counts would say 33 - the gap is relay echoes, not broken senders), over the mail log's 9-day span (2026-05-01 to 2026-05-09)
 - **Delivered despite failing: 3** - purchase-order mail from our own
   statements system, arriving only because of an override
 - **Spoofing blocked by receivers: 300 rejected** - voicemail and ACH lures

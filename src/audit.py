@@ -135,6 +135,9 @@ MAILLOG_COLUMNS = {"msgid": "Internet message ID", "recipient": "Recipients",
                    "action": "Delivery action", "location": "Latest delivery location",
                    "subject": "Subject", "envelope": "Sender mail from domain",
                    "direction": "Direction", "spf": "SPF", "dkim": "DKIM"}
+# the time column a mail-log export may carry, first match wins: the Defender
+# "All email" export, then queries/raw_maillog.kql, then common names
+TIME_COLUMNS = ("Email date (UTC)", "Timestamp", "Received", "Date")
 # maillog.by_domain bucket for rows whose sender domain is under no audited domain
 OTHER = "(other)"
 # census entries under this many genuine failures are notes, not headlines
@@ -365,6 +368,49 @@ def detect_auth_column(header):
     return None
 
 
+def _parse_time(text):
+    """A naive UTC datetime from an export's time cell (ISO 8601 with Z or an
+    offset, or 'YYYY-MM-DD HH:MM:SS'), or None."""
+    txt = str(text or "").strip()
+    if not txt:
+        return None
+    txt = re.sub(r"(\.\d{6})\d+", r"\1", txt.replace("Z", "+00:00"))  # fromisoformat takes six fraction digits at most
+    try:
+        t = datetime.fromisoformat(txt)
+    except ValueError:
+        return None
+    if t.tzinfo is not None:
+        t = t.astimezone(timezone.utc).replace(tzinfo=None)
+    return t
+
+
+def maillog_window(rows, header, cols, sender_domain=None):
+    """The time span the in-scope rows cover, from the first TIME_COLUMNS
+    column the export carries: {column, from, to, hours, rows}, or None when
+    there is no such column or no cell parses. This is how far the mail-log
+    numbers reach - a row budget or a cap can make it far shorter than the
+    window that was asked for."""
+    col = next((c for c in TIME_COLUMNS if c in header), None)
+    if not col:
+        return None
+    lo = hi = None
+    n = 0
+    for row in rows:
+        if not dedupe.in_scope(row, cols, sender_domain):
+            continue
+        t = _parse_time(row.get(col))
+        if t is None:
+            continue
+        n += 1
+        lo = t if lo is None or t < lo else lo
+        hi = t if hi is None or t > hi else hi
+    if lo is None:
+        return None
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return {"column": col, "from": lo.strftime(fmt), "to": hi.strftime(fmt),
+            "hours": round((hi - lo).total_seconds() / 3600, 1), "rows": n}
+
+
 def run_maillog(csv_path, sender_domain=None, auth_column=None, vendor_domains=(), columns=None):
     """dedupe as a library call. Returns dedupe.build_doc's document.
 
@@ -410,6 +456,9 @@ def run_maillog(csv_path, sender_domain=None, auth_column=None, vendor_domains=(
     findings = dedupe.build_findings(counts, verdicts, auth_column, missing_opt, sender_domain)
     doc = dedupe.build_doc(path, counts, verdicts, findings, sender_domain, auth_column, vendor_domains)
     doc["columns"] = cols
+    window = maillog_window(rows, header, cols, sender_domain)
+    if window:
+        doc["window"] = window
     if detected:
         doc["auth_column_detected"] = True
     if missing_opt:
@@ -1053,7 +1102,8 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence, maillog=
     reasons.append(evidence["statement"])
     return {"verdict": verdict, "current_policy": policy, "policy_source": policy_from,
             "next_step": step, "reasons": reasons,
-            "maillog_rows": maillog["logical_messages"] if maillog is not None else None}
+            "maillog_rows": maillog["logical_messages"] if maillog is not None else None,
+            "excepted_failures": excepted}
 
 
 def _gate_names(dns_reports, rua_doc, domains=()):
