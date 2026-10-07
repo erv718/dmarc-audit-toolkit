@@ -213,6 +213,7 @@ def dedupe_maillog(
     location_column: str = "Latest delivery location",
     subject_column: str = "Subject",
     envelope_column: str = "Sender mail from domain",
+    direction_column: str = "Direction",
     vendor_domains: list[str] | None = None,
 ) -> dict:
     """Collapse a mail-log CSV into logical messages by Message-ID plus
@@ -226,11 +227,15 @@ def dedupe_maillog(
     heuristic from the subject and envelope domain, not a verdict;
     vendor_domains teaches it your vendors' envelope domains. Column
     defaults match a Microsoft 365 Defender 'All email' export; a
-    misspelled column is an error, never a silent zero."""
+    misspelled column is an error, never a silent zero. Each message detail
+    carries passed (some copy passed authentication) and internal (every
+    leg of that Message-ID stayed inside the tenant, read from
+    direction_column; a log without that column marks nothing internal)."""
     cols = {"msgid": msgid_column, "recipient": recipient_column,
             "sender": sender_column, "domain": domain_column,
             "action": action_column, "location": location_column,
-            "subject": subject_column, "envelope": envelope_column}
+            "subject": subject_column, "envelope": envelope_column,
+            "direction": direction_column}
     sender_domain = (sender_domain or "").strip().lower() or None
     auth_column = (auth_column or "").strip() or None
     vendors = [v.strip().lower() for v in (vendor_domains or []) if v and v.strip()]
@@ -253,6 +258,8 @@ def dedupe_maillog(
     # the same column gate audit.py and dedupe.py apply before counting
     # anything: a typo in a column name dies loudly, it never returns zero
     missing_req, missing_opt = dedupe_mod.check_columns(header, cols, auth_column, sender_domain)
+    if direction_column != "Direction" and direction_column not in header:
+        missing_opt.append(direction_column)  # named by hand and absent: say so, as for any other column
     if missing_req:
         return {"error": "column not found: %s. Available columns: %s"
                          % (", ".join(missing_req), ", ".join(header) or "(none)")}

@@ -98,13 +98,13 @@ What it writes (the one-liner, the first section and the first owner group;
 the audience line above them names the sources and their sizes):
 
 ```markdown
-**example.com is at p=reject. 1 of our own sending streams still fails (statements@example.com x3); 5 streams look like spoofing and are being handled by the policy. Nothing is left to ratchet; what is left is keeping our own senders passing.**
+**example.com is at p=reject. 21 messages from example.com failed with no passing copy: 3 from 1 of our own senders (statements@example.com x3); 18 from 5 addresses that look like spoofing and are being handled by the policy. No policy step is left; what is left is keeping our own senders passing.**
 
 ## Where we stand (last 30 days, deduplicated)
 
 - **Genuine failures: 21** (raw counts would say 33 - the gap is relay echoes, not broken senders)
 - **Delivered despite failing: 3** - these only arrive because of our own overrides; outside receivers are not as forgiving (statements@example.com x3)
-- **Spoofing blocked by receivers: 300 rejected / 6 quarantined** - what enforcement is actually for (1361 messages seen by 3 reports, 77.4% passing)
+- **Mail refused or quarantined by receivers under our policy: 300 rejected / 6 quarantined** - this includes any of our own senders that are not yet aligned, not only spoofing (1361 messages seen by 3 reports, 77.4% passing). The spoofing share: 300 messages from 1 source that looks like spoofing (300 rejected).
 - **Trend: first run, no trend yet**
 
 ## What happens next, by owner

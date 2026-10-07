@@ -209,3 +209,54 @@ def test_a_failed_row_pull_keeps_the_measured_volume(monkeypatch, tmp_path):
 
 def test_a_template_with_a_filter_after_the_projection_is_not_sized():
     assert collect.count_kql(REAL.rstrip() + '\n| where Subject != ""\n', "example.com", 720) is None
+
+
+def test_a_template_without_the_sender_domain_line_is_noted_not_a_crash(monkeypatch, tmp_path):
+    monkeypatch.setattr(collect, "QUERY", tmp_path / "custom.kql")
+    (tmp_path / "custom.kql").write_text("EmailEvents | take 10\n", encoding="utf-8")
+    monkeypatch.setattr(collect.graph_client, "hunting", lambda *a, **k: {"results": [], "schema": []})
+    volumes = {}
+    path, notes = collect.pull_maillog("tok", ["example.com"], tmp_path / "m.csv", 30, 0, volumes)
+    assert path is None and volumes == {}
+    assert any("mail log for example.com not pulled" in n and "placeholder" in n for n in notes)
+
+
+def test_a_dynamic_column_in_a_customized_projection_does_not_crash_the_merge(monkeypatch, tmp_path):
+    def hunting(tok, kql, ts=None):
+        if "summarize n = count()" in kql:
+            return {"schema": [{"name": "hago"}, {"name": "n"}], "results": [{"hago": 0, "n": 2}]}
+        row = {"Internet message ID": "a", "Timestamp": "2026-09-30T00:00:00Z", "Tags": ["x", {"k": 1}]}
+        return {"schema": [{"name": k} for k in row], "results": [dict(row), dict(row)]}  # a repeated leg
+    monkeypatch.setattr(collect.graph_client, "hunting", hunting)
+    path, notes = collect.pull_maillog("tok", ["example.com"], tmp_path / "m.csv", 30, 0)
+    assert path is not None
+    with open(path, encoding="utf-8", newline="") as fh:
+        assert len(list(csv.DictReader(fh))) == 1  # the repeated leg was dropped, the list value kept
+
+
+def test_the_summary_note_is_honest_when_the_budget_cuts_an_unsized_pull(monkeypatch, tmp_path):
+    small_caps(monkeypatch)
+    monkeypatch.setattr(collect, "QUERY", tmp_path / "bare.kql")
+    (tmp_path / "bare.kql").write_text(BARE, encoding="utf-8")
+    tenant = Tenant({0: 60, 1: 60, 2: 60})
+    monkeypatch.setattr(collect.graph_client, "hunting", tenant.hunting)
+    path, notes = collect.pull_maillog("tok", ["example.com"], tmp_path / "m.csv", 30, 100)
+    assert any("row budget reached" in n for n in notes)
+    summary = [n for n in notes if n.startswith("mail log: 120 rows for example.com")]
+    assert summary and "the newest part of the last 30 days (2 window slices, row budget 100)" in summary[0]
+    assert not any("(last 30 days)" in n for n in notes)  # no note claims the whole window
+
+
+def test_the_headline_note_reports_what_the_gate_chose():
+    orgs = ["aaa.example", "corp.example"]
+    gate = {"headline_domain": "corp.example", "headline_source": "most internal mail"}
+    assert collect.headline_note(gate, orgs, {"aaa.example": 0, "corp.example": 120}) == (
+        "headline signal: internal mail per org domain - corp.example 120, aaa.example 0; "
+        "the headline is corp.example (most internal mail)")
+    gate = {"headline_domain": "aaa.example", "headline_source": "first on the command line"}
+    assert collect.headline_note(gate, orgs, {"aaa.example": 0, "corp.example": 0}) == (
+        "headline signal: no internal mail in any org domain this run - "
+        "the headline is aaa.example (first on the command line)")
+    assert collect.headline_note(gate, orgs, {"aaa.example": 7}) == (
+        "headline signal: internal-mail volume missing for corp.example - "
+        "the headline is aaa.example (first on the command line)")

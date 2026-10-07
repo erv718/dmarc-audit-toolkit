@@ -53,8 +53,10 @@ worst-ranked domain (on a tie the headline domain, then the order given).
 gate.headline describes the headline domain: a typed one (command line,
 then --file) when there is one; among discovered domains the org family
 carrying the most internal mail (collect.py's hourly sizing), else the most
-passing mail in the mail log or the reports, else the tenant default
-domain, else the shortest audited apex - the label says which. A sender
+passing or internal mail in the mail log (passing_messages plus
+internal_messages), else the most passing mail in the reports, else the
+tenant default domain, else the shortest audited apex - the label says
+which. A sender
 census (maillog.census, from
 dedupe.census) and, with --previous, a delta against an earlier report.json
 (report.delta) round the report out.
@@ -123,7 +125,8 @@ TENANT_GATE_BLOCKS = ("RULES-001", "RULES-002", "RULES-101", "RULES-102", "RULES
 MAILLOG_COLUMNS = {"msgid": "Internet message ID", "recipient": "Recipients",
                    "sender": "Sender address", "domain": "Sender domain",
                    "action": "Delivery action", "location": "Latest delivery location",
-                   "subject": "Subject", "envelope": "Sender mail from domain"}
+                   "subject": "Subject", "envelope": "Sender mail from domain",
+                   "direction": "Direction"}
 # maillog.by_domain bucket for rows whose sender domain is under no audited domain
 OTHER = "(other)"
 # census entries under this many genuine failures are notes, not headlines
@@ -383,6 +386,8 @@ def run_maillog(csv_path, sender_domain=None, auth_column=None, vendor_domains=(
         auth_column = detect_auth_column(header)
         detected = bool(auth_column)
     missing_req, missing_opt = dedupe.check_columns(header, cols, auth_column, sender_domain)
+    if (columns or {}).get("direction") and cols["direction"] not in header:
+        missing_opt.append(cols["direction"])  # named by hand and absent: say so, as for any other column
     if missing_req:
         raise UsageError("column not found: %s. Available columns: %s"
                          % (", ".join(missing_req), ", ".join(header) or "(none)"))
@@ -404,12 +409,18 @@ def run_maillog(csv_path, sender_domain=None, auth_column=None, vendor_domains=(
 
 def _counters(verdicts):
     """dedupe.summarize-style counters over one slice of verdicts, plus the
-    senders behind its genuine failures."""
+    senders behind its genuine failures. passing_messages had a copy pass
+    authentication; internal_messages stayed inside the tenant without one
+    (internal mail gets no DMARC verdict): together, the mail the domain
+    itself sent, which a spoof never is."""
     failing = [v for v in verdicts if v.get("genuine_failure")]
     by_likely = Counter(v.get("likely") or "unknown" for v in failing)
     senders = Counter((v.get("sender") or "?").lower() for v in failing)
     return {"logical_messages": len(verdicts),
             "genuine_failures": len(failing),
+            "passing_messages": sum(1 for v in verdicts if v.get("passed")),
+            "internal_messages": sum(1 for v in verdicts if v.get("internal") and not v.get("passed")
+                                     and not v.get("genuine_failure")),
             "echo_messages": sum(1 for v in verdicts if v.get("echo_present")),
             "delivered_despite_fail": sum(1 for v in verdicts if v.get("delivered_despite_fail")),
             "blocked_despite_pass": sum(1 for v in verdicts if v.get("blocked_despite_pass")),
@@ -550,25 +561,32 @@ def headline_domain(domains, domain_sources=None, headline=None, volume=None,
 
 
 def mail_volume(by_domain, rua_doc, names, maillog_doc=None):
-    """Passing messages per domain, the headline signal when collect.py's
+    """Mail each domain itself sent, the headline signal when collect.py's
     internal-mail totals are not available: the mail log's logical messages
-    minus its genuine failures, for each audited domain plus its unaudited
-    subdomains - unless the log was scoped to one --sender-domain, which
+    that passed authentication or stayed inside the tenant (when the log
+    carries verdicts; else logical messages minus genuine failures), for each
+    audited domain plus its unaudited subdomains - unless the log was scoped
+    to one --sender-domain, which
     cannot rank the rest; else the aggregate reports' passing counts per
     header-from domain. Spoofed mail fails, so it does not count. Returns
     (volume, label), or ({}, None) when neither source carries passing mail."""
     vol = {}
     scoped = bool(maillog_doc and maillog_doc.get("sender_domain"))
+    verdicts_known = bool(maillog_doc and maillog_doc.get("auth_column"))
     if by_domain and not scoped:
         for d in names:
             c = by_domain.get(d) or {}
             sub = c.get("subdomains_total") or {}
             for part in (c, sub):
-                ok = (part.get("logical_messages") or 0) - (part.get("genuine_failures") or 0)
+                if verdicts_known and part.get("passing_messages") is not None:
+                    # passed, or never left the tenant: a spoof of an unprotected domain is neither
+                    ok = (part.get("passing_messages") or 0) + (part.get("internal_messages") or 0)
+                else:
+                    ok = (part.get("logical_messages") or 0) - (part.get("genuine_failures") or 0)
                 if ok > 0:
                     vol[d] = vol.get(d, 0) + ok
         if vol:
-            return vol, "most passing mail in the mail log"
+            return vol, "most passing or internal mail in the mail log"
     audited = set(names)
     for h in ((rua_doc or {}).get("by_header_from") or []):
         dom = _norm_name(h.get("domain"))
@@ -962,9 +980,9 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
     headline domain's. headline: an optional explicit override; otherwise
     headline_domain picks it: a typed domain first (command line, then
     --file), else the org family carrying the most mail - volume, the
-    internal-mail totals per org that collect.py measures, else passing
-    mail from the mail log or the reports (mail_volume) - else the tenant
-    default domain, else the shortest apex."""
+    internal-mail totals per org that collect.py measures, else passing or
+    internal mail from the mail log, else passing mail from the reports
+    (mail_volume) - else the tenant default domain, else the shortest apex."""
     evidence = evidence_summary(rua_doc, maillog_doc, headers_doc)
     if dns_reports:  # a library caller's spelling must not lose the DNS blockers
         dns_reports = {_norm_name(d): r for d, r in dns_reports.items()}

@@ -348,7 +348,7 @@ def test_mail_volume_counts_passing_mail_in_the_log_then_the_reports():
                                  "subdomains_total": {"logical_messages": 7, "genuine_failures": 7}},
                  "quiet.example": {"logical_messages": 0, "genuine_failures": 0, "subdomains_total": {}}}
     assert audit.mail_volume(by_domain, None, ["example.com", "quiet.example"]) == (
-        {"example.com": 4}, "most passing mail in the mail log")
+        {"example.com": 4}, "most passing or internal mail in the mail log")
     # a log scoped to one --sender-domain cannot rank the others: the reports decide
     rua = {"by_header_from": [{"domain": "m.example.com", "count": 500, "pass": 480, "fail": 20},
                               {"domain": "example.com", "count": 20, "pass": 20, "fail": 0}]}
@@ -377,7 +377,7 @@ def test_a_tenant_run_headlines_the_busiest_domain_not_the_first_alphabetically(
     doc = audit.build_report(domains=domains, maillog=str(maillog), offline=True, auth_column="DMARC",
                              domain_sources={d: ["tenant"] for d in domains})
     g = doc["gate"]
-    assert (g["headline_domain"], g["headline_source"]) == ("example.com", "most passing mail in the mail log")
+    assert (g["headline_domain"], g["headline_source"]) == ("example.com", "most passing or internal mail in the mail log")
 
 
 def test_org_totals_pick_the_family_and_each_domains_own_mail_picks_the_member():
@@ -398,3 +398,89 @@ def test_report_volume_lands_on_the_closest_audited_domain():
     rua = {"by_header_from": [{"domain": "m.example.com", "pass": 500}, {"domain": "sub.example.com", "pass": 10}]}
     assert audit.mail_volume(None, rua, ["example.com", "sub.example.com"]) == (
         {"example.com": 500, "sub.example.com": 10}, "most passing mail in the reports")
+
+
+def test_spoofs_of_an_unprotected_domain_do_not_count_as_its_mail(tmp_path):
+    rows = []
+    for i in range(300):
+        rows.append(["2026-05-01 09:00:00", "<c%d@corp.example>" % i, "news@corp.example", "corp.example",
+                     "corp.example", "user@example.com", "News", "Delivered", "Inbox/folder", "pass"])
+    for i in range(900):  # no DMARC record on parked.example, so the spoofs carry the verdict none
+        rows.append(["2026-05-01 09:00:00", "<p%d@spam.invalid>" % i, "ceo@parked.example", "parked.example",
+                     "spam.invalid", "user@example.com", "Invoice", "Delivered", "Junk folder", "none"])
+    path = tmp_path / "log.csv"
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(COLUMNS)
+        w.writerows(rows)
+    domains = ["aaa.example", "corp.example", "parked.example"]
+    doc = audit.build_report(domains=domains, maillog=str(path), offline=True, auth_column="DMARC",
+                             domain_sources={d: ["tenant"] for d in domains})
+    assert (doc["gate"]["headline_domain"], doc["gate"]["headline_source"]) == (
+        "corp.example", "most passing or internal mail in the mail log")
+    assert doc["maillog"]["by_domain"]["parked.example"]["passing_messages"] == 0
+
+
+def test_internal_mail_is_the_domains_own_so_the_apex_leads_its_family(tmp_path):
+    rows = [["2026-05-01 09:00:00", "<i%d@corp.example>" % i, "staff@corp.example", "corp.example", "corp.example",
+             "colleague@corp.example", "Lunch", "Delivered", "Inbox/folder", "none", "Intra-org"] for i in range(400)]
+    rows += [["2026-05-01 09:00:00", "<v%d@vendor.invalid>" % i, "deals@mkt.corp.example", "mkt.corp.example",
+              "vendor.invalid", "user@corp.example", "Deals", "Delivered", "Inbox/folder", "pass", "Inbound"]
+             for i in range(100)]
+    # one message with an outside leg is not internal, whatever its other leg says
+    rows += [["2026-05-01 09:00:00", "<x@spam.invalid>", "ceo@corp.example", "corp.example", "spam.invalid",
+              "cfo@corp.example", "Wire", "Delivered", "Inbox/folder", "none", leg] for leg in ("Inbound", "Intra-org")]
+    # a spoof's copy that a mailbox rule redirected to another recipient is its own group with
+    # one Intra-org leg: still not internal, because that Message-ID arrived from outside
+    rows += [["2026-05-01 09:00:00", "<r%d@spam.invalid>" % i, "ceo@corp.example", "corp.example", "spam.invalid",
+              rcpt, "Wire", "Delivered", "Inbox/folder", "none", leg]
+             for i in range(5) for rcpt, leg in (("cfo@corp.example", "Inbound"), ("pa@corp.example", "Intra-org"))]
+    path = tmp_path / "log.csv"
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(COLUMNS + ["Direction"])
+        w.writerows(rows)
+    domains = ["aaa.example", "corp.example", "mkt.corp.example"]
+    doc = audit.build_report(domains=domains, maillog=str(path), offline=True, auth_column="DMARC",
+                             domain_sources={d: ["tenant"] for d in domains})
+    c = doc["maillog"]["by_domain"]["corp.example"]
+    assert (c["logical_messages"], c["passing_messages"], c["internal_messages"]) == (411, 0, 400)
+    # a pass-only count would hand the family to the subdomain that only receives vendor mail
+    assert (doc["gate"]["headline_domain"], doc["gate"]["headline_source"]) == (
+        "corp.example", "most passing or internal mail in the mail log")
+
+
+def _write(path, header, rows):
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def test_a_direction_column_named_by_hand_must_exist(tmp_path):
+    path = tmp_path / "log.csv"
+    _write(path, COLUMNS, [["2026-05-01 09:00:00", "<a@x>", "hi@corp.example", "corp.example", "corp.example",
+                            "u@example.com", "Hello", "Delivered", "Inbox/folder", "pass"]])
+    quiet = audit.run_maillog(str(path), auth_column="DMARC")  # no Direction column: the default stays silent
+    assert "Direction" not in (quiet.get("missing_optional_columns") or [])
+    loud = audit.run_maillog(str(path), auth_column="DMARC", columns={"direction": "Mail direction"})
+    assert "Mail direction" in loud["missing_optional_columns"]
+    p = subprocess.run([sys.executable, str(ROOT / "src" / "dedupe.py"), str(path), "--auth-column", "DMARC",
+                        "--direction-column", "Mail direction", "--json"], capture_output=True, text=True)
+    assert p.returncode in (0, 1) and "warning: column not found: Mail direction" in p.stderr
+
+
+def test_the_mcp_wrapper_reads_the_direction_column(tmp_path):
+    import mcp_server
+    path = tmp_path / "log.csv"
+    _write(path, COLUMNS + ["Direction"], [
+        ["2026-05-01 09:00:00", "<i1@x>", "staff@corp.example", "corp.example", "corp.example",
+         "colleague@corp.example", "Lunch", "Blocked", "Quarantine", "fail", "Intra-org"],
+        ["2026-05-01 09:00:00", "<v1@x>", "deals@corp.example", "corp.example", "vendor.invalid",
+         "u@corp.example", "Deals", "Blocked", "Quarantine", "fail", "Inbound"]])
+    reply = mcp_server.dedupe_maillog(str(path), auth_column="DMARC")
+    details = {d["msgid"]: d for d in reply["genuine_failure_details"]}
+    assert details["<i1@x>"]["internal"] is True and details["<v1@x>"]["internal"] is False
+    assert details["<i1@x>"]["passed"] is False
+    loud = mcp_server.dedupe_maillog(str(path), auth_column="DMARC", direction_column="Mail direction")
+    assert "Mail direction" in loud["missing_optional_columns"]

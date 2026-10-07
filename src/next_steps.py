@@ -224,6 +224,11 @@ def _under(name, domain):
     return bool(name) and bool(domain) and (name == domain or name.endswith("." + domain))
 
 
+def _dom(value):
+    """A domain name as the report keys it: lower case, no surrounding space or trailing dot."""
+    return str(value or "").strip().lower().rstrip(".")
+
+
 def _n(value):
     """int for anything that carries a whole number, else None (never a bool)."""
     if isinstance(value, bool):
@@ -559,6 +564,11 @@ def maillog_view(report):
     return view
 
 
+# streams() scopes whose numbers come from maillog.by_domain: the org's own rows, or
+# its unaudited subdomains' rows when it has none of its own
+OWN_SCOPES = ("own domain", "unaudited subdomains")
+
+
 def own_domain_view(report, view, org):
     """The organization domain's own mail-log numbers (maillog.by_domain[org]:
     its genuine failures, top senders and the likely split), with the census
@@ -569,7 +579,11 @@ def own_domain_view(report, view, org):
     c = bd.get(org) if isinstance(bd, dict) else None
     if not isinstance(c, dict) or _n(c.get("genuine_failures")) is None:
         return None
-    senders = [s for s in (view["by_sender"] if view else []) if s.get("domain") == org]
+    subs = []
+    sub = c.get("subdomains_total") if isinstance(c.get("subdomains_total"), dict) else None
+    if not _n(c.get("logical_messages")) and sub and _n(sub.get("logical_messages")):
+        c, subs = sub, [str(d) for d in (sub.get("domains") or [])]  # the org's mail all sits in its subdomains
+    senders = [s for s in (view["by_sender"] if view else []) if s.get("domain") == org or s.get("domain") in subs]
     by_likely = c.get("by_likely") if isinstance(c.get("by_likely"), dict) else None
     if by_likely is None and senders:
         cnt = Counter()
@@ -579,7 +593,8 @@ def own_domain_view(report, view, org):
     return {"genuine_failures": _n(c["genuine_failures"]), "logical_messages": _n(c.get("logical_messages")),
             "delivered_despite_fail": _n(c.get("delivered_despite_fail")),
             "by_likely": {k: _n(v) or 0 for k, v in by_likely.items()} if by_likely else None,
-            "top_senders": _entries(c.get("top_senders"), SENDER_KEYS) or [], "senders": senders}
+            "top_senders": _entries(c.get("top_senders"), SENDER_KEYS) or [], "senders": senders,
+            "subdomains": subs}
 
 
 def streams(view, rua, own=None):
@@ -590,10 +605,12 @@ def streams(view, rua, own=None):
         groups = {"likely_misconfigured_sender": [], "likely_spoof": [], "unknown": []}
         for s in own["senders"]:
             groups[s["likely"] if s.get("likely") in groups else "unknown"].append(s)
-        return {"basis": "mail log", "scope": "own domain", "own": groups["likely_misconfigured_sender"],
+        scope = "unaudited subdomains" if own.get("subdomains") else "own domain"
+        return {"basis": "mail log", "scope": scope, "own": groups["likely_misconfigured_sender"],
                 "spoof": groups["likely_spoof"], "unclear": groups["unknown"],
                 "genuine_failures": own["genuine_failures"], "logical_messages": own["logical_messages"],
-                "by_likely": own["by_likely"], "top_senders": own["top_senders"]}
+                "by_likely": own["by_likely"], "top_senders": own["top_senders"],
+                "subdomains": own.get("subdomains") or []}
     if view is not None and (view["by_sender"] or view["genuine_failures"] is not None):
         own_s = [s for s in view["by_sender"] if s["likely"] == "likely_misconfigured_sender"]
         spoof = [s for s in view["by_sender"] if s["likely"] == "likely_spoof"]
@@ -865,52 +882,123 @@ def holds_for(plan, domain=None):
 # ------------------------------------------------------------------ the document
 
 WEAK_HEADLINES = ("shortest audited apex", "shortest audited domain")
+TYPED_HEADLINES = ("first on the command line", "first in --file", "first domain given")
+# labels the gate gives a headline its volume rule chose: it ranked the org families
+# and picked the member already, so the subject is settled
+VOLUME_HEADLINES = ("most internal mail", "most passing or internal mail in the mail log",
+                    "most passing mail in the mail log", "most passing mail in the reports", "most mail in this run")
+
+
+def _passing(c, verdicts=True):
+    """Mail a domain itself sent, counted the way audit.mail_volume counts it:
+    messages that passed authentication or stayed inside the tenant when the
+    log carried verdicts and the report has those counts, else logical
+    messages minus genuine failures (a report from before the counts)."""
+    c = c if isinstance(c, dict) else {}
+    if verdicts and c.get("passing_messages") is not None:
+        return (_n(c.get("passing_messages")) or 0) + (_n(c.get("internal_messages")) or 0)
+    return max(0, (_n(c.get("logical_messages")) or 0) - (_n(c.get("genuine_failures")) or 0))
+
+
+def _rua_own(domain, froms, audited):
+    """Passing messages the aggregate reports attribute to the domain itself or
+    to its unaudited subdomains - audit.mail_volume's attribution."""
+    total = 0
+    for h in froms:
+        if not isinstance(h, dict):
+            continue
+        d = _dom(h.get("domain"))
+        if not d:
+            continue
+        home = d if d in audited else max((a for a in audited if d.endswith("." + a)), key=len, default=None)
+        if home != domain:
+            continue
+        ok = h.get("pass")
+        if ok is None:
+            ok = (_n(h.get("count")) or 0) - (_n(h.get("fail")) or 0)
+        total += max(0, _n(ok) or 0)
+    return total
 
 
 def pick_org(report, org_name=None):
-    """--org-name, else the gate's headline domain - or its org domain, when
-    the headline is a subdomain and that apex has a gate entry with mail-log
-    rows of its own (an apex seen only in the reports, or one whose mail all
-    sits in its subdomains, does not count) - else the first audited apex in
-    the order given, else the first audited domain. A report written before
-    the volume rule, whose headline is only the shortest name, has its
-    audited apexes ranked by passing mail instead. The gate headline
-    already prefers typed domains and, among discovered ones, the domain
-    carrying the most mail; the first apex in list order is only the fallback
-    for a report that names no headline."""
+    """--org-name, else the gate's headline domain. A typed headline (command
+    line, --file, or the first domain given when nothing carries a source) is
+    always the subject, and so is a headline the volume rule chose: the gate
+    ranked the org families and picked the member already. Any other
+    subdomain headline (a tenant default domain, an older report) maps to its
+    audited apex only when that apex sends mail of its own - by the mail log,
+    else by the aggregate reports; an apex seen only in the reports, or one
+    that only gets spoofed, does not count. With no headline: the first
+    audited apex in the order given, else the first audited domain. A report
+    written before the volume rule, whose headline is only the shortest name,
+    is re-ranked the way the gate ranks now: typed sources first, then org
+    families by the mail each audited domain itself sent (its rows plus its
+    unaudited subdomains' in an unscoped mail log, else its passing mail in
+    the reports), the apex leading its family when it has mail of its own,
+    else the busiest member."""
     if org_name:
         return org_name.strip().lower().rstrip(".")
     gate = report.get("gate") or {}
-    names = [str(d).lower() for d in ((report.get("inputs") or {}).get("domains") or []) if d]
-    names += [d.lower() for d in (gate.get("domains") or {})]
-    names += [str(d).lower() for d in ((report.get("rua") or {}).get("totals") or {}).get("domains") or []]
-    names = list(dict.fromkeys(names))
+    inputs = report.get("inputs") or {}
+    audited = [_dom(d) for d in (inputs.get("domains") or []) if d]
+    audited += [_dom(d) for d in (gate.get("domains") or {})]
+    audited = [d for d in dict.fromkeys(audited) if d]
+    names = audited + [_dom(d) for d in ((report.get("rua") or {}).get("totals") or {}).get("domains") or []]
+    names = [d for d in dict.fromkeys(names) if d]
     if not names:
         raise UsageError("the report names no audited domain; pass --org-name")
-    head = str(gate.get("headline_domain") or "").strip().lower().rstrip(".")
-    by = (report.get("maillog") or {}).get("by_domain") or {}
-    if head and gate.get("headline_source") in WEAK_HEADLINES and by:
-        # a report from before the volume rule: rank its audited apexes by passing mail instead
-        scored = []
-        for d, c in by.items():
-            d = str(d).strip().lower().rstrip(".")
-            if d in names and org_domain(d) == d:
-                parts = (c or {}, (c or {}).get("subdomains_total") or {})
-                ok = sum(max(0, (p.get("logical_messages") or 0) - (p.get("genuine_failures") or 0)) for p in parts)
-                if ok > 0:
-                    scored.append((ok, -names.index(d), d))
-        if scored:
-            return max(scored)[2]
+    src = gate.get("headline_source")
+    head = _dom(gate.get("headline_domain"))
+    maillog = report.get("maillog") if isinstance(report.get("maillog"), dict) else {}
+    by = {_dom(d): c for d, c in (maillog.get("by_domain") or {}).items()}
+    verdicts = bool(maillog.get("auth_column"))
+
+    def own_mail(d):
+        c = by.get(d) if isinstance(by.get(d), dict) else {}
+        return _passing(c, verdicts) + _passing(c.get("subdomains_total"), verdicts)
+
+    if head and src in WEAK_HEADLINES:
+        given = [_dom(d) for d in (inputs.get("domains") or []) if d]
+        if given and not inputs.get("domain_sources"):
+            return given[0]  # nothing carries a source: the first domain given is the typed one, as the gate rules now
+        srcs = {_dom(d): tags for d, tags in (inputs.get("domain_sources") or {}).items()}
+        for tag in ("cli", "file"):
+            typed = [d for d in audited if tag in (srcs.get(d) or ())]
+            if typed:
+                return typed[0]
+        scoped = bool(maillog.get("sender_domain"))  # a log scoped to one domain cannot rank the rest
+        own = {d: own_mail(d) for d in audited if d in by} if (by and not scoped) else {}
+        if not any(own.values()):  # no mail log to rank by: the reports' passing mail, as the gate does
+            froms = (report.get("rua") or {}).get("by_header_from") or []
+            own = {d: _rua_own(d, froms, audited) for d in audited} if froms else {}
+        family = {}
+        for d, n in own.items():
+            family[org_domain(d)] = family.get(org_domain(d), 0) + n
+        family = {o: n for o, n in family.items() if n > 0}
+        if family:
+            first = {o: min(audited.index(d) for d in audited if org_domain(d) == o) for o in family}
+            best = max(family, key=lambda o: (family[o], -first[o]))
+            members = [d for d in audited if org_domain(d) == best]
+            busy = [d for d in members if own.get(d, 0) > 0]
+            if best in members and (own.get(best, 0) > 0 or not busy):
+                return best
+            return max(busy, key=lambda d: (own[d], -audited.index(d))) if busy else members[0]
     if head:
         apex = org_domain(head)
-        if apex == head:
+        if apex == head or src in TYPED_HEADLINES or src in VOLUME_HEADLINES:
             return head
-        gd = {str(d).strip().lower().rstrip("."): g for d, g in (gate.get("domains") or {}).items()}
-        if apex in gd:
-            rows = (gd[apex] or {}).get("maillog_rows")
-            if rows is None or rows > 0 or not report.get("maillog"):
-                return apex
-        return head
+        gd = {_dom(d): g for d, g in (gate.get("domains") or {}).items()}
+        if apex not in gd:
+            return head  # an apex that was never audited cannot be the subject
+        froms = (report.get("rua") or {}).get("by_header_from") or []
+        if by:
+            sends = own_mail(apex) > 0
+        elif froms:
+            sends = _rua_own(apex, froms, audited) > 0
+        else:
+            rows = (gd.get(apex) or {}).get("maillog_rows")
+            sends = rows is None or rows > 0 or not report.get("maillog")
+        return apex if sends else head
     for d in names:
         if org_domain(d) == d:
             return d
@@ -1074,14 +1162,23 @@ def _handled(policy, n):
 
 
 def _own_domain_sentence(org, policy, strm):
-    """The one-liner's middle from the org domain's own rows (maillog.by_domain)."""
+    """The one-liner's middle from the org domain's own rows (maillog.by_domain),
+    or from its unaudited subdomains' rows when it has none of its own."""
     gf, seen, bl = strm["genuine_failures"], strm["logical_messages"], strm["by_likely"]
+    subs, subject, lead = strm.get("subdomains") or [], org, ""
+    if subs and seen:
+        listed = ", ".join(subs[:3]) + (" and %d more" % (len(subs) - 3) if len(subs) > 3 else "")
+        lead = "%s has no mail-log rows of its own; its subdomains (%s) carry %d %s. " % (
+            org, listed, seen, _plural(seen, "message"))
+        subject = "its subdomains"
+        if not gf:
+            return lead + "None of them failed with no passing copy."
     if not gf:
         if seen:
             return "None of %s's own mail failed with no passing copy in the mail log (%d %s checked)." % (
                 org, seen, _plural(seen, "message"))
         return "The mail log has no rows for %s, so nothing here can say which of its senders fail." % org
-    mid = "%d %s from %s failed with no passing copy" % (gf, _plural(gf, "message"), org)
+    mid = lead + "%d %s from %s failed with no passing copy" % (gf, _plural(gf, "message"), subject)
     if bl:
         own_n, spoof_n = bl.get("likely_misconfigured_sender", 0), bl.get("likely_spoof", 0)
         unclear_n = bl.get("unknown", 0)
@@ -1121,7 +1218,7 @@ def one_liner(org, policy, pct, since, strm, nxt):
     head += "."
     if strm is None:
         mid = "No mail-log evidence in this run, so nothing here can say which of our own senders still fail."
-    elif strm.get("scope") == "own domain":
+    elif strm.get("scope") in OWN_SCOPES:
         mid = _own_domain_sentence(org, policy, strm)
     else:
         own, spoof, unclear = strm["own"], strm["spoof"], strm["unclear"]
@@ -1771,10 +1868,12 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
         strm_data = {"basis": strm["basis"], "scope": strm.get("scope")}
         for k in ("own", "spoof", "unclear"):
             strm_data[k] = [{"name": s["name"], "count": s["count"]} for s in strm[k]]
-        if strm.get("scope") == "own domain":
+        if strm.get("scope") in OWN_SCOPES:
             strm_data.update({"genuine_failures": strm["genuine_failures"], "logical_messages": strm["logical_messages"],
                               "by_likely": strm["by_likely"],
                               "top_senders": [{"name": s["name"], "count": s["count"]} for s in strm["top_senders"]]})
+            if strm.get("subdomains"):
+                strm_data["subdomains"] = list(strm["subdomains"])  # whose rows these numbers are
     doc = {
         "tool": "next_steps.py", "version": VERSION, "date": date, "org_domain": org,
         "policy": {"p": policy, "pct": pct, "since": since, "text": policy_str},

@@ -156,7 +156,10 @@ def hourly_counts(tok, template, org, start_hours, end_hours=0, info=None):
     empty answer is a valid count: the domain has no rows. With info, records
     the window's total rows and its internal (Intra-org) rows - mail the
     tenant's own people sent, which spoofing cannot inflate."""
-    kql = count_kql(template, org, start_hours, end_hours)
+    try:
+        kql = count_kql(template, org, start_hours, end_hours)
+    except ValueError:  # a customized query without the sender_domain line: no sizing, and no crash
+        return None
     if not kql:
         return None
     try:
@@ -315,17 +318,19 @@ def pull_maillog(tok, org_domains, out_csv, days=30, max_rows=ROW_BUDGET, volume
         cols = cols or res_cols
         before = len(rows)
         for r in got:
-            key = tuple(sorted(r.items()))  # slice boundaries can repeat a leg
+            key = json.dumps(r, sort_keys=True, default=str)  # slice boundaries can repeat a leg; a customized
+            # projection can keep a dynamic column, whose value is a list or an object
             if key not in seen:
                 seen.add(key)
                 rows.append(r)
         stamps = sorted(str(r.get("Timestamp")) for r in rows[before:] if r.get("Timestamp"))
         span = "; rows span %s to %s" % (stamps[0], stamps[-1]) if stamps else ""
-        if budget is not None and budget.get("noted") and info.get("total"):
-            notes.append("mail log: %d rows for %s - the newest part of about %d rows in the last %d days "
-                         "(%d of %d planned slices, row budget %d)%s"
-                         % (len(rows) - before, org, info["total"], days, info.get("pulled", 0),
-                            info.get("planned", 0), max_rows, span))
+        if budget is not None and budget.get("noted"):
+            about = ("about %d rows in " % info["total"]) if info.get("total") else ""
+            how = (("%d of %d planned slices" % (info.get("pulled", 0), info["planned"])) if "planned" in info
+                   else "%d window slice%s" % (calls, "" if calls == 1 else "s"))
+            notes.append("mail log: %d rows for %s - the newest part of %sthe last %d days (%s, row budget %d)%s"
+                         % (len(rows) - before, org, about, days, how, max_rows, span))
         else:
             suffix = " (%d window slices)" % calls if calls > 1 else ""
             notes.append("mail log: %d rows for %s (last %d days)%s%s"
@@ -439,6 +444,20 @@ def render_metrics(entries, last=12):
                                                                pr, e.get("plan_changes", 0), e.get("plan_priority1", 0)))
     L.append("")
     return "\n".join(L)
+
+
+def headline_note(gate, orgs, volumes):
+    """The run note on the headline signal, written from the gate the report
+    chose rather than a guess at the fallback: the internal mail per org
+    domain when the sizing measured any, else what the headline rested on."""
+    chosen = "the headline is %s (%s)" % (gate.get("headline_domain"), gate.get("headline_source"))
+    missing = [o for o in orgs if o not in volumes]
+    if missing:
+        return "headline signal: internal-mail volume missing for %s - %s" % (", ".join(missing), chosen)
+    if any(v > 0 for v in volumes.values()):
+        top = sorted(volumes.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        return "headline signal: internal mail per org domain - %s; %s" % (", ".join("%s %d" % kv for kv in top), chosen)
+    return "headline signal: no internal mail in any org domain this run - %s" % chosen
 
 
 def main():
@@ -597,11 +616,6 @@ def main():
         extra["headline"] = headline
     if volumes and len(volumes) == len(orgs) and accepts(audit.build_report, "volume"):
         extra["volume"] = volumes  # only a complete set ranks: a missing org would lose by default
-        top = sorted(volumes.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
-        note("headline signal: internal mail per org domain - %s" % ", ".join("%s %d" % kv for kv in top))
-    elif tok and not args.maillog and orgs:
-        note("headline signal: internal-mail volume missing for %s - the headline falls back to passing "
-             "mail in the mail log" % ", ".join(o for o in orgs if o not in volumes))
     try:
         report = audit.build_report(
             domains=domains, domain_sources=domain_sources, rua_paths=rua_paths, maillog=maillog,
@@ -610,6 +624,8 @@ def main():
             known=args.known, auth_column=auth_column, since=since, **extra)
     except audit.UsageError as err:
         die(str(err))
+    if tok and not args.maillog and orgs:
+        note(headline_note(report.get("gate") or {}, orgs, volumes))
     (run_dir / "report.json").write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
     (run_dir / "report.md").write_text(audit.render_md(report), encoding="utf-8")
     covered = str(fetch_rua.load_state(out / "rua_state.json").get("covered_from") or "")[:10] if fetch_rua else ""

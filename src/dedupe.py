@@ -75,6 +75,9 @@ FAIL_ACTIONS = {"blocked", "quarantined", "junked", "replaced"}
 
 REQUIRED_COLS = ("msgid", "recipient", "action")
 OPTIONAL_COLS = ("sender", "domain", "location", "subject", "envelope")
+# mail sent from inside the tenant (a Direction column, when the log has one): it carries
+# no DMARC verdict, and no outside sender can fake it
+INTERNAL_DIRECTIONS = ("intra-org", "outbound")
 
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocking": 3}
 
@@ -203,6 +206,10 @@ def classify(rows, cols, sender_domain=None, auth_column=None, vendor_domains=No
         groups[(mid, rcpt)].append(row)
 
     verdicts = {}
+    # Message-IDs with a leg from outside: a copy a mailbox rule redirected to another
+    # recipient is its own group, with internal legs only, and is still not internal mail
+    external = {key[0] for key, legs in groups.items()
+                if any(field(leg, cols, "direction").lower() not in INTERNAL_DIRECTIONS for leg in legs)}
     for key, legs in groups.items():
         actions = [field(leg, cols, "action").lower() for leg in legs]
         locations = [field(leg, cols, "location") for leg in legs]
@@ -211,6 +218,7 @@ def classify(rows, cols, sender_domain=None, auth_column=None, vendor_domains=No
         auth = [leg_auth(leg, cols, auth_column) for leg in legs]
         anypass = any(p for p, _ in auth)
         anyfail = any(f for _, f in auth)
+        internal = key[0] not in external  # every leg of this Message-ID, for every recipient, stayed inside
 
         reached_mailbox = any(
             a in PASS_ACTIONS and ("inbox" in l.lower() or "junk" in l.lower() or "deleted" in l.lower())
@@ -226,6 +234,8 @@ def classify(rows, cols, sender_domain=None, auth_column=None, vendor_domains=No
 
         verdicts[key] = {
             "legs": len(legs),
+            "passed": anypass,  # some copy passed authentication
+            "internal": internal,  # every leg stayed inside the tenant
             "genuine_failure": anyfail and not anypass,
             "echo_present": anyfail and anypass,
             "reached_mailbox": reached_mailbox,
@@ -591,6 +601,9 @@ def main():
     ap.add_argument("--subject-column", default="Subject")
     ap.add_argument("--envelope-column", default="Sender mail from domain",
                     help="column holding the MAIL FROM (envelope) address or domain")
+    ap.add_argument("--direction-column", default="Direction",
+                    help="column holding the mail direction (Inbound, Intra-org, Outbound); a message "
+                         "whose every leg stayed inside the tenant is marked internal")
     ap.add_argument("--vendor-domain", action="append", default=[], metavar="DOMAIN",
                     help="envelope domain you know belongs to one of your vendors; the heuristic "
                          "treats it like a known platform (repeatable)")
@@ -608,6 +621,7 @@ def main():
         "location": args.location_column,
         "subject": args.subject_column,
         "envelope": args.envelope_column,
+        "direction": args.direction_column,
     }
 
     csv_path = repo_path(args.csv_path)
@@ -622,6 +636,8 @@ def main():
         die("cannot parse %s as CSV: %s" % (csv_path, err))
 
     missing_req, missing_opt = check_columns(header, cols, args.auth_column, args.sender_domain)
+    if args.direction_column != ap.get_default("direction_column") and args.direction_column not in header:
+        missing_opt.append(args.direction_column)  # named by hand and absent: say so, as for any other column
     if missing_req:
         die("column not found: %s. Available columns: %s"
             % (", ".join(missing_req), ", ".join(header) or "(none)"))

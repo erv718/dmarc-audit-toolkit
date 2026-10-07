@@ -61,14 +61,16 @@ def load_state(path):
 STATE_EVERY = 50  # messages between state saves: a crash loses at most this much progress
 
 
-def save_state(state_file, newest, mailbox, notes, covered=None):
-    """Remember the newest message handled and, when known, where the
-    archive's unbroken coverage starts; a failure is a note, never a crash."""
+def save_state(state_file, newest, mailbox, notes, covered=None, extra=None):
+    """Remember the newest message handled, where the archive's unbroken
+    coverage starts when known, and any unfinished --since backfill (extra);
+    a failure is a note, never a crash."""
     if not (state_file and newest):
         return
     doc = {"last_received": newest, "mailbox": mailbox}
     if covered:
         doc["covered_from"] = covered
+    doc.update(extra or {})
     try:
         Path(state_file).write_text(json.dumps(doc), encoding="utf-8")
     except OSError as err:
@@ -126,8 +128,13 @@ def fetch(tok, mailbox, dest_dir, state_file=None, since=None, max_messages=500,
 
     The state also records covered_from, where the archive's unbroken
     coverage starts: a first run (or a jump to the floor) starts it, resumes
-    keep it, and a --since backfill extends it back only when it read
-    through to the old coverage without skipping anything.
+    keep it, a forward --since restarts it at its start once the position
+    moves past the unread gap, and a --since backfill extends it back only
+    when it read through to the old coverage with no skip before it (a skip
+    inside the old coverage is a message the weekly runs read already). A
+    backfill that stops early (--max, a skipped message, a failure) records
+    the stretch it read unbroken (backfill_from, backfill_to), so the next
+    leg, --since where it stopped, extends the coverage from the first leg.
 
     The listing asks Graph for the attachments inline ($expand), so one call
     reads a page of reports instead of one call per message. A message whose
@@ -158,6 +165,15 @@ def fetch(tok, mailbox, dest_dir, state_file=None, since=None, max_messages=500,
         since, jumped = _iso(floor), True
     start = since
     cov = start if (jumped or not start_pos) else covered  # a fresh archive starts where this run starts
+    against = bool(explicit and start_pos and not jumped)  # a --since run against a saved position
+    before = against and start <= _iso(start_pos)  # a backfill: it reads what lies behind the saved position
+    forward = against and start > _iso(start_pos)  # a jump ahead: [saved position, start) is never read
+    bf_from, bf_to = state.get("backfill_from"), state.get("backfill_to")
+    eff_from = start
+    if before and bf_from and bf_to and start <= _iso(bf_to):
+        eff_from = min(start, _iso(bf_from))  # this leg continues a backfill that stopped at bf_to
+    pending = {"backfill_from": bf_from, "backfill_to": bf_to} if (bf_from and bf_to and not before) else {}
+    complete = False
     limit = max_messages if max_messages and max_messages > 0 else None
     box = urllib.parse.quote(mailbox)
     saved, seen, newest, last = 0, 0, start_pos, None
@@ -167,6 +183,24 @@ def fetch(tok, mailbox, dest_dir, state_file=None, since=None, max_messages=500,
     def position():
         p = resume_point(newest, hold)
         return start_pos if (start_pos and p and p < start_pos) else p  # never backwards
+
+    def coverage():
+        p = position()
+        if forward and p and p > start_pos:
+            return start  # the position moved past the unread gap: the coverage starts again here
+        return cov
+
+    def span():
+        """An unfinished backfill's unbroken stretch, kept so the next leg continues
+        it; any other run carries a pending one forward untouched."""
+        if not before:
+            return pending
+        if complete:
+            return {}
+        return {"backfill_from": eff_from, "backfill_to": hold or last or start}  # everything before hold was read
+
+    def save():
+        save_state(state_file, position(), mailbox, notes, coverage(), span())
 
     try:
         while not done:
@@ -178,9 +212,13 @@ def fetch(tok, mailbox, dest_dir, state_file=None, since=None, max_messages=500,
             try:
                 for msg in graph_client.get_all(tok, "users/%s/messages" % box, params):
                     if limit and seen >= limit:
-                        at = last or since
-                        notes.append("stopped after %d messages, at %s; run again to continue (a manual "
-                                     "backfill continues with --since %s)" % (limit, at, at))
+                        if explicit:
+                            at = min(hold, last) if (hold and last) else (hold or last or since)
+                            notes.append("stopped after %d messages, at %s; continue with --since %s"
+                                         % (limit, at, at))
+                        else:
+                            notes.append("stopped after %d messages; run again to continue from the saved "
+                                         "position (%s)" % (limit, position()))
                         done = True
                         break
                     seen += 1
@@ -208,7 +246,7 @@ def fetch(tok, mailbox, dest_dir, state_file=None, since=None, max_messages=500,
                     if received and (last is None or received > last):
                         last = received
                     if seen % STATE_EVERY == 0:
-                        save_state(state_file, position(), mailbox, notes, cov)
+                        save()
                 else:
                     done = reached_end = True  # the listing ran to the end
             except graph_client.GraphError as err:
@@ -216,20 +254,23 @@ def fetch(tok, mailbox, dest_dir, state_file=None, since=None, max_messages=500,
                     raise
                 # a page with its attachments inline did not come back: keep what is
                 # handled, then finish the run one message at a time from there
-                save_state(state_file, position(), mailbox, notes, cov)
+                save()
                 restart = max(since, _iso(last or since))
                 notes.append("report listing with attachments inline failed (%s) - continuing one message "
                              "at a time from %s" % (err, restart))
                 inline, since = False, restart
     except graph_client.GraphError as err:
-        save_state(state_file, position(), mailbox, notes, cov)
+        save()
         err.notes = notes
         raise
-    if explicit and start_pos and not jumped and not skipped:
-        # a backfill extends the coverage back only when it reached the old coverage unbroken
-        if reached_end or (covered and last and last >= covered):
-            cov = min(start, covered) if covered else start
-    save_state(state_file, position(), mailbox, notes, cov)
+    # a skip inside the old coverage is no hole: the saved position never passes a skipped message,
+    # so the weekly runs read that one already and [eff_from, hold) joins the old coverage unbroken
+    unbroken = not skipped or bool(covered and hold and hold >= covered)
+    if before and unbroken and (reached_end or (covered and last and last >= covered)):
+        # the backfill reached the old coverage unbroken: the archive is covered from its first leg on
+        cov = min(eff_from, covered) if covered else eff_from
+        complete = True
+    save()
     if skipped:
         if hold and start_pos and hold < start_pos:
             notes.append("%d message(s) skipped this run, the first received %s; the saved position stays at %s, "

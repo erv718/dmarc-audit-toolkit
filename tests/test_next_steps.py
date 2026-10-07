@@ -480,9 +480,151 @@ def test_the_org_stays_on_a_member_when_the_apex_has_no_rows_of_its_own():
 
 
 def test_an_old_reports_weak_headline_is_reranked_by_passing_mail():
-    rep = {"inputs": {"domains": ["chosen.example", "busy.example"]},
+    rep = {"inputs": {"domains": ["chosen.example", "busy.example"],
+                      "domain_sources": {"chosen.example": ["tenant"], "busy.example": ["tenant"]}},
            "gate": {"headline_domain": "chosen.example", "headline_source": "shortest audited apex",
                     "domains": {"chosen.example": {}, "busy.example": {}}},
            "maillog": {"by_domain": {"chosen.example": {"logical_messages": 3, "genuine_failures": 0},
                                      "busy.example": {"logical_messages": 900, "genuine_failures": 10}}}}
     assert next_steps.pick_org(rep) == "busy.example"
+
+
+def test_a_typed_subdomain_stays_the_subject():
+    rep = {"inputs": {"domains": ["mail.corp.example", "corp.example"]},
+           "maillog": {"auth_column": "DMARC",
+                       "by_domain": {"corp.example": {"logical_messages": 1, "genuine_failures": 1,
+                                                      "passing_messages": 0, "internal_messages": 0}}},
+           "gate": {"headline_domain": "mail.corp.example", "headline_source": "first on the command line",
+                    "domains": {"corp.example": {"maillog_rows": 1}, "mail.corp.example": {"maillog_rows": 62}}}}
+    assert next_steps.pick_org(rep) == "mail.corp.example"
+    # a headline the volume rule chose is settled: the gate picked the member of the busiest family
+    rep["gate"]["headline_source"] = "most internal mail"
+    rep["maillog"]["by_domain"]["corp.example"]["internal_messages"] = 40
+    assert next_steps.pick_org(rep) == "mail.corp.example"
+    # a label that skipped the in-family rule maps to the apex only when the apex sends mail of its own
+    rep["gate"]["headline_source"] = "tenant default domain"
+    assert next_steps.pick_org(rep) == "corp.example"  # 40 internal messages: internal mail is its own too
+    rep["maillog"]["by_domain"]["corp.example"]["internal_messages"] = 0  # only the one spoof is left
+    assert next_steps.pick_org(rep) == "mail.corp.example"
+
+
+def test_an_old_report_is_reranked_by_family_not_by_apex_alone():
+    names = ["aaa.example", "dom.example", "m.dom.example", "zz.example"]
+    rep = {"inputs": {"domains": names, "domain_sources": {d: ["tenant"] for d in names}},
+           "gate": {"headline_domain": "zz.example", "headline_source": "shortest audited apex",
+                    "domains": {d: {} for d in names}},
+           "maillog": {"by_domain": {"aaa.example": {"logical_messages": 40, "genuine_failures": 0},
+                                     "dom.example": {"logical_messages": 2, "genuine_failures": 0},
+                                     "m.dom.example": {"logical_messages": 5000, "genuine_failures": 0},
+                                     "zz.example": {"logical_messages": 0, "genuine_failures": 0}}}}
+    assert next_steps.pick_org(rep) == "dom.example"  # the busiest family, led by its audited apex
+
+
+def test_the_one_liner_describes_the_subdomains_when_the_org_has_no_rows_of_its_own(tmp_path):
+    import csv as _csv
+    cols = ["Email date (UTC)", "Internet message ID", "Sender address", "Sender domain", "Sender mail from domain",
+            "Recipients", "Subject", "Delivery action", "Latest delivery location", "DMARC"]
+    rows = [["2026-05-01 09:00:00", "<n%d@x>" % i, "news@news.corp.example", "news.corp.example",
+             "news.corp.example", "u@example.com", "Weekly", "Delivered", "Inbox/folder", "pass"] for i in range(500)]
+    rows += [["2026-05-01 09:00:00", "<f%d@x>" % i, "news@news.corp.example", "news.corp.example",
+              "news.corp.example", "u@example.com", "Weekly", "Blocked", "Quarantine", "fail"] for i in range(30)]
+    rows += [["2026-05-01 09:00:00", "<a%d@x>" % i, "hi@aaa.example", "aaa.example", "aaa.example",
+              "u@example.com", "Hello", "Delivered", "Inbox/folder", "pass"] for i in range(50)]
+    path = tmp_path / "log.csv"
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = _csv.writer(fh)
+        w.writerow(cols)
+        w.writerows(rows)
+    domains = ["aaa.example", "corp.example"]
+    rep = audit.build_report(domains=domains, maillog=str(path), offline=True, auth_column="DMARC",
+                             domain_sources={d: ["tenant"] for d in domains})
+    doc = next_steps.build(rep)
+    assert doc["org_domain"] == "corp.example"
+    assert ("corp.example has no mail-log rows of its own; its subdomains (news.corp.example) carry 530 messages"
+            in doc["one_liner"])
+    assert "30 messages from its subdomains failed with no passing copy" in doc["one_liner"]
+    assert "The mail log has no rows for corp.example" not in doc["one_liner"]
+    strm = doc["failing"]["streams"]  # the JSON says whose rows these numbers are
+    assert strm["scope"] == "unaudited subdomains" and strm["subdomains"] == ["news.corp.example"]
+    assert (strm["genuine_failures"], strm["logical_messages"]) == (30, 530)
+
+
+def test_a_headline_the_volume_rule_chose_is_not_remapped_without_a_mail_log():
+    # aggregate reports only: the apex gets spoofed (900 fail, 0 pass) while its subdomain sends
+    rep = {"inputs": {"domains": ["corp.example", "mail.corp.example"]},
+           "gate": {"headline_domain": "mail.corp.example", "headline_source": "most passing mail in the reports",
+                    "domains": {"corp.example": {"maillog_rows": None}, "mail.corp.example": {"maillog_rows": None}}},
+           "rua": {"by_header_from": [{"domain": "corp.example", "pass": 0, "fail": 900},
+                                      {"domain": "mail.corp.example", "pass": 500, "fail": 0}]}}
+    assert next_steps.pick_org(rep) == "mail.corp.example"
+    rep["gate"]["headline_source"] = "most internal mail"  # collect's volume: the gate picked the member already
+    assert next_steps.pick_org(rep) == "mail.corp.example"
+    # a label that skipped the in-family rule maps to the apex only when the reports show it sending
+    rep["gate"]["headline_source"] = "tenant default domain"
+    assert next_steps.pick_org(rep) == "mail.corp.example"
+    rep["rua"]["by_header_from"][0]["pass"] = 40
+    assert next_steps.pick_org(rep) == "corp.example"
+
+
+def test_the_first_domain_given_is_a_typed_headline_too():
+    rep = {"inputs": {"domains": ["mail.corp.example", "corp.example"]},
+           "maillog": {"auth_column": "DMARC",
+                       "by_domain": {"corp.example": {"logical_messages": 40, "genuine_failures": 0,
+                                                      "passing_messages": 0, "internal_messages": 40},
+                                     "mail.corp.example": {"logical_messages": 325, "genuine_failures": 25,
+                                                           "passing_messages": 300, "internal_messages": 0}}},
+           "gate": {"headline_domain": "mail.corp.example", "headline_source": "first domain given",
+                    "domains": {"corp.example": {"maillog_rows": 40}, "mail.corp.example": {"maillog_rows": 325}}}}
+    assert next_steps.pick_org(rep) == "mail.corp.example"
+
+
+def test_an_old_report_is_reranked_the_way_the_gate_ranks_now():
+    # typed sources first, as the gate does
+    rep = {"inputs": {"domains": ["zz.example", "corp.example"],
+                      "domain_sources": {"zz.example": ["file"], "corp.example": ["file"]}},
+           "gate": {"headline_domain": "zz.example", "headline_source": "shortest audited apex",
+                    "domains": {"zz.example": {}, "corp.example": {}}},
+           "maillog": {"by_domain": {"zz.example": {"logical_messages": 3, "genuine_failures": 0},
+                                     "corp.example": {"logical_messages": 900, "genuine_failures": 0}}}}
+    assert next_steps.pick_org(rep) == "zz.example"
+    del rep["inputs"]["domain_sources"]  # no sources at all: the first domain given counts as typed
+    assert next_steps.pick_org(rep) == "zz.example"
+    rep["inputs"]["domain_sources"] = {"zz.example": ["tenant"], "corp.example": ["tenant"]}  # discovered: mail decides
+    assert next_steps.pick_org(rep) == "corp.example"
+    # an apex with no rows of its own still leads its family through its unaudited subdomains
+    names = ["aaa.example", "app.corp.example", "corp.example"]
+    rep = {"inputs": {"domains": names, "domain_sources": {d: ["tenant"] for d in names}},
+           "gate": {"headline_domain": "aaa.example", "headline_source": "shortest audited apex",
+                    "domains": {d: {} for d in names}},
+           "maillog": {"by_domain": {
+               "aaa.example": {"logical_messages": 100, "genuine_failures": 0},
+               "app.corp.example": {"logical_messages": 50, "genuine_failures": 0},
+               "corp.example": {"logical_messages": 0, "genuine_failures": 0,
+                                "subdomains_total": {"logical_messages": 600, "genuine_failures": 0,
+                                                     "domains": ["news.corp.example"]}}}}}
+    assert next_steps.pick_org(rep) == "corp.example"
+    # an apex that was never audited (seen only in the reports) cannot lead: its audited member does
+    rep["inputs"]["domains"] = ["aaa.example", "app.corp.example"]
+    del rep["gate"]["domains"]["corp.example"]
+    del rep["maillog"]["by_domain"]["corp.example"]
+    rep["maillog"]["by_domain"]["app.corp.example"]["logical_messages"] = 500
+    rep["rua"] = {"totals": {"domains": ["corp.example", "app.corp.example", "aaa.example"]}}
+    assert next_steps.pick_org(rep) == "app.corp.example"
+
+
+def test_an_old_report_is_not_reranked_by_a_scoped_log_and_falls_back_to_the_reports():
+    names = ["zz.example", "corp.example"]
+    rep = {"inputs": {"domains": names, "domain_sources": {d: ["tenant"] for d in names}},
+           "gate": {"headline_domain": "zz.example", "headline_source": "shortest audited apex",
+                    "domains": {d: {} for d in names}},
+           "maillog": {"sender_domain": "corp.example",  # a log scoped to one domain cannot rank the rest
+                       "by_domain": {"corp.example": {"logical_messages": 900, "genuine_failures": 0},
+                                     "zz.example": {"logical_messages": 0, "genuine_failures": 0}}}}
+    assert next_steps.pick_org(rep) == "zz.example"
+    rep["rua"] = {"by_header_from": [{"domain": "zz.example", "pass": 5, "fail": 0},
+                                     {"domain": "news.corp.example", "pass": 400, "fail": 0}]}
+    assert next_steps.pick_org(rep) == "corp.example"  # the reports rank instead; an unaudited subdomain counts for its apex
+    del rep["maillog"]  # no mail log at all: the reports alone
+    assert next_steps.pick_org(rep) == "corp.example"
+    rep["inputs"]["domain_sources"]["zz.example"] = ["cli"]  # a typed domain wins before any ranking
+    assert next_steps.pick_org(rep) == "zz.example"

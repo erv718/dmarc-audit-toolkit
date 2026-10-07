@@ -281,3 +281,131 @@ def test_a_backfill_skip_never_moves_the_saved_position_back_and_names_the_retry
     st = json.loads(state.read_text(encoding="utf-8"))
     assert st["last_received"] == newer and "covered_from" not in st  # a hole: coverage is not claimed
     assert any("retry them with --since %s" % msgs[2]["receivedDateTime"] in n for n in notes)
+
+
+def test_a_forward_since_restarts_the_coverage_once_the_position_moves_past_the_gap(monkeypatch, tmp_path):
+    msgs = messages(10)  # all on Sept 1
+    monkeypatch.setattr(fetch_rua.graph_client, "get_all", filtered(msgs))
+    monkeypatch.setattr(fetch_rua.graph_client, "get", lambda tok, url, params=None: {"value": []})
+    state = tmp_path / "state.json"
+    old = {"last_received": "2026-08-20T00:00:00Z", "covered_from": "2026-08-01T00:00:00Z",
+           "mailbox": "box@example.com"}
+    state.write_text(json.dumps(old), encoding="utf-8")
+    # nothing after Sept 2: the position stays, so the next weekly run still reads from Aug 20, no gap
+    fetch_rua.fetch("tok", "box@example.com", tmp_path / "o", str(state), "2026-09-02", 0)
+    assert json.loads(state.read_text(encoding="utf-8")) == old
+    fetch_rua.fetch("tok", "box@example.com", tmp_path / "o", str(state), "2026-09-01", 0)
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["covered_from"] == "2026-09-01T00:00:00Z"  # [Aug 20, Sep 1) was never read
+    assert st["last_received"] == msgs[9]["receivedDateTime"]
+
+
+def test_a_backfill_that_dies_mid_run_keeps_its_stretch_for_the_next_leg(monkeypatch, tmp_path):
+    msgs = messages(70)
+
+    def dies(tok, url, params=None):
+        since = params["$filter"].split("ge ")[1].split(" and")[0]
+        for i, m in enumerate(msgs):
+            if m["receivedDateTime"] < since:
+                continue
+            if i == 60:
+                raise RuntimeError("process killed")
+            yield m
+    monkeypatch.setattr(fetch_rua.graph_client, "get_all", dies)
+    monkeypatch.setattr(fetch_rua.graph_client, "get", lambda tok, url, params=None: {"value": []})
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"last_received": "2026-12-01T00:00:00Z", "covered_from": "2026-11-01T00:00:00Z",
+                                 "mailbox": "box@example.com"}), encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        fetch_rua.fetch("tok", "box@example.com", tmp_path / "o", str(state), "2026-08-01", 0)
+    st = json.loads(state.read_text(encoding="utf-8"))  # the save every 50 messages carried the stretch
+    assert st["backfill_from"] == "2026-08-01T00:00:00Z" and st["backfill_to"] == msgs[49]["receivedDateTime"]
+    assert st["last_received"] == "2026-12-01T00:00:00Z" and st["covered_from"] == "2026-11-01T00:00:00Z"
+    monkeypatch.setattr(fetch_rua.graph_client, "get_all", filtered(msgs))
+    fetch_rua.fetch("tok", "box@example.com", tmp_path / "o", str(state), st["backfill_to"], 0)
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["covered_from"] == "2026-08-01T00:00:00Z" and "backfill_to" not in st
+
+
+def test_a_weekly_stop_points_at_the_saved_position_not_past_a_held_message(monkeypatch, tmp_path):
+    msgs = messages(6)
+    monkeypatch.setattr(fetch_rua.graph_client, "get_all", filtered(msgs))
+
+    def get(tok, url, params=None):
+        if url.endswith("/m1/attachments"):
+            raise graph_client.GraphError("request did not complete: IncompleteRead")
+        return {"value": []}
+    monkeypatch.setattr(fetch_rua.graph_client, "get", get)
+    count, notes = fetch_rua.fetch("tok", "box@example.com", tmp_path / "o", str(tmp_path / "s.json"), None, 4)
+    stop = [n for n in notes if n.startswith("stopped after 4 messages")]
+    assert stop and "saved position (%s)" % msgs[1]["receivedDateTime"] in stop[0] and "--since" not in stop[0]
+
+
+def test_a_backfill_in_legs_extends_the_coverage_from_its_first_leg(monkeypatch, tmp_path):
+    msgs = [{"id": "d%d" % d, "receivedDateTime": "2026-08-%02dT12:00:00Z" % d, "hasAttachments": True}
+            for d in range(1, 21)]
+    monkeypatch.setattr(fetch_rua.graph_client, "get_all", filtered(msgs))
+    monkeypatch.setattr(fetch_rua.graph_client, "get", lambda tok, url, params=None: {"value": []})
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"last_received": "2026-08-20T12:00:00Z", "covered_from": "2026-08-15T00:00:00Z",
+                                 "mailbox": "box@example.com"}), encoding="utf-8")
+    count, notes = fetch_rua.fetch("tok", "box@example.com", tmp_path / "o", str(state), "2026-08-01", 5)
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["covered_from"] == "2026-08-15T00:00:00Z"  # unfinished: not yet extended
+    assert st["backfill_from"] == "2026-08-01T00:00:00Z" and st["backfill_to"] == msgs[4]["receivedDateTime"]
+    nxt = [n for n in notes if n.startswith("stopped after 5")][0].split("--since ")[1]
+    fetch_rua.fetch("tok", "box@example.com", tmp_path / "o", str(state), nxt, 0)  # the next leg, as the note says
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["covered_from"] == "2026-08-01T00:00:00Z" and "backfill_from" not in st
+    assert st["last_received"] == "2026-08-20T12:00:00Z"  # never moved backwards
+
+
+def hourly(n):
+    return [{"id": "m%d" % h, "receivedDateTime": "2026-09-10T%02d:00:00Z" % h, "hasAttachments": True}
+            for h in range(1, n + 1)]
+
+
+def unreadable(monkeypatch, bad):
+    """Per-message attachment reads that fail for the ids in bad (a set the test edits)."""
+    def get(tok, url, params=None):
+        if any(url.endswith("/%s/attachments" % m) for m in bad):
+            raise graph_client.GraphError("request did not complete: IncompleteRead")
+        return {"value": []}
+    monkeypatch.setattr(fetch_rua.graph_client, "get", get)
+
+
+def test_a_skip_inside_the_old_coverage_does_not_block_a_backfill(monkeypatch, tmp_path):
+    monkeypatch.setattr(fetch_rua.graph_client, "get_all", filtered(hourly(8)))
+    bad = set()
+    unreadable(monkeypatch, bad)
+    state, o = tmp_path / "state.json", tmp_path / "o"
+    fetch_rua.fetch("tok", "box@example.com", o, str(state), None, 0, floor="2026-09-10T04:00:00Z")
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert (st["covered_from"], st["last_received"]) == ("2026-09-10T04:00:00Z", "2026-09-10T08:00:00Z")
+    bad.add("m8")  # the message at the saved position cannot be read during the backfill
+    count, notes = fetch_rua.fetch("tok", "box@example.com", o, str(state), "2026-09-10T01:00:00Z", 0)
+    st = json.loads(state.read_text(encoding="utf-8"))
+    # the weekly run read m8 already, so the backfill still joined the old coverage unbroken
+    assert st["covered_from"] == "2026-09-10T01:00:00Z" and "backfill_from" not in st
+    assert st["last_received"] == "2026-09-10T08:00:00Z"
+    assert any("so they are tried again" in n for n in notes)
+
+
+def test_an_outage_to_the_end_of_a_backfill_records_a_stretch_the_retry_note_continues(monkeypatch, tmp_path):
+    monkeypatch.setattr(fetch_rua.graph_client, "get_all", filtered(hourly(8)))
+    bad = set()
+    unreadable(monkeypatch, bad)
+    state, o = tmp_path / "state.json", tmp_path / "o"
+    fetch_rua.fetch("tok", "box@example.com", o, str(state), None, 0, floor="2026-09-10T04:00:00Z")
+    bad.update("m%d" % h for h in range(2, 9))  # from 02:00 to the end of the listing, nothing reads
+    count, notes = fetch_rua.fetch("tok", "box@example.com", o, str(state), "2026-09-10T01:00:00Z", 0)
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["covered_from"] == "2026-09-10T04:00:00Z"  # a hole before the old coverage: not extended yet
+    assert (st["backfill_from"], st["backfill_to"]) == ("2026-09-10T01:00:00Z", "2026-09-10T02:00:00Z")
+    retry = [n for n in notes if "retry them with --since " in n][0].split("--since ")[1]
+    assert retry == "2026-09-10T02:00:00Z"
+    bad.clear()
+    fetch_rua.fetch("tok", "box@example.com", o, str(state), retry, 0)  # exactly what the note says
+    st = json.loads(state.read_text(encoding="utf-8"))
+    assert st["covered_from"] == "2026-09-10T01:00:00Z" and "backfill_to" not in st
+    assert st["last_received"] == "2026-09-10T08:00:00Z"

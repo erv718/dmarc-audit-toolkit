@@ -120,6 +120,7 @@ The hunting API shows a rolling 30 days - that is Microsoft's retention
 ceiling, not a setting, and no query gets past it. The long view comes from
 accumulation instead: the first run reads the last 30 days of your report
 mailbox (`fetch_rua.py --since` backfills older history once, if you want
+it; a long backfill stops at `--max` and names the `--since` that continues
 it), every weekly run archives the new aggregate reports and stamps a
 dated copy of everything under `audit-out/history/`. By week six you are
 reading six weeks of local history even though the API still only shows 30
