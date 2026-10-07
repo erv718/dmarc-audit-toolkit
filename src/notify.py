@@ -70,14 +70,20 @@ def delta_finding_keys(entries):
     return [((f.get("source") or ""), f.get("id")) for f in entries or [] if isinstance(f, dict)]
 
 
-def rua_sources(report):
-    """Sending sources by IP from the outside view (rua_parse's by_source_ip)."""
+def source_ips(report):
+    """Every source IP the outside view saw: rua.source_ips, the plain list
+    audit.py keeps when it caps by_source_ip to the busiest rows, else the
+    table itself."""
     rua = report.get("rua") or {}
-    out = {}
-    for s in rua.get("by_source_ip") or []:
-        if isinstance(s, dict) and s.get("source_ip"):
-            out[s["source_ip"]] = s
-    return out
+    ips = rua.get("source_ips") if isinstance(rua.get("source_ips"), list) else None
+    if ips is None:
+        ips = [s.get("source_ip") for s in rua.get("by_source_ip") or [] if isinstance(s, dict)]
+    return {str(ip) for ip in ips if ip}
+
+
+def rua_sources(report):
+    """Sending sources by IP from the outside view, as a set of addresses."""
+    return source_ips(report)
 
 
 def sender_label(u):
@@ -124,10 +130,7 @@ def sender_keys(report):
     mail-log envelope domains, keyed ip:<address> and envelope:<domain>. No
     From addresses, no people - this set is what collect.py remembers in
     senders.json so 'newly identified' means new to the whole history."""
-    keys = set()
-    for s in (report.get("rua") or {}).get("by_source_ip") or []:
-        if isinstance(s, dict) and s.get("source_ip"):
-            keys.add("ip:" + str(s["source_ip"]))
+    keys = {"ip:" + ip for ip in source_ips(report)}  # every source, not only the busiest rows kept
     maillog = report.get("maillog") or {}
     census = maillog.get("census") if isinstance(maillog.get("census"), dict) else {}
     rows = census.get("by_envelope") or []
@@ -216,8 +219,13 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
                         disp.get("reject", 0), disp.get("quarantine", 0)))
         unk = rua.get("unknown_senders") or []
         if unk:
+            cut = rua.get("truncated") if isinstance(rua.get("truncated"), dict) else {}
+            try:  # the table may be capped to its busiest rows: the count is the total, not the rows kept
+                total = int((cut.get("unknown_senders") or {}).get("total") or len(unk))
+            except (TypeError, ValueError):
+                total = len(unk)
             lines.append("- unknown senders in reports: %d (top: %s)"
-                         % (len(unk), ", ".join(sender_label(u) for u in unk[:3])))
+                         % (total, ", ".join(sender_label(u) for u in unk[:3])))
 
     if dl or previous:
         prev_gen = (dl or {}).get("previous_generated_utc") or (previous or {}).get("generated_utc")
@@ -282,7 +290,7 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
                 if nm and pm and min(nm, pm) / max(nm, pm) >= 0.1:
                     d = 100 * (float(tot.get("pass_rate", 0) or 0) - float(ptot.get("pass_rate", 0) or 0))
                     lines.append("- pass rate vs last run: %+.1f points" % d)
-                else:
+                elif nm or pm:  # two empty outside views have nothing to compare, and nothing to say
                     lines.append("- outside view not comparable with last run (%s messages now, %s then): no "
                                  "pass-rate delta" % (nm, pm))
 
@@ -299,8 +307,8 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
             else:
                 lines.append("- newly identified senders: none")
 
-    if history and len(history) >= 2:
-        pts = list(history)[-TREND_RUNS:]
+    pts = [h for h in (history or []) if isinstance(h, dict)][-TREND_RUNS:]
+    if len(pts) >= 2:
         gf = [h.get("genuine_failures") for h in pts]
         pr = [h.get("rua_pass_rate") for h in pts]
         parts = []
@@ -309,9 +317,20 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
         if any(x is not None for x in pr):
             parts.append("pass rate " + ", ".join("-" if x is None else "%.1f%%" % (100 * float(x)) for x in pr))
         if parts:
-            known_gf = [x for x in gf if x is not None]
-            # with no failure counts to compare, the pass rate decides: a higher rate is the improvement
-            word = trend_word(gf) if len(known_gf) >= 2 else trend_word([None if x is None else -float(x) for x in pr])
+            known = [i for i, x in enumerate(gf) if x is not None]
+            # the word compares the first and last failure counts, which means something only when their
+            # mail logs cover alike spans (a row budget can keep 41 hours of one run and 30 days of another);
+            # otherwise, as with no counts at all, the pass rate decides: a higher rate is the improvement
+            ends = [known[0], known[-1]] if len(known) >= 2 else []
+            spans = [float(pts[i]["maillog_hours"]) for i in ends
+                     if isinstance(pts[i].get("maillog_hours"), (int, float)) and pts[i]["maillog_hours"] > 0]
+            spans_ok = len(spans) < 2 or min(spans) / max(spans) >= 0.5
+            if len(known) >= 2 and spans_ok:
+                word = trend_word(gf)
+            else:
+                word = trend_word([None if x is None else -float(x) for x in pr])
+            if not spans_ok:
+                parts.append("failure counts not comparable: the mail-log spans differ")
             lines.append("- trend over the last %d runs (%s): %s" % (len(pts), word, "; ".join(parts)))
 
     if plan:
@@ -359,6 +378,13 @@ def _run_stamp(report_path):
     return str(doc.get("run")) if isinstance(doc, dict) and doc.get("run") else None
 
 
+def _report_stamp(report):
+    """The report's own generation time in collect.py's run-stamp form
+    (2026-10-08T090000Z): the cut-off for 'new' when no run.json sits beside it."""
+    g = str((report or {}).get("generated_utc") or "")
+    return g.replace(":", "") if len(g) == 20 and g[10] == "T" and g.endswith("Z") else None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Post a short DMARC audit status to a Slack or Teams webhook.")
     ap.add_argument("--report", required=True, help="this run's report.json")
@@ -386,7 +412,9 @@ def main():
             die("%s: expected the senders.json collect.py writes" % args.senders)
         # known = the identities first seen BEFORE the run this report describes; collect.py records a
         # run's own new senders into senders.json before the summary, so those must still count as new
-        stamp = _run_stamp(args.report) or state.get("updated")
+        # a report with no run.json beside it (audit.py's own) is dated by its generation time, so a
+        # sender first seen by the last collect run counts as known, not announced a second time
+        stamp = _run_stamp(args.report) or _report_stamp(report) or state.get("updated")
         known = {k for k, v in senders.items()
                  if not (stamp and isinstance(v, dict) and str(v.get("first_seen") or "") >= str(stamp))}
     if args.metrics:
@@ -394,7 +422,7 @@ def main():
             history = json.loads(Path(args.metrics).read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as err:
             die("cannot read %s: %s" % (args.metrics, err))
-        if not isinstance(history, list):
+        if not isinstance(history, list) or not all(isinstance(h, dict) for h in history):
             die("%s: expected the metrics list collect.py writes" % args.metrics)
     text = summarize(report, previous, plan, known_senders=known, history=history)
     if args.dry_run:

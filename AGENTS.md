@@ -168,9 +168,9 @@ Starter tasks, in order:
 |---|---|---|
 | `next_steps.md`, `next_steps.json` | the status document: the one-liner, where we stand, what is failing, the per-domain table, actions by owner, the ask and the open questions; the JSON is the same content as data | start here; refine the generated copy, never rewrite it from memory (rule 13) |
 | `todo.md` | the prioritised list: holds to decide, zero-risk DNS rows, senders to fix DKIM-first, tenant findings, gated enforcement steps with prerequisites, exceptions in force | work it top to bottom; every line names the file with the evidence |
-| `report.json`, `report.md` | every finding with severity, evidence, action and `verified`; the gate per domain with its reasons; `gate.exceptions` (applied, expired, invalid); `gate.evidence.dkim_evidence` | cite finding ids and gate reasons, never raw rows; quote deduplicated and raw counts together |
+| `report.json`, `report.md` | every finding with severity, evidence, action and `verified`; the gate per domain with its reasons; `gate.exceptions` (applied, expired, invalid); `gate.evidence.dkim_evidence`; `maillog.verdicts_omitted` and `rua.truncated` say what the JSON leaves out (`--keep-verdicts` keeps the verdicts) | cite finding ids and gate reasons, never raw rows; quote deduplicated and raw counts together |
 | `plan.json`, `plan.md` | the records to publish with current value, rollback and prerequisites | draft the change ticket from a row; the human applies it |
-| `summary.txt` | the Slack message: deltas vs the previous run, newly identified senders, the trend | the status line; do not recompute it |
+| `summary.txt` | the Slack message: deltas vs the previous run (withheld, with a note, when the mail-log spans or the outside views differ too much), newly identified senders, the trend | the status line; do not recompute it |
 | `run.json` | notes, caveats (for example a truncated mail-log slice), degraded steps, strict reasons | say when a number is a floor because of a caveat |
 | `../metrics.json`, `../metrics.md` | one entry per run since day one | trend questions |
 | `../senders.json` | every sender identity ever seen with its first and last run | "is this sender new?" is answered here, never from one week's report |

@@ -572,3 +572,60 @@ def test_report_json_drops_the_verdicts_and_caps_the_source_tables(tmp_path):
     audit._trim_rua(doc, 1000)
     assert len(doc["by_source_ip"]) == 1000 and len(doc["unknown_senders"]) == 1000
     assert doc["truncated"] == {"by_source_ip": {"kept": 1000, "total": 1500}, "unknown_senders": {"kept": 1000, "total": 1200}}
+
+
+def test_the_delta_judges_each_domain_on_its_own_span():
+    """A per-domain row budget cuts one busy domain to hours while a quiet
+    domain still reaches back 30 days: the whole log's span stays put, yet
+    neither the busy domain's counts nor the whole log's can be compared."""
+    def rep(busy_hours, busy_gf):
+        return {"generated_utc": "2026-10-07T15:00:00Z", "gate": {"domains": {}}, "findings": [],
+                "maillog": {"counters": {"genuine_failures": busy_gf + 87, "delivered_despite_fail": 0},
+                            "window": {"hours": 719.0},
+                            "by_domain": {"corp.example": {"genuine_failures": busy_gf, "delivered_despite_fail": 0,
+                                                           "window": {"hours": busy_hours}},
+                                          "shop.example": {"genuine_failures": 87, "delivered_despite_fail": 0,
+                                                           "window": {"hours": 719.0}},
+                                          audit.OTHER: {"genuine_failures": 0, "delivered_despite_fail": 0,
+                                                        "window": {"hours": 2.0}}}},
+                "rua": {"totals": {"messages": 100, "pass_rate": 0.9}}}
+    dl = audit.build_delta(rep(41.0, 613), rep(719.0, 2100))
+    assert dl["genuine_failures"] is None and dl["maillog_window"]["comparable"] is False
+    assert dl["maillog_window"]["domains_not_comparable"] == ["corp.example"]
+    assert "corp.example" not in dl["by_domain"] and dl["by_domain"]["shop.example"]["genuine_failures"] == 0
+    assert any(n.startswith("corp.example: its own mail-log rows cover 41 hours now and 30 days") for n in dl["notes"])
+    dl = audit.build_delta(rep(700.0, 613), rep(719.0, 2100))  # alike spans: everything compares
+    assert dl["genuine_failures"] == -1487 and dl["by_domain"]["corp.example"]["genuine_failures"] == -1487
+    assert dl["maillog_window"]["comparable"] is True and dl["maillog_window"]["domains_not_comparable"] == []
+
+
+def test_a_window_of_minutes_is_a_span_not_a_missing_window():
+    now = {"generated_utc": "2026-10-07T15:00:00Z", "gate": {"domains": {}}, "findings": [],
+           "maillog": {"counters": {"genuine_failures": 5, "delivered_despite_fail": 0},
+                       "window": {"from": "2026-10-07T14:57:00Z", "to": "2026-10-07T15:00:00Z", "hours": 0.0}}}
+    prev = {"generated_utc": "2026-10-01T15:00:00Z", "gate": {"domains": {}}, "findings": [],
+            "maillog": {"counters": {"genuine_failures": 2100, "delivered_despite_fail": 0}, "window": {"hours": 719.0}}}
+    dl = audit.build_delta(now, prev)
+    assert dl["genuine_failures"] is None and dl["maillog_window"]["comparable"] is False
+    assert any("cover different spans (under an hour now, 30 days in the previous run)" in n for n in dl["notes"])
+    L = []
+    audit._md_delta(L, dl)
+    assert any("n/a (mail-log spans not comparable, see the note below)" in l for l in L)
+    assert not any("no mail log on one side" in l for l in L)
+    L = []
+    audit._md_delta(L, audit.build_delta(now, {"generated_utc": "2026-10-01T15:00:00Z", "gate": {"domains": {}}, "findings": []}))
+    assert any("n/a (no mail log on one side)" in l for l in L)
+    assert audit._hours({"from": "2026-10-07T14:57:00Z", "to": "2026-10-07T15:00:00"}) == 0.05  # a naive stamp reads as UTC
+
+
+def test_build_report_wires_the_source_cap_and_keeps_every_source_for_the_history():
+    rep = audit.build_report(domains=["example.com"], rua_paths=[str(ROOT / "samples" / "rua")], offline=True,
+                             max_sources=1)
+    rua = rep["rua"]
+    assert len(rua["by_source_ip"]) == 1 and rua["truncated"]["by_source_ip"]["kept"] == 1
+    total = rua["truncated"]["by_source_ip"]["total"]
+    assert total > 1 and len(rua["source_ips"]) == total and rua["by_source_ip"][0]["source_ip"] in rua["source_ips"]
+    full = audit.build_report(domains=["example.com"], rua_paths=[str(ROOT / "samples" / "rua")], offline=True,
+                              max_sources=0)
+    assert len(full["rua"]["by_source_ip"]) == total and "truncated" not in full["rua"] and "source_ips" not in full["rua"]
+    assert rua["by_source_ip"][0]["count"] == max(r["count"] for r in full["rua"]["by_source_ip"])  # the busiest is kept

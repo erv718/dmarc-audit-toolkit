@@ -173,10 +173,41 @@ def test_an_own_platform_with_a_broken_dkim_key_is_likely_misconfigured_not_unkn
          "dkim_failed": 400, "header_from": {"news.example.com": 400},
          "reasons": __import__("collections").Counter(), "spf": {("platform.example", "mfrom", "pass"): 400},
          "dkim": {("news.example.com", "s1", "fail"): 400}}
-    label, signals = rua_parse.likely_label(s, {"example.com"})
+    label, signals = rua_parse.likely_label(s, {"example.com"}, known_domains=["platform.example"])
     assert label == "likely_misconfigured" and any("broken, rotated or mismatched DKIM key" in x for x in signals)
+    # the same counters fit a modifying forwarder or a spoof with a forged signature: without the platform
+    # listed as ours the stream stays unknown, and the signal says what listing it would mean
+    label, signals = rua_parse.likely_label(s, {"example.com"})
+    assert label == "unknown" and any("list it under --known or the settings' vendors" in x for x in signals)
+    assert not any("nothing marks forwarding" in x for x in signals)
     s["reasons"] = __import__("collections").Counter({"forwarded": 300})  # a forward, not our key: still unknown
-    assert rua_parse.likely_label(s, {"example.com"})[0] == "unknown"
+    assert rua_parse.likely_label(s, {"example.com"}, known_domains=["platform.example"])[0] == "unknown"
+    s["reasons"] = __import__("collections").Counter({"forwarded": 40})  # even a minority of forwarding marks
+    label, signals = rua_parse.likely_label(s, {"example.com"}, known_domains=["platform.example"])
+    assert label == "unknown" and not any("nothing marks forwarding" in x for x in signals)
     s["reasons"] = __import__("collections").Counter()
     s["misaligned_spf"] = 0  # no platform passes SPF at all: could be a forged signature, stays unknown
     assert rua_parse.likely_label(s, {"example.com"})[0] == "unknown"
+
+
+def test_the_settings_vendors_are_known_platforms_for_the_labels(monkeypatch):
+    """The vendors list reaches the aggregate-report labels through analyse and
+    audit.run_rua, so an own platform does not need a separate --known list."""
+    import pathlib
+
+    import audit
+    root = pathlib.Path(rua_parse.__file__).resolve().parent.parent
+    seen, real = {}, rua_parse.failing_streams
+
+    def spy(agg, min_volume, fail_threshold, known_domains=()):
+        seen["known"] = list(known_domains)
+        return real(agg, min_volume, fail_threshold, known_domains)
+
+    monkeypatch.setattr(rua_parse, "failing_streams", spy)
+    doc, _agg = rua_parse.analyse([str(root / "samples" / "rua")], vendors=["Mail.Example.", " "])
+    assert seen["known"] == ["mail.example"] and doc["totals"]["messages"] > 0
+    seen.clear()
+    plain = audit.run_rua([str(root / "samples" / "rua")], max_sources=0)
+    assert seen["known"] == []
+    with_vendors = audit.run_rua([str(root / "samples" / "rua")], max_sources=0, vendors=["platform.example"])
+    assert seen["known"] == ["platform.example"] and with_vendors["totals"] == plain["totals"]

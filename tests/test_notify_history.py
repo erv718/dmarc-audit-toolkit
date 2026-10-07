@@ -139,3 +139,58 @@ def test_sender_keys_come_from_the_census_when_the_verdicts_are_gone():
     rep["maillog"]["census"] = {"by_envelope": [{"envelope_domain": "bounce.vendor.example", "genuine_failures": 0},
                                                  {"envelope_domain": "(blank)", "genuine_failures": 0}]}
     assert notify.sender_keys(rep) == {"ip:192.0.2.10", "envelope:bounce.vendor.example"}
+
+
+def test_the_trend_word_does_not_compare_failure_counts_across_different_spans():
+    history = [{"genuine_failures": 118, "rua_pass_rate": 0.70, "maillog_hours": 720.0},
+               {"genuine_failures": 120, "rua_pass_rate": 0.72, "maillog_hours": 720.0},
+               {"genuine_failures": 5, "rua_pass_rate": 0.69, "maillog_hours": 41.0}]
+    text = notify.summarize(report(), history=history)
+    assert "(improving)" not in text and "(worsening)" in text  # the pass rate fell: that is the word
+    assert "genuine failures 118, 120, 5" in text and "failure counts not comparable: the mail-log spans differ" in text
+    history[2]["maillog_hours"] = 700.0
+    assert "(improving)" in notify.summarize(report(), history=history)
+    assert "trend over the last 2 runs" in notify.summarize(report(), history=[1, history[0], history[1]])  # a corrupt entry is skipped
+
+
+def test_two_empty_outside_views_say_nothing_about_the_pass_rate():
+    now, prev = report(pass_rate=0.0), report(pass_rate=0.0)
+    now["rua"]["totals"]["messages"] = prev["rua"]["totals"]["messages"] = 0
+    text = notify.summarize(now, previous=prev)
+    assert "not comparable" not in text and "pass rate vs last run" not in text
+
+
+def test_counts_and_the_sender_history_see_every_source_when_the_tables_are_capped():
+    rep = report(sources=("192.0.2.10",))
+    rep["rua"]["source_ips"] = ["192.0.2.10", "198.51.100.7", "203.0.113.9"]
+    rep["rua"]["unknown_senders"] = [{"kind": "ip", "value": "198.51.100.7", "count": 9}]
+    rep["rua"]["truncated"] = {"by_source_ip": {"kept": 1, "total": 3}, "unknown_senders": {"kept": 1, "total": 1200}}
+    assert notify.sender_keys(rep) >= {"ip:192.0.2.10", "ip:198.51.100.7", "ip:203.0.113.9"}
+    text = notify.summarize(rep, previous=report(sources=("192.0.2.10",)))
+    assert "unknown senders in reports: 1200 (top: ip 198.51.100.7)" in text
+    assert "*newly seen senders*: 198.51.100.7, 203.0.113.9" in text
+
+
+def test_a_report_without_run_json_is_dated_by_its_own_generation_time(tmp_path):
+    import json as _json
+    import subprocess
+    import sys as _sys
+    from pathlib import Path as _Path
+    rep = report(sources=("192.0.2.10", "198.51.100.7"), envelopes=("example.com",))
+    rep["generated_utc"] = "2026-10-08T09:00:00Z"  # audit.py's own run, the day after the last collect run
+    (tmp_path / "report.json").write_text(_json.dumps(rep), encoding="utf-8")
+    senders = tmp_path / "senders.json"
+    senders.write_text(_json.dumps({"updated": "2026-10-07T150000Z", "senders": {
+        "ip:192.0.2.10": {"first_seen": "2026-09-30T060000Z", "last_seen": "2026-10-07T150000Z"},
+        "envelope:example.com": {"first_seen": "2026-09-30T060000Z", "last_seen": "2026-10-07T150000Z"},
+        "ip:198.51.100.7": {"first_seen": "2026-10-07T150000Z", "last_seen": "2026-10-07T150000Z"}}}), encoding="utf-8")
+    script = str(_Path(notify.__file__))
+    p = subprocess.run([_sys.executable, script, "--report", str(tmp_path / "report.json"), "--senders", str(senders),
+                        "--dry-run"], capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    assert "newly identified senders: none" in p.stdout  # 198.51.100.7 was seen, and announced, by the last run
+    assert notify._report_stamp(rep) == "2026-10-08T090000Z" and notify._report_stamp({}) is None
+    (tmp_path / "metrics.json").write_text("[1, 2]", encoding="utf-8")
+    p = subprocess.run([_sys.executable, script, "--report", str(tmp_path / "report.json"), "--metrics",
+                        str(tmp_path / "metrics.json"), "--dry-run"], capture_output=True, text=True)
+    assert p.returncode == 2 and "expected the metrics list collect.py writes" in p.stderr

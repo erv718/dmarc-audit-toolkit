@@ -775,8 +775,16 @@ def test_exceptions_reduce_every_number_the_document_shows_for_the_domain(tmp_pa
     assert "2 formally excepted in audit.toml" in line
     assert "printer@corp.example x2" in line and "printer@corp.example x4" not in line  # one entry, reduced
     strm = doc["failing"]["streams"]
-    assert strm["excepted"] == 2 and strm["by_likely"]["likely_misconfigured_sender"] + strm["by_likely"]["likely_spoof"] \
-        + strm["by_likely"]["unknown"] == 7  # 9 failed, 2 of them excepted
+    assert strm["excepted"] == 2 and strm["by_likely"] == {"likely_spoof": 2, "likely_misconfigured_sender": 5, "unknown": 0}
+    assert "5 from 2 of our own senders" in line and "2 from 1 address that look like spoofing" in line
+    assert g["excepted_senders_by_likely"] == {"printer@corp.example": {"likely_misconfigured_sender": 2}}
+    assert g["excepted_senders_by_envelope"] == {"printer@corp.example": {"printer.vendor.example": 2}}
+    # the sections that name senders show the same reduced numbers, and the excepted stream once, as such
+    md = next_steps.render_md(doc)
+    assert "printer@corp.example - 2 messages" in md and "printer@corp.example - 4 messages" not in md
+    assert "Formally excepted in audit.toml and not counted above: 2 messages (printer@corp.example x2)." in md
+    assert doc["failing"]["excepted"] == [{"name": "printer@corp.example", "domain": "corp.example",
+                                           "envelope": "printer.vendor.example", "count": 2}]
 
 
 def test_blocker_items_split_the_reduced_count_with_the_reduced_split():
@@ -860,3 +868,96 @@ def test_the_trend_does_not_compare_what_the_runs_cannot_bear():
     prev["rua"]["totals"]["messages"] = 800000
     trend = next_steps.apply_comparability(next_steps.trend_from_report(prev), {}, rep, view)
     assert trend["previous_genuine_failures"] == 2100 and trend["previous_pass_rate"] == 0.0
+
+
+def test_an_exception_comes_off_the_stream_it_covered_not_the_address_as_a_whole():
+    """ops@ has two streams: 3 through its own platform (excepted) and 2 through a
+    spam host that look like spoofing. What remains keeps the spoof label."""
+    rep = {"inputs": {"domains": ["corp.example"]},
+           "gate": {"domains": {"corp.example": {"verdict": "no_go", "current_policy": "none", "reasons": [],
+                                                 "excepted_failures": 3, "excepted_by_likely": {"likely_misconfigured_sender": 3},
+                                                 "excepted_senders": {"ops@corp.example": 3},
+                                                 "excepted_senders_by_likely": {"ops@corp.example": {"likely_misconfigured_sender": 3}}}},
+                    "evidence": {"statement": "s"}},
+           "maillog": {"by_domain": {"corp.example": {"genuine_failures": 7, "logical_messages": 7,
+                                                      "by_likely": {"likely_spoof": 2, "likely_misconfigured_sender": 5, "unknown": 0},
+                                                      "top_senders": []}},
+                       "census": {"by_sender": [
+                           {"sender": "ops@corp.example", "domain": "corp.example", "envelope_domain": "corp.example",
+                            "genuine_failures": 3, "messages": 3, "likely": "likely_misconfigured_sender"},
+                           {"sender": "ops@corp.example", "domain": "corp.example", "envelope_domain": "spam.invalid",
+                            "genuine_failures": 2, "messages": 2, "likely": "likely_spoof"},
+                           {"sender": "app@corp.example", "domain": "corp.example", "envelope_domain": "corp.example",
+                            "genuine_failures": 2, "messages": 2, "likely": "likely_misconfigured_sender"}]}}}
+    view = next_steps.maillog_view(rep)
+    own = next_steps.own_domain_view(rep, view, "corp.example")
+    assert own["by_likely"] == {"likely_spoof": 2, "likely_misconfigured_sender": 2, "unknown": 0}
+    assert [(s["name"], s["count"], s["likely"]) for s in own["senders"]] == [
+        ("app@corp.example", 2, "likely_misconfigured_sender"), ("ops@corp.example", 2, "likely_spoof")]
+    strm = next_steps.streams(view, None, own)
+    assert [s["name"] for s in strm["own"]] == ["app@corp.example"] and [s["name"] for s in strm["spoof"]] == ["ops@corp.example"]
+    # the sections that name senders: the excepted stream is gone, the spoof stream of the same address stays
+    xv = next_steps.excepted_view(rep, view)
+    assert [(s["name"], s["count"]) for s in xv["by_sender"]] == [("app@corp.example", 2), ("ops@corp.example", 2)]
+    assert xv["excepted"] == [{"name": "ops@corp.example", "domain": "corp.example", "envelope": "corp.example", "count": 3}]
+    assert next_steps.excepted_view(rep, None) is None
+    # a gate from before the per-stream split takes the exception off the address's main label, as before
+    del rep["gate"]["domains"]["corp.example"]["excepted_senders_by_likely"]
+    own = next_steps.own_domain_view(rep, view, "corp.example")
+    assert [(s["name"], s["count"]) for s in own["senders"]] == [("app@corp.example", 2), ("ops@corp.example", 2)]
+    # and a gate that names no excepted senders at all leaves the split and the names raw, with the total as a clause
+    del rep["gate"]["domains"]["corp.example"]["excepted_senders"]
+    own = next_steps.own_domain_view(rep, view, "corp.example")
+    assert own["by_likely"] == {"likely_spoof": 2, "likely_misconfigured_sender": 5, "unknown": 0} and own["excepted"] == 3
+    assert [(s["name"], s["count"]) for s in own["senders"]] == [("ops@corp.example", 5), ("app@corp.example", 2)]
+    assert next_steps.excepted_view(rep, view) is view
+
+
+def test_two_empty_outside_views_are_not_called_different_in_size():
+    rep = {"generated_utc": "2026-10-07T15:00:00Z", "inputs": {"domains": ["example.com"]}, "gate": {"domains": {}},
+           "maillog": {"counters": {"genuine_failures": 5, "raw_failing_rows": 5, "raw_rows": 9, "logical_messages": 9,
+                                    "delivered_despite_fail": 0, "by_likely": {}}, "auth_column": "DMARC",
+                       "window": {"hours": 700.0}},
+           "rua": {"totals": {"messages": 0, "pass_rate": 0.0, "reports": 0, "by_disposition": {}}}}
+    prev = {"generated_utc": "2026-10-06T15:00:00Z", "maillog": {"counters": {"genuine_failures": 5}, "window": {"hours": 710.0}},
+            "rua": {"totals": {"messages": 0, "pass_rate": 0.0}}}
+    view = next_steps.maillog_view(rep)
+    trend = next_steps.apply_comparability(next_steps.trend_from_report(prev), {}, rep, view)
+    assert trend["previous_genuine_failures"] == 5 and trend["previous_pass_rate"] is None and trend["not_comparable"] == []
+    stand = next_steps.where_we_stand(rep, view, trend)
+    line = next(l for l in stand["lines"] if l.startswith("**Trend vs"))
+    assert "differ too much" not in line and "not comparable" not in line and "+0 genuine failures (5 -> 5)" in line
+
+
+def test_the_deltas_verdict_applies_only_to_a_trend_about_the_same_previous_run():
+    rep = {"generated_utc": "2026-10-07T15:00:00Z", "inputs": {"domains": ["example.com"]}, "gate": {"domains": {}},
+           "maillog": {"counters": {"genuine_failures": 613, "raw_failing_rows": 900, "raw_rows": 1000, "logical_messages": 700,
+                                    "delivered_despite_fail": 0, "by_likely": {}}, "auth_column": "DMARC",
+                       "window": {"from": "2026-10-05T22:00:00Z", "to": "2026-10-07T15:00:00Z", "hours": 41.0}},
+           "rua": {"totals": {"messages": 828000, "pass_rate": 0.98, "reports": 6000, "by_disposition": {}}}}
+    view = next_steps.maillog_view(rep)
+    not_ok = {"previous_generated_utc": "2026-10-01T15:00:00Z", "genuine_failures": None,
+              "maillog_window": {"comparable": False}, "rua": {"comparable": False, "now_messages": 828000, "previous_messages": 40}}
+    # a metrics trend about another run (Sept 30: a 40-hour log, a full outside view) is judged on its own figures
+    other = {"source": "metrics", "label": "2026-09-30", "previous_genuine_failures": 600, "previous_pass_rate": 0.97,
+             "previous_maillog_hours": 40.0, "previous_rua_messages": 800000}
+    t = next_steps.apply_comparability(dict(other), not_ok, rep, view)
+    assert t["previous_genuine_failures"] == 600 and t["previous_pass_rate"] == 0.97 and t["not_comparable"] == []
+    # the same trend labelled with the delta's run takes the delta's verdict
+    t = next_steps.apply_comparability(dict(other, label="2026-10-01"), not_ok, rep, view)
+    assert t["previous_genuine_failures"] is None and t["previous_pass_rate"] is None and len(t["not_comparable"]) == 2
+    # and a comparable delta does not vouch for a trend about a run whose log covered 30 days
+    ok = dict(not_ok, maillog_window={"comparable": True}, rua={"comparable": True})
+    t = next_steps.apply_comparability(dict(other, previous_maillog_hours=719.0), ok, rep, view)
+    assert t["previous_genuine_failures"] is None and t["previous_pass_rate"] == 0.97
+    # 0.0 stored hours is a span of minutes, not a missing window: it is not compared with 30 days
+    rep["maillog"]["window"] = {"from": "2026-10-07T14:57:00Z", "to": "2026-10-07T15:00:00Z", "hours": 0.0}
+    t = next_steps.apply_comparability(dict(other, previous_maillog_hours=719.0), {}, rep, next_steps.maillog_view(rep))
+    assert t["previous_genuine_failures"] is None
+
+
+def test_a_window_mixing_zoned_and_naive_stamps_still_gets_a_span():
+    w = {"from": "2026-10-05T22:00:00Z", "to": "2026-10-06T07:00:00", "hours": 9.0}
+    assert next_steps.span_phrase(w) == "the mail log's 9-hour span (2026-10-05 22:00 to 2026-10-06 07:00 UTC)"
+    assert next_steps._span_seconds({"from": "2026-10-05T22:00:00Z", "to": None}) is None
+    assert next_steps._span_seconds("not a window") is None

@@ -469,7 +469,8 @@ def parse_rua(
     try:
         doc = audit_mod.run_rua(paths, known=known, min_volume=min_volume,
                                 fail_threshold=fail_threshold, since=since,
-                                until=until, expect_policy=expect_policy)
+                                until=until, expect_policy=expect_policy,
+                                max_sources=0)  # the reply caps its own previews and counts whole tables
     except audit_mod.UsageError as err:
         return {"error": str(err)}
     reply = {

@@ -330,22 +330,27 @@ def run_dns(domains, resolver, selectors=()):
 
 def _trim_rua(doc, keep):
     """Keep the busiest `keep` rows of the report's source tables; the totals
-    stay in doc["truncated"] so nothing reads as the whole list."""
+    stay in doc["truncated"] so nothing reads as the whole list, and every
+    source IP stays in doc["source_ips"] (a plain list) so the sender history
+    behind "newly identified" still sees each one."""
     if not doc or not keep:
         return doc
     for key in ("by_source_ip", "unknown_senders"):
         rows = doc.get(key) or []
         if len(rows) > keep:
+            if key == "by_source_ip":
+                doc["source_ips"] = [r.get("source_ip") for r in rows if isinstance(r, dict) and r.get("source_ip")]
             doc[key] = rows[:keep]
             doc.setdefault("truncated", {})[key] = {"kept": keep, "total": len(rows)}
     return doc
 
 
 def run_rua(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, until=None,
-            expect_policy=None, retiring=(), max_sources=REPORT_SOURCES):
+            expect_policy=None, retiring=(), max_sources=REPORT_SOURCES, vendors=()):
     """rua_parse.analyse as a library call; its input errors become a UsageError
     carrying the real message. The source tables are cut to the busiest
-    max_sources rows (0 = keep all), with the totals kept.
+    max_sources rows (0 = keep all), with the totals kept. vendors: the
+    settings' sending platforms, known senders for the labels.
 
     rua_parse raises RuaInputError for those where that class exists. An older
     rua_parse prints 'error: ...' to stderr and exits 2 instead, so the fallback
@@ -354,6 +359,8 @@ def run_rua(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, un
     args = ([str(repo_path(p)) for p in paths],)
     kwargs = dict(known=known, min_volume=min_volume, fail_threshold=fail_threshold,
                   since=since, until=until, expect_policy=expect_policy, retiring=retiring)
+    if vendors:  # only when given: an older rua_parse without the parameter still works otherwise
+        kwargs["vendors"] = [str(v) for v in vendors if v]
     if err_cls is not _NoSuchError:
         try:
             doc, _agg = rua_parse.analyse(*args, **kwargs)
@@ -993,8 +1000,9 @@ def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None):
 def _excepted_by_domain(maillog_doc, active, names):
     """The deduplicated mail-log failures the active exceptions cover, per
     audited domain (its own rows, as maillog_by_domain attributes them: a
-    dict of total, by_likely and senders), the notes naming each excepted
-    sender, and the total excepted."""
+    dict of total, by_likely, senders, senders_by_likely and
+    senders_by_envelope), the notes naming each excepted sender, and the total
+    excepted."""
     counts, hits, total = {}, {}, 0
     if not (active and maillog_doc and maillog_doc.get("verdicts")):
         return counts, [], total
@@ -1007,12 +1015,18 @@ def _excepted_by_domain(maillog_doc, active, names):
         total += 1
         home, is_sub = _home_domain(_norm_name(v.get("domain")), names)
         if home and not is_sub:
-            d = counts.setdefault(home, {"total": 0, "by_likely": {}, "senders": {}})
+            d = counts.setdefault(home, {"total": 0, "by_likely": {}, "senders": {}, "senders_by_likely": {},
+                                         "senders_by_envelope": {}})
             d["total"] += 1
             label = v.get("likely") or "unknown"
             d["by_likely"][label] = d["by_likely"].get(label, 0) + 1
             sender = (v.get("sender") or "?").lower()
             d["senders"][sender] = d["senders"].get(sender, 0) + 1
+            per = d["senders_by_likely"].setdefault(sender, {})  # which of the sender's streams it covered ...
+            per[label] = per.get(label, 0) + 1
+            env = str(v.get("envelope_domain") or "").strip().lower().rstrip(".")  # ... by label and by envelope
+            via = d["senders_by_envelope"].setdefault(sender, {})
+            via[env] = via.get(env, 0) + 1
         hits.setdefault(hit["match"], [hit, 0])[1] += 1
     notes = [f"{n} mail-log failure(s) from {match} excepted until {hit['until']}: {hit['reason']}; "
              f"remove when {hit['removal_criterion']}" for match, (hit, n) in hits.items()]
@@ -1182,7 +1196,9 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence, maillog=
             "maillog_rows": maillog["logical_messages"] if maillog is not None else None,
             "excepted_failures": (excepted or {}).get("total", 0),
             "excepted_by_likely": dict((excepted or {}).get("by_likely") or {}),
-            "excepted_senders": dict((excepted or {}).get("senders") or {})}
+            "excepted_senders": dict((excepted or {}).get("senders") or {}),
+            "excepted_senders_by_likely": {s: dict(l) for s, l in ((excepted or {}).get("senders_by_likely") or {}).items()},
+            "excepted_senders_by_envelope": {s: dict(e) for s, e in ((excepted or {}).get("senders_by_envelope") or {}).items()}}
 
 
 def _gate_names(dns_reports, rua_doc, domains=()):
@@ -1441,11 +1457,31 @@ def _sender_key(s):
 
 
 def _hours(window):
+    """A mail-log window's span in hours: from its stamps when they parse (the
+    stored figure is rounded, so a few minutes read as 0.0), else the stored
+    hours; None when the window carries neither. Zero is a span, not a gap."""
+    w = window if isinstance(window, dict) else {}
     try:
-        h = float((window or {}).get("hours"))
+        a = datetime.fromisoformat(str(w.get("from")).replace("Z", "+00:00"))
+        b = datetime.fromisoformat(str(w.get("to")).replace("Z", "+00:00"))
+        a = a if a.tzinfo else a.replace(tzinfo=timezone.utc)
+        b = b if b.tzinfo else b.replace(tzinfo=timezone.utc)
+        return max(0.0, (b - a).total_seconds() / 3600)
+    except (TypeError, ValueError):
+        pass
+    try:
+        h = float(w.get("hours"))
     except (TypeError, ValueError):
         return None
-    return h if h > 0 else None
+    return h if h >= 0 else None
+
+
+def _spans_comparable(now_hours, prev_hours):
+    """Two mail-log spans bear a message-for-message comparison when neither is
+    under half of the other; an unknown span gets the benefit of the doubt."""
+    if now_hours is None or prev_hours is None or max(now_hours, prev_hours) <= 0:
+        return True
+    return min(now_hours, prev_hours) / max(now_hours, prev_hours) >= 0.5
 
 
 def _count(value):
@@ -1456,6 +1492,10 @@ def _count(value):
 
 
 def _hours_text(hours):
+    if hours is None:
+        return "an unknown span"
+    if hours < 1:
+        return "under an hour"
     return "%d hours" % int(hours + 0.5) if hours < 48 else "%d days" % int(hours / 24 + 0.5)
 
 
@@ -1471,10 +1511,27 @@ def build_delta(report, previous):
     now_w = (report.get("maillog") or {}).get("window") or {}
     prev_w = (previous.get("maillog") or {}).get("window") or {}
     nh, ph = _hours(now_w), _hours(prev_w)
-    windows_comparable = not (now_c and prev_c and nh and ph and min(nh, ph) / max(nh, ph) < 0.5)
-    if not windows_comparable:
+    log_comparable = not (now_c and prev_c) or _spans_comparable(nh, ph)
+    if not log_comparable:
         notes.append("the mail logs cover different spans (%s now, %s in the previous run): failure counts are "
                      "not comparable, so their deltas are not computed" % (_hours_text(nh), _hours_text(ph)))
+    # the row budget cuts one busy domain at a time, so the whole log's span can stay at 30 days (a
+    # quiet domain still reaches back that far) while the busy domain's own rows cover hours: each
+    # domain is judged on its own window, and one cut domain spoils the whole log's counts too
+    now_bd = (report.get("maillog") or {}).get("by_domain") or {}
+    prev_bd = (previous.get("maillog") or {}).get("by_domain") or {}
+    domain_comparable = {}
+    for d, c in now_bd.items():
+        p = prev_bd.get(d)
+        if d == OTHER or not isinstance(c, dict) or not isinstance(p, dict) or not (c.get("window") and p.get("window")):
+            continue
+        dh, dp = _hours(c.get("window")), _hours(p.get("window"))
+        domain_comparable[d] = _spans_comparable(dh, dp)
+        if not domain_comparable[d]:
+            notes.append("%s: its own mail-log rows cover %s now and %s in the previous run: its failure counts, "
+                         "and the whole log's, are not comparable, so those deltas are not computed"
+                         % (d, _hours_text(dh), _hours_text(dp)))
+    windows_comparable = log_comparable and all(domain_comparable.values())
     # the outside view: a first full archive against a near-empty one is not a trend, it is a different archive
     now_t = (report.get("rua") or {}).get("totals") or {}
     prev_t = (previous.get("rua") or {}).get("totals") or {}
@@ -1531,12 +1588,10 @@ def build_delta(report, previous):
         now_keys = {_sender_key(s) for s in now_s}
         new_senders = [s for s in now_s if _sender_key(s) not in prev_keys]
         gone_senders = [s for s in prev_s if _sender_key(s) not in now_keys]
-    by_domain = {}
-    now_bd = (report.get("maillog") or {}).get("by_domain") or {}
-    prev_bd = (previous.get("maillog") or {}).get("by_domain") or {}
+    by_domain = {}  # a domain whose own span held still keeps its delta when another domain was cut
     for d, c in now_bd.items():
         p = prev_bd.get(d)
-        if p and windows_comparable:
+        if p and domain_comparable.get(d, log_comparable):
             by_domain[d] = {k: c.get(k, 0) - p.get(k, 0) for k in ("genuine_failures", "delivered_despite_fail")}
     return {"previous_generated_utc": previous.get("generated_utc"),
             "previous_version": previous.get("version"),
@@ -1548,7 +1603,8 @@ def build_delta(report, previous):
             "domains_removed": [d for d in prev_g if d not in now_g],
             "new_senders": new_senders, "gone_senders": gone_senders,
             "by_domain": by_domain,
-            "maillog_window": {"now": now_w or None, "previous": prev_w or None, "comparable": windows_comparable},
+            "maillog_window": {"now": now_w or None, "previous": prev_w or None, "comparable": windows_comparable,
+                               "domains_not_comparable": sorted(d for d, ok in domain_comparable.items() if not ok)},
             "rua": rua, "notes": notes}
 
 
@@ -1558,8 +1614,11 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                  min_volume=20, fail_threshold=0.5, since=None, until=None,
                  expect_policy=None, retiring=(), columns=None, domain_file=None,
                  rules_json=None, bypasses_json=None, groups_json=None, domain_sources=None,
-                 previous_report=None, headline=None, volume=None, exceptions=None, keep_verdicts=False):
+                 previous_report=None, headline=None, volume=None, exceptions=None, keep_verdicts=False,
+                 max_sources=REPORT_SOURCES):
     """The whole audit as one document. Raises UsageError on input problems.
+    max_sources: the aggregate reports' source tables keep this many of their
+    busiest rows in the document (0 = all), the totals in rua.truncated.
     keep_verdicts: keep maillog.verdicts (one entry per logical message) in the
     document; by default they are dropped once the gate, the attribution and
     the census have used them, and maillog.verdicts_omitted says how many -
@@ -1589,8 +1648,8 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
     if not offline and domains:
         dns_reports = run_dns(domains, make_resolver(resolver_addr), selectors)
 
-    rua_doc = run_rua(rua_paths, known, min_volume, fail_threshold, since, until,
-                      expect_policy, retiring) if rua_paths else None
+    rua_doc = run_rua(rua_paths, known, min_volume, fail_threshold, since, until, expect_policy, retiring,
+                      max_sources=max_sources, vendors=vendor_domains or ()) if rua_paths else None
     maillog_doc = run_maillog(maillog, sender_domain, auth_column, vendor_domains, columns, domains) if maillog else None
     headers_doc = run_headers(header_files, authserv_id, strict) if header_files else None
     tenant_docs = {name: (run_tenant_export(path, name) if path else None)
@@ -1855,8 +1914,13 @@ def _md_census(L, cs):
 
 
 def _md_delta(L, dl):
+    spans_differ = (dl.get("maillog_window") or {}).get("comparable") is False
+
     def signed(n):
-        return "n/a (no mail log on one side)" if n is None else f"{n:+d}"
+        if n is None:
+            return "n/a (%s)" % ("mail-log spans not comparable, see the note below" if spans_differ
+                                 else "no mail log on one side")
+        return f"{n:+d}"
 
     def more(items, cap=10):
         return " ..." if len(items) > cap else ""

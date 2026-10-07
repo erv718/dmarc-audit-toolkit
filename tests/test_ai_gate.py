@@ -51,3 +51,18 @@ def test_the_server_module_imports_without_the_sdk(monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(mcp_server)
+
+
+def test_parse_rua_counts_whole_tables_not_the_capped_preview(monkeypatch):
+    seen = {}
+
+    def fake(paths, **kw):
+        seen.update(kw)
+        return {"totals": {}, "policy_check": {}, "selectors": [], "findings": [], "warnings": [], "summary": "",
+                "exit_code": 0, "failing_streams": [], "spf_only_senders": [], "retiring_selectors": [],
+                "by_header_from": [], "by_reporter": [],
+                "unknown_senders": [{"kind": "ip", "value": "203.0.113.%d" % i} for i in range(60)]}
+
+    monkeypatch.setattr(mcp_server.audit_mod, "run_rua", fake)
+    reply = mcp_server.parse_rua(["samples/rua"])
+    assert seen["max_sources"] == 0 and reply["unknown_senders_total"] == 60 and reply["unknown_senders_truncated"] is True

@@ -214,7 +214,8 @@ def _gzip_declared_size(tail):
 def _gunzip_capped(fh, declared, what="", owned=()):
     """A capped stream over the gzip data in fh; the declared size is checked first."""
     if declared > MAX_BYTES:
-        raise ValueError(f"{what}declared decompressed size {_mb(declared)} is over the {_mb(MAX_BYTES)} cap, not inflated")
+        raise ValueError(f"{what}declared decompressed size {_mb(declared)} is over the {_mb(MAX_BYTES)} cap, not inflated "
+                         "(a download cut short carries data where the trailer belongs: re-fetch the file if that size cannot be right)")
     return _Capped(gzip.GzipFile(fileobj=fh), what, owned)
 
 
@@ -780,8 +781,12 @@ def unknown_senders(agg, nets, domains):
     return sorted(out, key=lambda u: (-u["count"], u["kind"], u["value"]))
 
 
-def likely_label(s, domains):
-    """Heuristic (label, signals) for one failing source. A guess, not a verdict."""
+def likely_label(s, domains, known_domains=()):
+    """Heuristic (label, signals) for one failing source. A guess, not a verdict.
+    known_domains: the sending platforms the operator listed (--known, the
+    settings' vendors); only one of those, sending as the domain with a
+    signature that fails, reads as a broken key at our own sender rather than
+    as a forward or a spoof, because the counters alone fit all three."""
     signals = []
     own = all(_under(hf, domains) for hf in s["header_from"]) if domains else True
     unauth = s["no_auth"]
@@ -801,14 +806,20 @@ def likely_label(s, domains):
             signals.append(f"reporter marked {fwd} msgs as forwarded or list traffic")
         if s["misaligned_spf"]:
             doms = sorted({d for (d, _, r) in s["spf"] if r == "pass" and d})
-            if own and fwd * 2 < s["count"] and s["aligned_dkim_failed"] * 2 >= s["count"]:
-                # a real platform (SPF passes for its own domain) sending as the domain itself with a
-                # signature for the domain that does not verify, and no forwarding marks: a broken,
-                # rotated or mismatched key at one of our senders, not a forward and not a spoof
-                signals.append(f"SPF passes for the sending platform ({', '.join(doms) or '?'}) and nothing marks "
+            own_key = own and not fwd and s["aligned_dkim_failed"] * 2 >= s["count"] and bool(doms)
+            if own_key and all(_under(d, known_domains or ()) for d in doms):
+                # a platform the operator listed as ours (SPF passes for its own domain) sending as the
+                # domain itself with a signature for the domain that does not verify, and not one
+                # forwarding mark: a broken, rotated or mismatched key at one of our senders. The same
+                # counters also fit a modifying forwarder or a spoof with a forged signature, so without
+                # the listing the stream stays unknown and the signal says what listing it would mean.
+                signals.append(f"SPF passes for a platform listed as ours ({', '.join(doms)}) and nothing marks "
                                "forwarding: a broken, rotated or mismatched DKIM key at a system sending as the domain")
                 return "likely_misconfigured", signals
             signals.append(f"SPF passes for {', '.join(doms) or '?'}, which looks like the forwarding hop")
+            if own_key:
+                signals.append(f"or our own platform with a broken DKIM key: if {', '.join(doms)} sends for us, list it "
+                               "under --known or the settings' vendors and this stream reads as likely_misconfigured")
         signals.append("not a sender misconfiguration if the original passed at the first hop; check tenant logs")
         return "unknown", signals
     if s["misaligned_dkim"]:
@@ -831,7 +842,7 @@ def likely_label(s, domains):
     return "unknown", signals
 
 
-def failing_streams(agg, min_volume, fail_threshold):
+def failing_streams(agg, min_volume, fail_threshold, known_domains=()):
     """Sources with real volume and a pass rate under the threshold, labelled."""
     total = agg["messages"] or 1
     out = []
@@ -839,7 +850,7 @@ def failing_streams(agg, min_volume, fail_threshold):
         rate = s["pass"] / s["count"] if s["count"] else 0.0
         if s["count"] < min_volume or rate >= fail_threshold:
             continue
-        label, signals = likely_label(s, agg["domains"])
+        label, signals = likely_label(s, agg["domains"], known_domains)
         out.append({"source_ip": ip, "count": s["count"], "pass": s["pass"], "fail": s["fail"],
                     "pass_rate": round(rate, 4), "share": round(s["count"] / total, 4),
                     "header_from": [d for d, _ in s["header_from"].most_common()],
@@ -1291,8 +1302,10 @@ def in_window(rep, since, until):
 
 
 def analyse(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, until=None,
-            expect_policy=None, retiring=(), use_rdns=False, top=20):
+            expect_policy=None, retiring=(), use_rdns=False, top=20, vendors=()):
     """Everything main does short of printing: the --json document.
+    vendors: sending platforms from the settings, known senders like --known's
+    domains for the labels and the unknown-sender list.
 
     Raises RuaInputError on input problems (missing path, no report files,
     nothing parsable, bad --since/--until or --known); main() prints that as
@@ -1312,19 +1325,22 @@ def analyse(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, un
     reports = [r for r in reports if in_window(r, lo, hi)]
 
     nets, known_domains = parse_known(known)
+    if vendors:
+        known_domains = sorted(set(known_domains or ()) | {str(v).strip().lower().rstrip(".") for v in vendors
+                                                           if str(v).strip()})
     names = [s.strip().lower() for arg in (retiring or []) for s in arg.split(",") if s.strip()]
     agg = aggregate(reports)
     derived = {
         "selectors": selectors_in_use(agg),
         "unknown_senders": unknown_senders(agg, nets, known_domains),
-        "failing_streams": failing_streams(agg, min_volume, fail_threshold),
+        "failing_streams": failing_streams(agg, min_volume, fail_threshold, known_domains),
         "spf_only_senders": spf_only_senders(agg, min_volume),
         "retiring_selectors": retiring_selectors(agg, names),
         "policy_check": policy_check(agg, expect_policy),
     }
     opts = {"paths": list(paths), "since": since, "until": until, "min_volume": min_volume,
             "fail_threshold": fail_threshold, "expect_policy": expect_policy, "retiring": names,
-            "rdns": use_rdns, "nets": nets, "known_domains": known_domains, "known_given": bool(known),
+            "rdns": use_rdns, "nets": nets, "known_domains": known_domains, "known_given": bool(known) or bool(vendors),
             "parsed_total": parsed_total}
 
     ptr = {}
