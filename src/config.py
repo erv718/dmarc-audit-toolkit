@@ -137,6 +137,16 @@ def collect_defaults(cfg):
     return out
 
 
+def audit_list(cfg, key):
+    """One [audit] list key as a list of strings however it was written (a
+    list, or a comma or space separated string), shaped as collect_defaults
+    shapes it, so every reader of audit.toml agrees."""
+    table = cfg.get("audit") or {}
+    if not isinstance(table, dict):
+        raise ConfigError("[audit] must be a table")
+    return _as_list(table.get(key), key)
+
+
 def notify_settings(cfg):
     """{enabled, target} from the [notify] table; enabled defaults to true so a
     webhook in .env keeps working for anyone without a settings file."""

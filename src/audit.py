@@ -139,6 +139,9 @@ MAILLOG_COLUMNS = {"msgid": "Internet message ID", "recipient": "Recipients",
 # the time column a mail-log export may carry, first match wins: the Defender
 # "All email" export, then queries/raw_maillog.kql, then common names
 TIME_COLUMNS = ("Email date (UTC)", "Timestamp", "Received", "Date")
+# report.json keeps this many of the busiest aggregate-report sources and unknown senders; the
+# rest is a count (a large tenant's reports name a hundred thousand spoofing IPs)
+REPORT_SOURCES = 1000
 # maillog.by_domain bucket for rows whose sender domain is under no audited domain
 OTHER = "(other)"
 # census entries under this many genuine failures are notes, not headlines
@@ -325,10 +328,24 @@ def run_dns(domains, resolver, selectors=()):
     return {d: dns_audit.audit_domain(d, resolver, list(selectors) or None) for d in domains}
 
 
+def _trim_rua(doc, keep):
+    """Keep the busiest `keep` rows of the report's source tables; the totals
+    stay in doc["truncated"] so nothing reads as the whole list."""
+    if not doc or not keep:
+        return doc
+    for key in ("by_source_ip", "unknown_senders"):
+        rows = doc.get(key) or []
+        if len(rows) > keep:
+            doc[key] = rows[:keep]
+            doc.setdefault("truncated", {})[key] = {"kept": keep, "total": len(rows)}
+    return doc
+
+
 def run_rua(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, until=None,
-            expect_policy=None, retiring=()):
+            expect_policy=None, retiring=(), max_sources=REPORT_SOURCES):
     """rua_parse.analyse as a library call; its input errors become a UsageError
-    carrying the real message.
+    carrying the real message. The source tables are cut to the busiest
+    max_sources rows (0 = keep all), with the totals kept.
 
     rua_parse raises RuaInputError for those where that class exists. An older
     rua_parse prints 'error: ...' to stderr and exits 2 instead, so the fallback
@@ -344,7 +361,7 @@ def run_rua(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, un
             raise UsageError(f"rua: {exc}") from exc
         except SystemExit as exc:
             raise UsageError(f"rua: input error (exit {exc.code}); details on stderr") from exc
-        return doc
+        return _trim_rua(doc, max_sources)
     buf = io.StringIO()
     try:
         with contextlib.redirect_stderr(buf):
@@ -358,7 +375,7 @@ def run_rua(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, un
         raise UsageError("rua: " + (errors[-1] if errors else f"input error (exit {exc.code})")) from exc
     if buf.getvalue():
         sys.stderr.write(buf.getvalue())
-    return doc
+    return _trim_rua(doc, max_sources)
 
 
 def detect_auth_column(header):
@@ -548,7 +565,7 @@ def maillog_by_domain(maillog_doc, domains=()):
     under = {d: {} for d in audited}
     other = {}
     for v in maillog_doc.get("verdicts") or []:
-        dom = (v.get("domain") or "").strip().lower()
+        dom = _norm_name(v.get("domain"))  # the same spelling the windows and the audited list use
         home, is_sub = _home_domain(dom, audited)
         if home is None:
             other.setdefault(dom or "(blank)", []).append(v)
@@ -1066,15 +1083,17 @@ def _rua_covers(rua_doc, domain):
 
 
 def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence, maillog=None, scope=None,
-                 ml_spf_only=(), exception_notes=(), excepted=None):
+                 ml_spf_only=(), exception_notes=(), excepted=None, rua_spf_only=()):
     """One domain's verdict. Every branch names the step being gated and
     whether failure evidence was supplied. maillog: this domain's own
     counters from maillog_by_domain (None when no mail log was supplied);
     excepted: what a formal exception covers of its genuine failures (total,
     by_likely, senders); ml_spf_only: the mail-log senders attributed to this
     domain (its own rows and its unaudited subdomains', like the counters)
-    that pass on SPF alone. The move to p=reject additionally needs
-    aligned-DKIM evidence from somewhere (DKIM before reject, always)."""
+    that pass on SPF alone; rua_spf_only: the aggregate-report SPF-only
+    streams attributed to it the same way, by header_from. The move to
+    p=reject additionally needs aligned-DKIM evidence from somewhere (DKIM
+    before reject, always)."""
     policy, policy_from = info["policy"], info["source"]
     blockers = list(dns_blockers) + list(shared)
     notes = []
@@ -1084,13 +1103,10 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence, maillog=
     own_rows = maillog["logical_messages"] if maillog is not None and domain else 0
     no_rows = bool(domain) and not own_rows and not _rua_covers(rua_doc, domain)
     if policy == "quarantine":
-        if rua_doc:
-            spf_only = [f for f in rua_doc["spf_only_senders"]
-                        if domain is None or any(_under(hf, domain) for hf in f["header_from"])]
-            if spf_only:
-                msgs = sum(f["spf_only"] for f in spf_only)
-                blockers.append(f"{len(spf_only)} sender(s) pass on SPF alone ({msgs} msgs): "
-                                "set up aligned DKIM before moving quarantine -> reject")
+        if rua_spf_only:
+            msgs = sum(f["spf_only"] for f in rua_spf_only)
+            blockers.append(f"{len(rua_spf_only)} sender(s) pass on SPF alone ({msgs} msgs): "
+                            "set up aligned DKIM before moving quarantine -> reject")
         if ml_spf_only:
             msgs = sum(s["spf_only"] for s in ml_spf_only)
             blockers.append(f"{len(ml_spf_only)} sender(s) in the mail log pass on SPF alone ({msgs} msgs, no DKIM "
@@ -1165,7 +1181,8 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence, maillog=
             "next_step": step, "reasons": reasons,
             "maillog_rows": maillog["logical_messages"] if maillog is not None else None,
             "excepted_failures": (excepted or {}).get("total", 0),
-            "excepted_by_likely": dict((excepted or {}).get("by_likely") or {})}
+            "excepted_by_likely": dict((excepted or {}).get("by_likely") or {}),
+            "excepted_senders": dict((excepted or {}).get("senders") or {})}
 
 
 def _gate_names(dns_reports, rua_doc, domains=()):
@@ -1216,6 +1233,11 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
     for s in (maillog_doc or {}).get("spf_only_senders") or []:
         home = _home_domain(_norm_name(s.get("domain")), names)[0] if names else None
         ml_spf.setdefault(home, []).append(s)
+    rua_spf = {}  # the reports' SPF-only streams, attributed by header_from the same way
+    for f in (rua_doc or {}).get("spf_only_senders") or []:
+        homes = {(_home_domain(_norm_name(hf), names)[0] if names else None) for hf in (f.get("header_from") or [])}
+        for home in homes or {None}:
+            rua_spf.setdefault(home, []).append(f)
     by_domain, scope = None, None
     if maillog_doc and names:
         by_domain = maillog_doc.get("by_domain")
@@ -1228,7 +1250,7 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
         dns_b = _dns_blockers(dns_reports[d], d) if dns_reports and d in dns_reports else []
         per_domain[d] = _domain_gate(d, info, shared, dns_b, rua_doc, evidence,
                                      by_domain.get(d) if by_domain else None, scope,
-                                     ml_spf.get(d, []), notes, excepted.get(d))
+                                     ml_spf.get(d, []), notes, excepted.get(d), rua_spf.get(d, []))
     head_sources = domain_sources
     if not domains and not domain_sources and names:
         head_sources = {d: ["reports"] for d in names}  # nothing was named: every name came from the files
@@ -1266,7 +1288,8 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
         reasons = list(merged) + [evidence["statement"]]
     else:
         top = _domain_gate(None, domain_policy(None, dns_reports, rua_doc), shared, [], rua_doc, evidence,
-                           None, None, (maillog_doc or {}).get("spf_only_senders") or [], notes)
+                           None, None, (maillog_doc or {}).get("spf_only_senders") or [], notes, None,
+                           (rua_doc or {}).get("spf_only_senders") or [])
         verdict, overall = top["verdict"], "no domain named - one verdict over the files given"
         reasons = top["reasons"]
     return {"verdict": verdict, "current_policy": top["current_policy"],
@@ -1417,6 +1440,25 @@ def _sender_key(s):
     return (s.get("sender"), s.get("domain"), s.get("envelope_domain"))
 
 
+def _hours(window):
+    try:
+        h = float((window or {}).get("hours"))
+    except (TypeError, ValueError):
+        return None
+    return h if h > 0 else None
+
+
+def _count(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hours_text(hours):
+    return "%d hours" % int(hours + 0.5) if hours < 48 else "%d days" % int(hours / 24 + 0.5)
+
+
 def build_delta(report, previous):
     """What changed since an earlier report.json: whole-log and per-domain
     counters, findings, policies, gates and census senders. A counter delta
@@ -1424,8 +1466,35 @@ def build_delta(report, previous):
     notes = []
     now_c = (report.get("maillog") or {}).get("counters") or {}
     prev_c = (previous.get("maillog") or {}).get("counters") or {}
+    # a mail log that covers 41 hours and one that covers 30 days cannot be compared message for
+    # message: the deltas stay out and the note says why (a row budget or a cap shortens the span)
+    now_w = (report.get("maillog") or {}).get("window") or {}
+    prev_w = (previous.get("maillog") or {}).get("window") or {}
+    nh, ph = _hours(now_w), _hours(prev_w)
+    windows_comparable = not (now_c and prev_c and nh and ph and min(nh, ph) / max(nh, ph) < 0.5)
+    if not windows_comparable:
+        notes.append("the mail logs cover different spans (%s now, %s in the previous run): failure counts are "
+                     "not comparable, so their deltas are not computed" % (_hours_text(nh), _hours_text(ph)))
+    # the outside view: a first full archive against a near-empty one is not a trend, it is a different archive
+    now_t = (report.get("rua") or {}).get("totals") or {}
+    prev_t = (previous.get("rua") or {}).get("totals") or {}
+    nm, pm = _count(now_t.get("messages")), _count(prev_t.get("messages"))
+    rua = {"now_messages": nm, "previous_messages": pm, "comparable": None, "pass_rate_change": None}
+    if nm is not None and pm is not None and (nm or pm):  # two empty outside views have nothing to compare
+        rua["comparable"] = bool(nm and pm and min(nm, pm) / max(nm, pm) >= 0.1)
+        if rua["comparable"]:
+            try:
+                rua["pass_rate_change"] = round(100 * (float(now_t.get("pass_rate") or 0)
+                                                       - float(prev_t.get("pass_rate") or 0)), 1)
+            except (TypeError, ValueError):
+                rua["pass_rate_change"] = None
+        else:
+            notes.append("the outside view is not comparable with the previous run (%d messages now, %d then): "
+                         "the pass-rate change is not computed" % (nm, pm))
 
     def diff(key):
+        if not windows_comparable:
+            return None
         return now_c[key] - prev_c[key] if key in now_c and key in prev_c else None
 
     if bool(now_c) != bool(prev_c):
@@ -1467,7 +1536,7 @@ def build_delta(report, previous):
     prev_bd = (previous.get("maillog") or {}).get("by_domain") or {}
     for d, c in now_bd.items():
         p = prev_bd.get(d)
-        if p:
+        if p and windows_comparable:
             by_domain[d] = {k: c.get(k, 0) - p.get(k, 0) for k in ("genuine_failures", "delivered_despite_fail")}
     return {"previous_generated_utc": previous.get("generated_utc"),
             "previous_version": previous.get("version"),
@@ -1478,7 +1547,9 @@ def build_delta(report, previous):
             "domains_added": [d for d in now_g if d not in prev_g],
             "domains_removed": [d for d in prev_g if d not in now_g],
             "new_senders": new_senders, "gone_senders": gone_senders,
-            "by_domain": by_domain, "notes": notes}
+            "by_domain": by_domain,
+            "maillog_window": {"now": now_w or None, "previous": prev_w or None, "comparable": windows_comparable},
+            "rua": rua, "notes": notes}
 
 
 def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offline=False,
@@ -1487,8 +1558,12 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                  min_volume=20, fail_threshold=0.5, since=None, until=None,
                  expect_policy=None, retiring=(), columns=None, domain_file=None,
                  rules_json=None, bypasses_json=None, groups_json=None, domain_sources=None,
-                 previous_report=None, headline=None, volume=None, exceptions=None):
+                 previous_report=None, headline=None, volume=None, exceptions=None, keep_verdicts=False):
     """The whole audit as one document. Raises UsageError on input problems.
+    keep_verdicts: keep maillog.verdicts (one entry per logical message) in the
+    document; by default they are dropped once the gate, the attribution and
+    the census have used them, and maillog.verdicts_omitted says how many -
+    a large tenant's verdicts alone ran to millions of lines of JSON.
     previous_report: an earlier run's report.json as a dict; adds report["delta"].
     headline: an optional explicit headline override; without it the headline
     is a typed domain (cli, then --file), else the org family carrying the
@@ -1569,6 +1644,9 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
     report["verified_vs_inferred"] = verified_vs_inferred(report)
     if previous_report:
         report["delta"] = build_delta(report, previous_report)
+    if maillog_doc and not keep_verdicts:
+        maillog_doc["verdicts_omitted"] = len(maillog_doc.get("verdicts") or [])
+        maillog_doc["verdicts"] = []  # the census, by_domain and the counters carry what the readers need
     report["exit_code"] = code
     return report
 
@@ -1935,6 +2013,8 @@ def render_md(report):
         L.append(f"- {t['reports']} reports, {t['messages']} messages, "
                  f"{t['pass']} pass / {t['fail']} fail ({t['pass_rate'] * 100:.1f}% pass)")
         L.append(f"- window: {t['begin_date']} .. {t['end_date']}; reporters: {', '.join(t['reporters'])}")
+        for key, cut in (report["rua"].get("truncated") or {}).items():
+            L.append(f"- {key}: the {cut['kept']} busiest of {cut['total']} are kept in report.json")
         L.append(f"- alignment: {_plain(t['aligned'], ('both', 'dkim_only', 'spf_only', 'neither'))}")
         L.append(f"- dispositions: {_plain(t.get('by_disposition') or {}, ('none', 'quarantine', 'reject'))}")
         fs = report["rua"]["failing_streams"]
@@ -2049,6 +2129,9 @@ def main():
     ap.add_argument("--rules-json", metavar="JSON", help="audit_rules.ps1 -Json export")
     ap.add_argument("--bypasses-json", metavar="JSON", help="audit_bypasses.ps1 -Json export")
     ap.add_argument("--groups-json", metavar="JSON", help="audit_groups.ps1 -Json export")
+    ap.add_argument("--keep-verdicts", action="store_true",
+                    help="keep every per-message verdict in report.json (large; dropped by default, the census "
+                         "and the per-domain counters stay)")
     ap.add_argument("--previous", metavar="PATH",
                     help="an earlier run's report.json (or the folder holding it), for the "
                          "'since the previous run' deltas")
@@ -2096,10 +2179,10 @@ def main():
     if not args.no_config:
         try:
             cfg = config_mod.load(args.config)
+            cfg_vendors = config_mod.audit_list(cfg, "vendor_domains")
         except config_mod.ConfigError as exc:
             die(str(exc))
         exceptions = cfg.get("exceptions") or []
-        cfg_vendors = [str(v) for v in ((cfg.get("audit") or {}).get("vendor_domains") or [])]
 
     # Domains: command line (comma or space separated), --file, and - unless
     # --no-graph or --offline - the tenant's own verified domain list, merged
@@ -2164,7 +2247,7 @@ def main():
             since=args.since, until=args.until, expect_policy=args.expect_policy,
             retiring=args.retiring_selector, columns=columns,
             rules_json=args.rules_json, bypasses_json=args.bypasses_json, groups_json=args.groups_json,
-            previous_report=previous, headline=headline, exceptions=exceptions)
+            previous_report=previous, headline=headline, exceptions=exceptions, keep_verdicts=args.keep_verdicts)
     except UsageError as exc:
         die(str(exc))
 

@@ -157,10 +157,27 @@ def org_domain(name):
 # --------------------------------------------------------------------------
 # evidence from the mail log and the aggregate reports
 
+def _audited(report):
+    """The audited names, as the gate keys them."""
+    names = {str(x).lower() for x in ((report.get("inputs") or {}).get("domains") or [])}
+    names |= {str(x).lower() for x in ((report.get("gate") or {}).get("domains") or {})}
+    return names
+
+
+def _home(name, audited):
+    """The audited domain a sender domain belongs to: itself when audited,
+    else its closest audited parent (the gate's rule), else None."""
+    name = (name or "").lower().rstrip(".")
+    if name in audited:
+        return name
+    return max((a for a in audited if name.endswith("." + a)), key=len, default=None)
+
+
 def evidence_for(report, domain):
     """What the report proves about this domain's legitimate senders."""
     ev = {"legit_failing": [], "spf_only": [], "has_maillog": False, "has_rua": False,
           "outbound_seen": None, "dkim_evidence": False}
+    audited = _audited(report)
     gate_exc = (report.get("gate") or {}).get("exceptions") or {}
     excepted_ips = set(gate_exc.get("excepted_streams") or [])
     ml = report.get("maillog") or {}
@@ -175,8 +192,9 @@ def evidence_for(report, domain):
                 # exceptions the gate applied to them - the same numbers the status document shows
                 by = own.get("by_likely") or {}
                 gate_dom = ((report.get("gate") or {}).get("domains") or {}).get(domain) or {}
-                excepted = (gate_dom.get("excepted_by_likely") or {}).get("likely_misconfigured_sender")
-                if excepted is None:  # a gate without the per-label split: every excepted failure counts
+                if "excepted_by_likely" in gate_dom:  # the gate's split: only excepted own-sender failures count here
+                    excepted = (gate_dom.get("excepted_by_likely") or {}).get("likely_misconfigured_sender", 0)
+                else:  # a gate from before the split: every excepted failure counts
                     excepted = gate_dom.get("excepted_failures") or 0
             else:
                 # a report from before the attribution: the whole log, less everything excepted
@@ -189,11 +207,9 @@ def evidence_for(report, domain):
                                            % (remaining, " (%d more are excepted in the gate)" % excepted if excepted else ""))
         if (ml.get("alignment") or {}).get("available"):
             ev["dkim_evidence"] = True
-        audited = {str(x).lower() for x in ((report.get("inputs") or {}).get("domains") or [])}
-        audited |= {str(x).lower() for x in ((report.get("gate") or {}).get("domains") or {})}
         for s in ml.get("spf_only_senders") or []:
-            d = (s.get("domain") or "").lower()
-            if d == domain or (d.endswith("." + domain) and d not in audited):  # an audited subdomain is its own gate
+            if _home(s.get("domain"), audited) == domain:  # attributed as the gate does: an audited subdomain is its own
+                d = (s.get("domain") or "").lower()
                 ev["spf_only"].append("%s (mail log, %d msgs)" % (s.get("sender") or d, s.get("spf_only") or 0))
     rua = report.get("rua") or {}
     if rua:
@@ -212,7 +228,7 @@ def evidence_for(report, domain):
                                               "; ".join(s.get("likely_signals") or [])[:120]))
         for s in rua.get("spf_only_senders") or []:
             froms = [h.lower() for h in (s.get("header_from") or [])] if isinstance(s, dict) else []
-            if not froms or domain in froms:
+            if not froms or any(_home(h, audited) == domain for h in froms):  # the gate's attribution, mirrored
                 ev["spf_only"].append(str(s.get("source_ip", s)) if isinstance(s, dict) else str(s))
     return ev
 

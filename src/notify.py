@@ -128,10 +128,19 @@ def sender_keys(report):
     for s in (report.get("rua") or {}).get("by_source_ip") or []:
         if isinstance(s, dict) and s.get("source_ip"):
             keys.add("ip:" + str(s["source_ip"]))
-    for v in (report.get("maillog") or {}).get("verdicts") or []:
-        env = (v.get("envelope_domain") or "").strip().lower() if isinstance(v, dict) else ""
-        if env:
-            keys.add("envelope:" + env)
+    maillog = report.get("maillog") or {}
+    census = maillog.get("census") if isinstance(maillog.get("census"), dict) else {}
+    rows = census.get("by_envelope") or []
+    if rows:  # the census names every envelope domain seen; the verdicts are no longer in report.json by default
+        for r in rows:
+            env = str(r.get("envelope_domain") or "").strip().lower() if isinstance(r, dict) else ""
+            if env and env != "(blank)":
+                keys.add("envelope:" + env)
+    else:
+        for v in maillog.get("verdicts") or []:
+            env = (v.get("envelope_domain") or "").strip().lower() if isinstance(v, dict) else ""
+            if env:
+                keys.add("envelope:" + env)
     return keys
 
 
@@ -260,11 +269,22 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
             if ml and pml:
                 d = ml.get("genuine_failures", 0) - pml.get("genuine_failures", 0)
                 lines.append("- genuine failures vs last run: %+d" % d)
-        if previous:
+        cmp = (dl or {}).get("rua") if isinstance((dl or {}).get("rua"), dict) else None
+        if cmp and cmp.get("comparable") is False:
+            lines.append("- outside view not comparable with last run (%s messages now, %s then): no pass-rate delta"
+                         % (cmp.get("now_messages"), cmp.get("previous_messages")))
+        elif cmp and cmp.get("pass_rate_change") is not None:
+            lines.append("- pass rate vs last run: %+.1f points" % cmp["pass_rate_change"])
+        elif previous:
             ptot = (previous.get("rua") or {}).get("totals") or {}
             if tot and ptot:
-                d = 100 * (float(tot.get("pass_rate", 0) or 0) - float(ptot.get("pass_rate", 0) or 0))
-                lines.append("- pass rate vs last run: %+.1f points" % d)
+                nm, pm = tot.get("messages") or 0, ptot.get("messages") or 0
+                if nm and pm and min(nm, pm) / max(nm, pm) >= 0.1:
+                    d = 100 * (float(tot.get("pass_rate", 0) or 0) - float(ptot.get("pass_rate", 0) or 0))
+                    lines.append("- pass rate vs last run: %+.1f points" % d)
+                else:
+                    lines.append("- outside view not comparable with last run (%s messages now, %s then): no "
+                                 "pass-rate delta" % (nm, pm))
 
     if known_senders is not None:
         now_keys = sender_keys(report)
@@ -330,6 +350,15 @@ def post(webhook, text, target=None):
         raise RuntimeError("webhook unreachable: %s" % getattr(err, "reason", err.__class__.__name__))
 
 
+def _run_stamp(report_path):
+    """collect.py's run stamp for a report, from the run.json beside it; None otherwise."""
+    try:
+        doc = json.loads((Path(report_path).resolve().parent / "run.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return str(doc.get("run")) if isinstance(doc, dict) and doc.get("run") else None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Post a short DMARC audit status to a Slack or Teams webhook.")
     ap.add_argument("--report", required=True, help="this run's report.json")
@@ -348,7 +377,18 @@ def main():
     plan = load(args.plan) if args.plan else None
     known = history = None
     if args.senders:
-        known = set((load(args.senders).get("senders") or {}))
+        try:
+            state = json.loads(Path(args.senders).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as err:
+            die("cannot read %s: %s" % (args.senders, err))
+        senders = state.get("senders") if isinstance(state, dict) else None
+        if not isinstance(senders, dict):
+            die("%s: expected the senders.json collect.py writes" % args.senders)
+        # known = the identities first seen BEFORE the run this report describes; collect.py records a
+        # run's own new senders into senders.json before the summary, so those must still count as new
+        stamp = _run_stamp(args.report) or state.get("updated")
+        known = {k for k, v in senders.items()
+                 if not (stamp and isinstance(v, dict) and str(v.get("first_seen") or "") >= str(stamp))}
     if args.metrics:
         try:
             history = json.loads(Path(args.metrics).read_text(encoding="utf-8-sig"))

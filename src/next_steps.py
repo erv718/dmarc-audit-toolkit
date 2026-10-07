@@ -135,9 +135,10 @@ GAP_RX = re.compile(r"^(\d+) logical message\(s\) from this domain failed with n
 # Plan prerequisites written as observations, reworded as the condition that clears them.
 PREREQ_REWORDS = (
     (re.compile(r"^(\d+) message\(s\) in the mail log failed from a sender that looks like your own "
-                r"misconfigured system, not a spoof(?: \(\d+ more are excepted in the gate\))?$"),
-     lambda m: "the %s mail-log failure%s from our own systems %s fixed"
-     % (m.group(1), "" if m.group(1) == "1" else "s", "is" if m.group(1) == "1" else "are")),
+                r"misconfigured system, not a spoof(?: \((\d+) more are excepted in the gate\))?$"),
+     lambda m: "the %s mail-log failure%s from our own systems %s fixed%s"
+     % (m.group(1), "" if m.group(1) == "1" else "s", "is" if m.group(1) == "1" else "are",
+        (" (%s more are formally excepted in audit.toml)" % m.group(2)) if m.group(2) else "")),
     (re.compile(r"^aggregate reports: (\S+) sends (\d+) message\(s\) as (\S+) and fails"),
      lambda m: "the sender at %s (%s messages as %s) is fixed" % (m.group(1), m.group(2), m.group(3))),
     (re.compile(r"^no failure evidence in this run"),
@@ -504,21 +505,38 @@ def _stamp(value):
     return txt[:16].replace("T", " ") if len(txt) >= 16 and txt[10] == "T" else txt
 
 
+def _span_seconds(window):
+    """The exact span between the window's stamps, in seconds; None when they do not parse."""
+    try:
+        a = datetime.fromisoformat(str(window.get("from")).replace("Z", "+00:00"))
+        b = datetime.fromisoformat(str(window.get("to")).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, (b - a).total_seconds())
+
+
 def span_phrase(window):
     """'the mail log's 41-hour span (2026-10-05 22:25 to 2026-10-07 15:20 UTC)',
-    in days from 48 hours on; None without a window. The mail log often
-    reaches less far back than the report window (a row budget keeps the
-    newest hours), and every mail-log number should say how far."""
+    in days from 48 hours on, in minutes under an hour; None without a
+    window. The figure comes from the window's own stamps (the stored hours
+    are rounded), so it never contradicts them. The mail log often reaches
+    less far back than the report window (a row budget keeps the newest
+    hours), and every mail-log number should say how far."""
     if not window:
         return None
-    hours = _f(window.get("hours"))
+    secs = _span_seconds(window)
+    hours = secs / 3600 if secs is not None else _f(window.get("hours"))
     if hours is None:
         return "the mail log's span (%s to %s UTC)" % (_stamp(window.get("from")), _stamp(window.get("to")))
     if hours >= 48:  # halves round up: 60 hours is a 3-day span, as 84 is a 4-day one
         return "the mail log's %d-day span (%s to %s)" % (int(hours / 24 + 0.5), str(window.get("from"))[:10],
                                                          str(window.get("to"))[:10])
     if hours < 1:
-        return "the mail log's %d-minute span (%s to %s UTC)" % (int(hours * 60 + 0.5), _stamp(window.get("from")),
+        minutes = int(hours * 60 + 0.5)
+        if minutes < 1:
+            return "the mail log's under-a-minute span (%s to %s UTC)" % (_stamp(window.get("from")),
+                                                                            _stamp(window.get("to")))
+        return "the mail log's %d-minute span (%s to %s UTC)" % (minutes, _stamp(window.get("from")),
                                                                   _stamp(window.get("to")))
     return "the mail log's %d-hour span (%s to %s UTC)" % (int(hours + 0.5), _stamp(window.get("from")),
                                                             _stamp(window.get("to")))
@@ -588,9 +606,21 @@ def maillog_view(report):
     view["by_sender"] = by_sender or []
     view["census_missing"] = by_env is None and by_sender is None
     ddf = Counter((v.get("sender") or "(no sender)").lower() for v in verdicts if v.get("delivered_despite_fail"))
+    env_of = {}
+    if ddf:
+        for v in verdicts:
+            s = (v.get("sender") or "(no sender)").lower()
+            if s in ddf and s not in env_of:
+                env_of[s] = v.get("envelope_domain") or ""
+    else:  # report.json carries the census, not the verdicts: the census names them per sender stream
+        raw = census.get("by_sender") if isinstance(census, dict) else None
+        for r in raw or []:
+            if isinstance(r, dict) and _n(r.get("delivered_despite_fail")):
+                s = str(r.get("sender") or "(no sender)").lower()
+                ddf[s] += _n(r.get("delivered_despite_fail"))
+                env_of.setdefault(s, str(r.get("envelope_domain") or ""))
     view["ddf_senders"] = [{"name": s, "count": n, "domain": (s.rpartition("@")[2] if "@" in s else ""),
-                            "envelope": next(((v.get("envelope_domain") or "") for v in verdicts
-                                              if (v.get("sender") or "").lower() == s), "")}
+                            "envelope": env_of.get(s, "")}
                            for s, n in sorted(ddf.items(), key=lambda kv: (-kv[1], kv[0]))]
     for s in view["by_sender"]:
         s["likely"] = s.get("likely") or "unknown"
@@ -617,8 +647,30 @@ def own_domain_view(report, view, org):
     if not _n(c.get("logical_messages")) and sub and _n(sub.get("logical_messages")):
         c, subs = sub, [str(d) for d in (sub.get("domains") or [])]  # the org's mail all sits in its subdomains
     senders = [s for s in (view["by_sender"] if view else []) if s.get("domain") == org or s.get("domain") in subs]
+    gate_dom = ((report.get("gate") or {}).get("domains") or {}).get(org) or {}
+    exc_likely = gate_dom.get("excepted_by_likely") if isinstance(gate_dom.get("excepted_by_likely"), dict) else {}
+    exc_senders = gate_dom.get("excepted_senders") if isinstance(gate_dom.get("excepted_senders"), dict) else {}
+    excepted = sum(_n(v) or 0 for v in exc_likely.values())
+    # one entry per address whatever envelope it failed through, less what the gate formally excepted:
+    # the gate's blocker counts are after the exceptions, so every number here is too
+    merged = {}
+    for s in senders:
+        name = str(s.get("name") or "?").lower()
+        e = merged.setdefault(name, {"name": name, "count": 0, "domain": s.get("domain"), "likes": Counter()})
+        e["count"] += _n(s.get("count")) or 0
+        e["likes"][s.get("likely") or "unknown"] += _n(s.get("count")) or 0
+    senders = []
+    for e in merged.values():
+        likes = e.pop("likes")
+        e["likely"] = likes.most_common(1)[0][0] if likes else "unknown"
+        e["count"] -= _n(exc_senders.get(e["name"])) or 0
+        if e["count"] > 0:
+            senders.append(e)
+    senders.sort(key=lambda s: (-s["count"], s["name"]))
     by_likely = c.get("by_likely") if isinstance(c.get("by_likely"), dict) else None
-    if by_likely is None and senders:
+    if by_likely is not None:
+        by_likely = {k: max(0, (_n(v) or 0) - (_n(exc_likely.get(k)) or 0)) for k, v in by_likely.items()}
+    elif senders:
         cnt = Counter()
         for s in senders:
             cnt[s.get("likely") or "unknown"] += s["count"]
@@ -627,7 +679,8 @@ def own_domain_view(report, view, org):
             "delivered_despite_fail": _n(c.get("delivered_despite_fail")),
             "by_likely": {k: _n(v) or 0 for k, v in by_likely.items()} if by_likely else None,
             "top_senders": _entries(c.get("top_senders"), SENDER_KEYS) or [], "senders": senders,
-            "subdomains": subs, "window": c.get("window") if isinstance(c.get("window"), dict) else None}
+            "subdomains": subs, "window": c.get("window") if isinstance(c.get("window"), dict) else None,
+            "excepted": excepted}
 
 
 def streams(view, rua, own=None):
@@ -641,7 +694,7 @@ def streams(view, rua, own=None):
         scope = "unaudited subdomains" if own.get("subdomains") else "own domain"
         # the domain's own span when the report carries it: the whole log often reaches further
         return {"basis": "mail log", "scope": scope, "window": own.get("window") or (view or {}).get("window"),
-                "own": groups["likely_misconfigured_sender"],
+                "excepted": own.get("excepted") or 0, "own": groups["likely_misconfigured_sender"],
                 "spoof": groups["likely_spoof"], "unclear": groups["unknown"],
                 "genuine_failures": own["genuine_failures"], "logical_messages": own["logical_messages"],
                 "by_likely": own["by_likely"], "top_senders": own["top_senders"],
@@ -761,11 +814,46 @@ def merge_trends(candidates):
     for c in cands[1:]:
         if c["label"] != out["label"]:
             continue
-        for k in ("previous_genuine_failures", "previous_pass_rate"):
+        for k in ("previous_genuine_failures", "previous_pass_rate", "previous_rua_messages", "previous_maillog_hours"):
             if out.get(k) is None and c.get(k) is not None:
                 out[k] = c[k]
-                out["source"] += " + " + c["source"]
+                if k in ("previous_genuine_failures", "previous_pass_rate"):
+                    out["source"] += " + " + c["source"]
     return out
+
+
+def apply_comparability(trend, delta, report, view):
+    """Drop a comparison the two runs cannot bear, and say why: failure
+    counts when the mail logs cover very different spans (a row budget keeps
+    the newest hours of a busy domain), the pass rate when the outside views
+    differ tenfold in size (a first full archive against an empty one). The
+    audit's delta carries the judgement when it ran; otherwise it is made
+    here from the previous run's figures."""
+    if not trend:
+        return trend
+    t, why = dict(trend), []
+    mw = delta.get("maillog_window") if isinstance(delta, dict) and isinstance(delta.get("maillog_window"), dict) else None
+    rc = delta.get("rua") if isinstance(delta, dict) and isinstance(delta.get("rua"), dict) else None
+    fail_ok = mw.get("comparable") if mw and mw.get("comparable") is not None else None
+    rate_ok = rc.get("comparable") if rc and rc.get("comparable") is not None else None
+    if fail_ok is None:
+        now_h = _f(((view or {}).get("window") or {}).get("hours")) if view else None
+        prev_h = _f(t.get("previous_maillog_hours"))
+        if now_h and prev_h:
+            fail_ok = min(now_h, prev_h) / max(now_h, prev_h) >= 0.5
+    if rate_ok is None:
+        now_m = _n(((report.get("rua") or {}).get("totals") or {}).get("messages"))
+        prev_m = _n(t.get("previous_rua_messages"))
+        if now_m is not None and prev_m is not None:
+            rate_ok = bool(now_m and prev_m and min(now_m, prev_m) / max(now_m, prev_m) >= 0.1)
+    if fail_ok is False:
+        t["previous_genuine_failures"] = None
+        why.append("failure counts are not compared: the two mail logs cover very different spans")
+    if rate_ok is False:
+        t["previous_pass_rate"] = None
+        why.append("the pass rate is not compared: the two outside views differ too much in size")
+    t["not_comparable"] = why
+    return t
 
 
 def trend_from_report(previous):
@@ -776,7 +864,9 @@ def trend_from_report(previous):
     if gf is None and pr is None:
         return None
     return {"source": "previous report", "label": _day(previous.get("generated_utc")) or "the previous run",
-            "previous_genuine_failures": gf, "previous_pass_rate": pr}
+            "previous_genuine_failures": gf, "previous_pass_rate": pr,
+            "previous_rua_messages": _n(((previous.get("rua") or {}).get("totals") or {}).get("messages")),
+            "previous_maillog_hours": _f(((previous.get("maillog") or {}).get("window") or {}).get("hours"))}
 
 
 def _same_run(entry, report, view):
@@ -806,7 +896,8 @@ def trend_from_metrics(metrics, report, view):
     if gf is None and pr is None:
         return None
     return {"source": "metrics", "label": _day(e.get("run")) or str(e.get("run")),
-            "previous_genuine_failures": gf, "previous_pass_rate": pr}
+            "previous_genuine_failures": gf, "previous_pass_rate": pr,
+            "previous_rua_messages": _n(e.get("rua_messages")), "previous_maillog_hours": _f(e.get("maillog_hours"))}
 
 
 def policy_since(metrics, org, policy):
@@ -1240,6 +1331,8 @@ def _own_domain_sentence(org, policy, strm):
             k = len(strm["spoof"])
             who = ("%d %s" % (k, _plural(k, "address", "addresses"))) if k else "addresses"
             parts.append("%d from %s that look like spoofing%s" % (spoof_n, who, _handled(policy, k or spoof_n)))
+        if strm.get("excepted"):
+            parts.append("%d formally excepted in audit.toml" % strm["excepted"])
         mid += ": " + "; ".join(parts)
     else:
         tops = _named(strm["top_senders"])
@@ -1308,8 +1401,10 @@ def where_we_stand(report, view, trend, window=None):
         gf, raw = view["genuine_failures"], view["raw_failing_rows"]
         data.update({"genuine_failures": gf, "raw_failing_rows": raw, "truncation": view["truncation"]})
         text = "**Genuine failures: %d**" % gf
-        if raw is not None:
+        if raw is not None and raw > gf:
             text += " (raw counts would say %d - the gap is relay echoes, not broken senders)" % raw
+        elif raw is not None:
+            text += " (raw row counts agree: no relay echoes)"
         span = span_phrase(view.get("window"))
         data["maillog_window"] = view.get("window")
         if span:
@@ -1374,11 +1469,13 @@ def where_we_stand(report, view, trend, window=None):
         if trend["previous_pass_rate"] is not None and pr_now is not None:
             parts.append("%+.1f pts pass rate (%.1f%% -> %.1f%%)" % (100 * (pr_now - trend["previous_pass_rate"]),
                                                                      100 * trend["previous_pass_rate"], 100 * pr_now))
+        why = trend.get("not_comparable") or []
         if parts:
-            lines.append("**Trend vs %s: %s**" % (trend["label"], ", ".join(parts)))
+            lines.append("**Trend vs %s: %s**%s" % (trend["label"], ", ".join(parts),
+                                                   (" - " + "; ".join(why)) if why else ""))
         else:
-            lines.append("**Trend vs %s: not comparable** - the two runs do not share a failure count or a pass rate"
-                         % trend["label"])
+            lines.append("**Trend vs %s: not comparable** - %s"
+                         % (trend["label"], "; ".join(why) or "the two runs do not share a failure count or a pass rate"))
     data["lines"] = lines
     return data
 
@@ -1911,6 +2008,7 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
     trend = merge_trends([trend_from_delta(delta, now_gf, now_pr),
                           trend_from_report(previous),
                           trend_from_metrics(metrics, report, view) if metrics else None])
+    trend = apply_comparability(trend, delta, report, view)
     stand = where_we_stand(report, view, trend, window)
     failing, failing_lines = what_is_failing(report, view)
     domains = per_domain(report, plan)
@@ -1924,7 +2022,7 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
             strm_data[k] = [{"name": s["name"], "count": s["count"]} for s in strm[k]]
         if strm.get("scope") in OWN_SCOPES:
             strm_data.update({"genuine_failures": strm["genuine_failures"], "logical_messages": strm["logical_messages"],
-                              "by_likely": strm["by_likely"],
+                              "by_likely": strm["by_likely"], "excepted": strm.get("excepted") or 0,
                               "top_senders": [{"name": s["name"], "count": s["count"]} for s in strm["top_senders"]]})
             if strm.get("subdomains"):
                 strm_data["subdomains"] = list(strm["subdomains"])  # whose rows these numbers are

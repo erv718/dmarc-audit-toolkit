@@ -88,8 +88,9 @@ MAX_BYTES = 256 * 1024 * 1024       # decompressed cap per file: zip bombs and r
 CHUNK_BYTES = 1024 * 1024           # inflate in pieces so the cap stops the read, not the heap
 MAX_NUM_CHARS = 24                  # longest <count> or epoch text worth parsing (2^64 is 20 digits)
 MAX_LABEL_CHARS = 100               # archive member names are clipped to this in warnings and findings
-PROBE_TAIL = 16                     # bytes carried between chunks so a DTD marker split across two is still seen
-DTD_MARKERS = (b"<!ENTITY", b"<!DOCTYPE")
+PROBE_TAIL = 32                     # bytes carried between chunks so a DTD marker split across two is still seen
+# the DTD markers in every spelling the parser would accept: ASCII (also UTF-8) and both UTF-16 byte orders
+DTD_MARKERS = tuple(m.encode(enc) for m in ("<!ENTITY", "<!DOCTYPE") for enc in ("ascii", "utf-16-le", "utf-16-be"))
 REPORT_SUFFIXES = (".xml", ".gz", ".zip")
 RDNS_TIMEOUT = 3
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocking": 3}
@@ -512,7 +513,7 @@ def load_reports(files, warnings=None):
         for label, data in payloads:
             try:
                 rep = parse_report(data, label)
-            except (ET.ParseError, ValueError, OverflowError, RecursionError) as exc:
+            except (ET.ParseError, ValueError, OverflowError, RecursionError, LookupError) as exc:  # LookupError: an encoding Python cannot look up
                 msg = _clean(str(exc), 200)
                 plain = " cap" in msg or "damaged file" in msg  # the file is bad, not merely not a report
                 warn(f"skipped {label}: {msg}" if plain else f"skipped {label}: not an aggregate report ({msg})")
@@ -800,6 +801,13 @@ def likely_label(s, domains):
             signals.append(f"reporter marked {fwd} msgs as forwarded or list traffic")
         if s["misaligned_spf"]:
             doms = sorted({d for (d, _, r) in s["spf"] if r == "pass" and d})
+            if own and fwd * 2 < s["count"] and s["aligned_dkim_failed"] * 2 >= s["count"]:
+                # a real platform (SPF passes for its own domain) sending as the domain itself with a
+                # signature for the domain that does not verify, and no forwarding marks: a broken,
+                # rotated or mismatched key at one of our senders, not a forward and not a spoof
+                signals.append(f"SPF passes for the sending platform ({', '.join(doms) or '?'}) and nothing marks "
+                               "forwarding: a broken, rotated or mismatched DKIM key at a system sending as the domain")
+                return "likely_misconfigured", signals
             signals.append(f"SPF passes for {', '.join(doms) or '?'}, which looks like the forwarding hop")
         signals.append("not a sender misconfiguration if the original passed at the first hop; check tenant logs")
         return "unknown", signals

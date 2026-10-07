@@ -152,3 +152,31 @@ def test_only_record_elements_count_and_several_feedback_blocks_merge(tmp_path):
     (tmp_path / "two.xml").write_bytes(two)
     rep = rua_parse.load_reports([tmp_path / "two.xml"], [])[0][0]
     assert len(rep["records"]) == 6 and rep["report_id"] == "2"  # one report under the first block's metadata
+
+
+def test_an_unknown_encoding_and_a_utf16_dtd_are_skipped_not_fatal(tmp_path):
+    odd = report_xml(5).replace(b'encoding="UTF-8"', b'encoding="UCS-2"')
+    (tmp_path / "odd.xml").write_bytes(odd)
+    utf16 = ('<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE feedback [<!ENTITY a "b">]>'
+             + report_xml(3)[len(b'<?xml version="1.0" encoding="UTF-8"?>'):].decode()).encode("utf-16")
+    (tmp_path / "wide.xml").write_bytes(utf16)
+    gz(tmp_path / "fine.xml.gz", report_xml(4))
+    warnings = []
+    reports, skipped = rua_parse.load_reports(sorted(tmp_path.iterdir()), warnings)
+    assert len(reports) == 1 and len(reports[0]["records"]) == 4 and skipped == 2
+    assert any("odd.xml" in w for w in warnings)
+    assert any("wide.xml" in w and "DTD or entity declaration present" in w for w in warnings)
+
+
+def test_an_own_platform_with_a_broken_dkim_key_is_likely_misconfigured_not_unknown():
+    s = {"count": 400, "no_auth": 0, "aligned_dkim_failed": 400, "misaligned_spf": 400, "misaligned_dkim": 0,
+         "dkim_failed": 400, "header_from": {"news.example.com": 400},
+         "reasons": __import__("collections").Counter(), "spf": {("platform.example", "mfrom", "pass"): 400},
+         "dkim": {("news.example.com", "s1", "fail"): 400}}
+    label, signals = rua_parse.likely_label(s, {"example.com"})
+    assert label == "likely_misconfigured" and any("broken, rotated or mismatched DKIM key" in x for x in signals)
+    s["reasons"] = __import__("collections").Counter({"forwarded": 300})  # a forward, not our key: still unknown
+    assert rua_parse.likely_label(s, {"example.com"})[0] == "unknown"
+    s["reasons"] = __import__("collections").Counter()
+    s["misaligned_spf"] = 0  # no platform passes SPF at all: could be a forged signature, stays unknown
+    assert rua_parse.likely_label(s, {"example.com"})[0] == "unknown"

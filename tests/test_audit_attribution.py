@@ -82,7 +82,7 @@ def maillog(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def report(maillog):
-    return build(maillog)
+    return build(maillog, keep_verdicts=True)  # these tests attribute from the verdicts themselves
 
 
 def test_each_audited_domain_gets_its_own_counters(report):
@@ -523,3 +523,52 @@ def test_the_mcp_audit_reads_the_settings_file(tmp_path):
     finally:
         import shutil
         shutil.rmtree(out, ignore_errors=True)
+
+
+def test_a_trailing_dot_in_the_sender_domain_cell_is_attributed_like_its_window(tmp_path):
+    path = tmp_path / "log.csv"
+    _write(path, COLUMNS, [["2026-05-01 09:00:00", "<a@x>", "hi@corp.example", "corp.example.", "corp.example",
+                            "u@example.com", "Hello", "Blocked", "Quarantine", "fail"]])
+    doc = audit.build_report(domains=["corp.example"], maillog=str(path), offline=True, auth_column="DMARC")
+    c = doc["maillog"]["by_domain"]["corp.example"]
+    assert c["logical_messages"] == 1 and c["genuine_failures"] == 1 and c["window"]["rows"] == 1
+    assert doc["maillog"]["by_domain"][audit.OTHER]["logical_messages"] == 0
+
+
+def test_the_delta_does_not_compare_logs_or_views_that_differ_too_much():
+    now = {"generated_utc": "2026-10-07T15:00:00Z",
+           "maillog": {"counters": {"genuine_failures": 613, "delivered_despite_fail": 1}, "window": {"hours": 41.0},
+                       "by_domain": {"corp.example": {"genuine_failures": 613, "delivered_despite_fail": 1}}},
+           "rua": {"totals": {"messages": 828000, "pass_rate": 0.98}}, "gate": {"domains": {}}, "findings": []}
+    prev = {"generated_utc": "2026-10-01T15:00:00Z",
+            "maillog": {"counters": {"genuine_failures": 2100, "delivered_despite_fail": 0}, "window": {"hours": 719.0},
+                        "by_domain": {"corp.example": {"genuine_failures": 2100, "delivered_despite_fail": 0}}},
+            "rua": {"totals": {"messages": 40, "pass_rate": 0.0}}, "gate": {"domains": {}}, "findings": []}
+    dl = audit.build_delta(now, prev)
+    assert dl["genuine_failures"] is None and dl["by_domain"] == {} and dl["maillog_window"]["comparable"] is False
+    assert dl["rua"] == {"now_messages": 828000, "previous_messages": 40, "comparable": False, "pass_rate_change": None}
+    assert any("cover different spans (41 hours now, 30 days in the previous run)" in n for n in dl["notes"])
+    assert any("not comparable with the previous run (828000 messages now, 40 then)" in n for n in dl["notes"])
+    prev["maillog"]["window"]["hours"] = 45.0
+    prev["rua"]["totals"] = {"messages": 700000, "pass_rate": 0.95}
+    dl = audit.build_delta(now, prev)
+    assert dl["genuine_failures"] == -1487 and dl["by_domain"]["corp.example"]["genuine_failures"] == -1487
+    assert dl["rua"]["comparable"] is True and dl["rua"]["pass_rate_change"] == 3.0
+    now["rua"]["totals"]["messages"] = prev["rua"]["totals"]["messages"] = 0  # no reports on either side: nothing to judge
+    dl = audit.build_delta(now, prev)
+    assert dl["rua"]["comparable"] is None and not any("outside view" in n for n in dl["notes"])
+
+
+def test_report_json_drops_the_verdicts_and_caps_the_source_tables(tmp_path):
+    rep = audit.build_report(domains=["example.com"], maillog=str(ROOT / "samples" / "sample_maillog.csv"),
+                             rua_paths=[str(ROOT / "samples" / "rua")], offline=True, auth_column="DMARC")
+    assert rep["maillog"]["verdicts"] == [] and rep["maillog"]["verdicts_omitted"] == rep["maillog"]["counters"]["logical_messages"]
+    assert rep["maillog"]["census"]["by_sender"] and rep["maillog"]["by_domain"]["example.com"]["genuine_failures"] > 0
+    kept = audit.build_report(domains=["example.com"], maillog=str(ROOT / "samples" / "sample_maillog.csv"),
+                              offline=True, auth_column="DMARC", keep_verdicts=True)
+    assert len(kept["maillog"]["verdicts"]) == kept["maillog"]["counters"]["logical_messages"]
+    doc = {"by_source_ip": [{"source_ip": "2001:db8::%x" % i, "count": 5000 - i} for i in range(1500)],
+           "unknown_senders": [{"kind": "ip", "value": "2001:db8::%x" % i, "count": 5000 - i} for i in range(1200)]}
+    audit._trim_rua(doc, 1000)
+    assert len(doc["by_source_ip"]) == 1000 and len(doc["unknown_senders"]) == 1000
+    assert doc["truncated"] == {"by_source_ip": {"kept": 1000, "total": 1500}, "unknown_senders": {"kept": 1000, "total": 1200}}

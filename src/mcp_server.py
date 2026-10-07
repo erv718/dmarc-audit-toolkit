@@ -19,7 +19,9 @@ path fails everywhere except inside the repo folder.
     claude mcp add dmarc-audit-toolkit -- python /path/to/dmarc-audit-toolkit/src/mcp_server.py
 
 Requires: pip install -r requirements-mcp.txt, and AI_ANALYSIS_ENABLED=true
-in the repo's .env or in the environment (see .env.example).
+in the repo's .env or in the environment (see .env.example). Without the SDK
+the module still imports and its tools run as plain functions; only serving
+needs it.
 """
 
 import csv
@@ -63,9 +65,26 @@ def _mcp_import_error():
 
 try:
     from mcp.server.mcpserver import MCPServer
+    MCP_AVAILABLE = True
 except ImportError:
-    print(_mcp_import_error(), file=sys.stderr)
-    sys.exit(2)
+    MCP_AVAILABLE = False
+
+    class MCPServer:
+        """Stand-in without the SDK: the tools below stay importable and
+        callable as plain functions (tests, library use); only serving
+        needs the real thing, and run() says what to install."""
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def tool(self, *args, **kwargs):
+            def register(fn):
+                return fn
+            return register
+
+        def run(self):
+            print(_mcp_import_error(), file=sys.stderr)
+            sys.exit(2)
 
 server = MCPServer(
     name="dmarc-audit-toolkit",
@@ -533,6 +552,7 @@ def run_audit(
                          "got a path resolving outside it"}
     try:
         cfg = config_mod.load(config)
+        vendors = config_mod.audit_list(cfg, "vendor_domains")
     except config_mod.ConfigError as err:
         return {"error": str(err)}
     try:
@@ -540,8 +560,7 @@ def run_audit(
             domains=domains or (), rua_paths=rua or (), maillog=maillog,
             header_files=header_files or (), offline=offline, known=known,
             sender_domain=sender_domain, authserv_id=authserv_id,
-            vendor_domains=[str(v) for v in ((cfg.get("audit") or {}).get("vendor_domains") or [])],
-            exceptions=cfg.get("exceptions") or [])
+            vendor_domains=vendors, exceptions=cfg.get("exceptions") or [])
     except audit_mod.UsageError as err:
         return {"error": str(err)}
     reply = {

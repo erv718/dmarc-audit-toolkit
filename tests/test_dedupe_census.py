@@ -170,9 +170,18 @@ def test_cli_json_carries_the_full_census_and_the_report_prints_it():
     assert fails == sorted(fails, reverse=True)
     assert set(cs["by_envelope"][0]) == {"envelope_domain", "genuine_failures", "messages", "senders",
                                         "sample_sender", "likely"}
-    assert set(cs["by_sender"][0]) == {"sender", "domain", "envelope_domain", "genuine_failures", "messages",
+    assert set(cs["by_sender"][0]) == {"sender", "domain", "envelope_domain", "genuine_failures", "messages", "delivered_despite_fail",
                                       "likely", "sample_subject"}
     p = run_cli()
     assert p.returncode in (0, 1), p.stderr
     assert "genuine failures by envelope domain (" in p.stdout
     assert "genuine failures by sender (" in p.stdout
+
+
+def test_the_census_counts_delivered_despite_fail_per_sender_stream():
+    vs = [{"sender": "statements@example.com", "domain": "example.com", "envelope_domain": "example.com",
+           "genuine_failure": True, "delivered_despite_fail": True, "likely": "likely_misconfigured_sender", "subject": "s"},
+          {"sender": "statements@example.com", "domain": "example.com", "envelope_domain": "example.com",
+           "genuine_failure": True, "delivered_despite_fail": False, "likely": "likely_misconfigured_sender", "subject": "s"}]
+    row = dedupe.census(vs)["by_sender"][0]
+    assert row["sender"] == "statements@example.com" and row["genuine_failures"] == 2 and row["delivered_despite_fail"] == 1

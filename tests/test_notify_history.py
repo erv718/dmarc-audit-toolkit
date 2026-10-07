@@ -91,3 +91,51 @@ def test_a_domain_without_a_record_is_not_p_none():
     rep = report()
     rep["gate"]["domains"]["example.com"]["current_policy"] = None
     assert "p=unknown" in notify.summarize(rep) and "p=None" not in notify.summarize(rep)
+
+
+def test_the_cli_counts_the_runs_own_new_senders_as_new_and_checks_the_file(tmp_path):
+    import json as _json
+    import subprocess
+    import sys as _sys
+    from pathlib import Path as _Path
+    rep = report(sources=("192.0.2.10", "198.51.100.7"), envelopes=("example.com",))
+    run_dir = tmp_path / "latest"
+    run_dir.mkdir()
+    (run_dir / "report.json").write_text(_json.dumps(rep), encoding="utf-8")
+    (run_dir / "run.json").write_text(_json.dumps({"run": "2026-10-07T150000Z"}), encoding="utf-8")
+    senders = tmp_path / "senders.json"
+    senders.write_text(_json.dumps({"updated": "2026-10-07T150000Z", "senders": {
+        "ip:192.0.2.10": {"first_seen": "2026-09-30T060000Z", "last_seen": "2026-10-07T150000Z"},
+        "envelope:example.com": {"first_seen": "2026-09-30T060000Z", "last_seen": "2026-10-07T150000Z"},
+        "ip:198.51.100.7": {"first_seen": "2026-10-07T150000Z", "last_seen": "2026-10-07T150000Z"}}}), encoding="utf-8")
+    script = str(_Path(notify.__file__))
+    p = subprocess.run([_sys.executable, script, "--report", str(run_dir / "report.json"), "--senders", str(senders),
+                        "--dry-run"], capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    assert "*newly identified senders* (never seen in an earlier run): 198.51.100.7" in p.stdout
+    for bad in ("[]", '{"not": "senders"}'):
+        senders.write_text(bad, encoding="utf-8")
+        p = subprocess.run([_sys.executable, script, "--report", str(run_dir / "report.json"), "--senders", str(senders),
+                            "--dry-run"], capture_output=True, text=True)
+        assert p.returncode == 2 and "expected the senders.json collect.py writes" in p.stderr
+
+
+def test_no_pass_rate_jump_against_an_empty_outside_view():
+    now = report(pass_rate=0.98)
+    now["rua"]["totals"]["messages"] = 828000
+    prev = report(pass_rate=0.0)
+    prev["rua"]["totals"]["messages"] = 40
+    text = notify.summarize(now, previous=prev)
+    assert "pass rate vs last run" not in text
+    assert "outside view not comparable with last run (828000 messages now, 40 then): no pass-rate delta" in text
+    now["delta"] = {"previous_generated_utc": "2026-01-08T06:00:00Z", "rua": {"comparable": True, "pass_rate_change": 2.5,
+                                                                            "now_messages": 100, "previous_messages": 90}}
+    assert "- pass rate vs last run: +2.5 points" in notify.summarize(now, previous=prev)
+
+
+def test_sender_keys_come_from_the_census_when_the_verdicts_are_gone():
+    rep = report(envelopes=("example.com",))
+    rep["maillog"]["verdicts"] = []
+    rep["maillog"]["census"] = {"by_envelope": [{"envelope_domain": "bounce.vendor.example", "genuine_failures": 0},
+                                                 {"envelope_domain": "(blank)", "genuine_failures": 0}]}
+    assert notify.sender_keys(rep) == {"ip:192.0.2.10", "envelope:bounce.vendor.example"}

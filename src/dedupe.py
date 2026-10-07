@@ -223,9 +223,10 @@ def message_alignment(legs, cols, auth, from_domain):
     if not any(p for p, _ in auth):
         return "not_passing"
     carried = dkim_any = False
+    env_known = bool(cols.get("envelope")) and cols["envelope"] in legs[0]  # without it, alignment of an SPF pass is unknown
     for leg, (passed, _) in zip(legs, auth):
-        spf_ok = field(leg, cols, "spf").lower() == "pass" and _aligned(
-            envelope_domain(field(leg, cols, "envelope")), from_domain)
+        spf_ok = field(leg, cols, "spf").lower() == "pass" and (
+            not env_known or _aligned(envelope_domain(field(leg, cols, "envelope")), from_domain))
         if passed and not spf_ok and field(leg, cols, "dkim").lower() == "pass":
             carried = True  # DKIM carried it only when a DKIM pass is on that leg
         if field(leg, cols, "dkim").lower() == "pass":
@@ -401,8 +402,8 @@ def _dominant(counter):
 
 def census(verdicts):
     """Sender census over the verdicts: every envelope (MAIL FROM) domain and
-    every (sender, domain, envelope) stream seen, with its genuine failures,
-    worst first. Clean entries stay in, so a new sender shows up before it
+    every (sender, domain, envelope) stream seen, with its genuine failures
+    (and, per stream, how many were delivered despite failing), worst first. Clean entries stay in, so a new sender shows up before it
     fails. Takes the verdict dict from classify() or the --json verdict list.
     {"by_envelope": [...], "by_sender": [...]}"""
     vs = list(verdicts.values()) if isinstance(verdicts, dict) else list(verdicts)
@@ -418,8 +419,11 @@ def census(verdicts):
         e["messages"] += 1
         e["all"][sender] += 1
         s = senders.setdefault((sender, dom, env), {"messages": 0, "genuine_failures": 0, "likely": Counter(),
+                                                    "delivered_despite_fail": 0,
                                                     "subject": v.get("subject") or "", "fail_subject": None})
         s["messages"] += 1
+        if v.get("delivered_despite_fail"):
+            s["delivered_despite_fail"] += 1
         if failing:
             e["genuine_failures"] += 1
             e["fail"][sender] += 1
@@ -434,6 +438,7 @@ def census(verdicts):
               for env, e in envs.items()]
     by_sender = [{"sender": sender, "domain": dom, "envelope_domain": env,
                   "genuine_failures": s["genuine_failures"], "messages": s["messages"],
+                  "delivered_despite_fail": s["delivered_despite_fail"],
                   "likely": _dominant(s["likely"]),
                   "sample_subject": s["fail_subject"] if s["fail_subject"] is not None else s["subject"]}
                  for (sender, dom, env), s in senders.items()]

@@ -675,7 +675,8 @@ def test_plan_holds_from_the_merged_gate_are_reworded_as_conditions():
                 return fn(m)
         return None
     assert reword("3 message(s) in the mail log failed from a sender that looks like your own misconfigured system, "
-                  "not a spoof (2 more are excepted in the gate)") == "the 3 mail-log failures from our own systems are fixed"
+                  "not a spoof (2 more are excepted in the gate)") == (
+        "the 3 mail-log failures from our own systems are fixed (2 more are formally excepted in audit.toml)")
     assert reword("SPF-only aligned senders (news@example.com (mail log, 2 msgs)): they break on forwarding at reject "
                   "- aligned DKIM first") == ("the SPF-only senders (news@example.com (mail log, 2 msgs)) are DKIM-signed, "
                                                "because SPF alone breaks on forwarding")
@@ -727,8 +728,124 @@ def test_the_one_liner_states_the_headline_domains_own_span(tmp_path):
 
 
 def test_span_phrase_rounds_halves_up_and_has_a_minute_form():
-    w = {"from": "2026-10-05T22:00:00Z", "to": "2026-10-05T22:30:00Z"}
-    assert next_steps.span_phrase(dict(w, hours=0.5)) == "the mail log's 30-minute span (2026-10-05 22:00 to 2026-10-05 22:30 UTC)"
-    assert next_steps.span_phrase(dict(w, hours=2.5)).startswith("the mail log's 3-hour span")
-    assert next_steps.span_phrase(dict(w, hours=60.0)).startswith("the mail log's 3-day span")
-    assert next_steps.span_phrase(dict(w, hours=84.0)).startswith("the mail log's 4-day span")
+    def w(to):
+        return {"from": "2026-10-05T22:00:00Z", "to": to}
+    assert next_steps.span_phrase(w("2026-10-05T22:30:00Z")) == "the mail log's 30-minute span (2026-10-05 22:00 to 2026-10-05 22:30 UTC)"
+    assert next_steps.span_phrase(w("2026-10-06T00:30:00Z")).startswith("the mail log's 3-hour span")   # 2.5 h
+    assert next_steps.span_phrase(w("2026-10-08T10:00:00Z")).startswith("the mail log's 3-day span")    # 60 h
+    assert next_steps.span_phrase(w("2026-10-09T10:00:00Z")).startswith("the mail log's 4-day span")    # 84 h
+
+
+def test_exceptions_reduce_every_number_the_document_shows_for_the_domain(tmp_path):
+    import csv as _csv
+    cols = ["Email date (UTC)", "Internet message ID", "Sender address", "Sender domain", "Sender mail from domain",
+            "Recipients", "Subject", "Delivery action", "Latest delivery location", "DMARC"]
+    rows = [["2026-05-01 09:00:00", "<a%d@x>" % i, "app@corp.example", "corp.example", "corp.example",
+             "u@example.com", "Purchase order 1 acknowledged", "Blocked", "Quarantine", "fail"] for i in range(3)]
+    rows += [["2026-05-01 09:00:00", "<p%d@x>" % i, "printer@corp.example", "corp.example", "printer.vendor.example",
+              "u@example.com", "Scan", "Blocked", "Quarantine", "fail"] for i in range(2)]
+    rows += [["2026-05-01 09:00:00", "<p%d@y>" % i, "printer@corp.example", "corp.example", "other.vendor.example",
+              "u@example.com", "Scan", "Blocked", "Quarantine", "fail"] for i in range(2)]
+    rows += [["2026-05-01 09:00:00", "<s%d@x>" % i, "ceo@corp.example", "corp.example", "spam.invalid",
+              "u@example.com", "Urgent wire transfer", "Blocked", "Quarantine", "fail"] for i in range(2)]
+    path = tmp_path / "log.csv"
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = _csv.writer(fh)
+        w.writerow(cols)
+        w.writerows(rows)
+    exc = {"match": "printer.vendor.example", "reason": "printer", "until": "2099-01-01", "removal_criterion": "replaced"}
+    rep = audit.build_report(domains=["corp.example"], maillog=str(path), offline=True, auth_column="DMARC",
+                             vendor_domains=["vendor.example"], exceptions=[exc])
+    g = rep["gate"]["domains"]["corp.example"]
+    assert g["excepted_failures"] == 2 and g["excepted_senders"] == {"printer@corp.example": 2}
+    doc = next_steps.build(rep)
+    line = doc["one_liner"]
+    assert "9 messages from corp.example failed with no passing copy" in line
+    assert "2 formally excepted in audit.toml" in line
+    assert "printer@corp.example x2" in line and "printer@corp.example x4" not in line  # one entry, reduced
+    strm = doc["failing"]["streams"]
+    assert strm["excepted"] == 2 and strm["by_likely"]["likely_misconfigured_sender"] + strm["by_likely"]["likely_spoof"] \
+        + strm["by_likely"]["unknown"] == 7  # 9 failed, 2 of them excepted
+
+
+def test_blocker_items_split_the_reduced_count_with_the_reduced_split():
+    rep = {"inputs": {"domains": ["corp.example"]},
+           "gate": {"domains": {"corp.example": {"verdict": "no_go", "current_policy": "reject",
+                                                 "excepted_by_likely": {"likely_spoof": 2}, "excepted_senders": {"ceo@corp.example": 2},
+                                                 "reasons": ["corp.example: 5 logical message(s) from this domain failed with no "
+                                                             "passing copy (deduplicated; 2 more excepted); top senders: "
+                                                             "app@corp.example x3, printer@corp.example x2"]}},
+                    "evidence": {"statement": "s"}},
+           "maillog": {"by_domain": {"corp.example": {"genuine_failures": 7, "logical_messages": 7,
+                                                      "by_likely": {"likely_spoof": 2, "likely_misconfigured_sender": 5, "unknown": 0},
+                                                      "top_senders": []}},
+                       "census": {"by_sender": [
+                           {"sender": "app@corp.example", "domain": "corp.example", "envelope_domain": "corp.example",
+                            "genuine_failures": 3, "messages": 3, "likely": "likely_misconfigured_sender"},
+                           {"sender": "printer@corp.example", "domain": "corp.example", "envelope_domain": "v.example",
+                            "genuine_failures": 2, "messages": 2, "likely": "likely_misconfigured_sender"},
+                           {"sender": "ceo@corp.example", "domain": "corp.example", "envelope_domain": "spam.invalid",
+                            "genuine_failures": 2, "messages": 2, "likely": "likely_spoof"}]}}}
+    view = next_steps.maillog_view(rep)
+    own = next_steps.own_domain_view(rep, view, "corp.example")
+    assert own["by_likely"] == {"likely_spoof": 0, "likely_misconfigured_sender": 5, "unknown": 0}
+    assert [s["name"] for s in own["senders"]] == ["app@corp.example", "printer@corp.example"]  # the excepted spoof is gone
+    items = next_steps.blocker_items(rep, "corp.example", own)
+    assert len(items) == 1 and items[0]["kind"] == "other" and "5 logical message" in items[0]["text"]
+
+
+def test_rewords_keep_the_excepted_count_and_the_stand_line_knows_when_there_is_no_gap():
+    def reword(text):
+        for rx, fn in next_steps.PREREQ_REWORDS:
+            m = rx.match(text)
+            if m:
+                return fn(m)
+    assert reword("3 message(s) in the mail log failed from a sender that looks like your own misconfigured system, "
+                  "not a spoof (2 more are excepted in the gate)") == (
+        "the 3 mail-log failures from our own systems are fixed (2 more are formally excepted in audit.toml)")
+    rep = {"inputs": {"domains": ["corp.example"]}, "gate": {"domains": {}},
+           "maillog": {"counters": {"genuine_failures": 4, "raw_failing_rows": 4, "raw_rows": 10, "logical_messages": 8,
+                                    "delivered_despite_fail": 0, "by_likely": {}}, "auth_column": "DMARC"}}
+    view = next_steps.maillog_view(rep)
+    stand = next_steps.where_we_stand(rep, view, None)
+    assert any("(raw row counts agree: no relay echoes)" in l for l in stand["lines"])
+    assert not any("the gap is relay echoes" in l for l in stand["lines"])
+
+
+def test_span_phrase_takes_its_minutes_from_the_stamps():
+    w = {"from": "2026-10-05T22:00:00Z", "to": "2026-10-05T22:08:00Z", "hours": 0.1}  # stored hours are rounded
+    assert next_steps.span_phrase(w) == "the mail log's 8-minute span (2026-10-05 22:00 to 2026-10-05 22:08 UTC)"
+    w = {"from": "2026-10-05T22:00:00Z", "to": "2026-10-05T22:00:20Z", "hours": 0.0}
+    assert next_steps.span_phrase(w).startswith("the mail log's under-a-minute span")
+    assert "0-minute" not in next_steps.span_phrase(w) and "0-hour" not in next_steps.span_phrase(w)
+
+
+def test_the_trend_does_not_compare_what_the_runs_cannot_bear():
+    rep = {"generated_utc": "2026-10-07T15:00:00Z", "inputs": {"domains": ["example.com"]}, "gate": {"domains": {}},
+           "maillog": {"counters": {"genuine_failures": 613, "raw_failing_rows": 900, "raw_rows": 1000,
+                                    "logical_messages": 700, "delivered_despite_fail": 0, "by_likely": {}},
+                       "auth_column": "DMARC", "window": {"from": "2026-10-05T22:00:00Z", "to": "2026-10-07T15:00:00Z", "hours": 41.0}},
+           "rua": {"totals": {"messages": 828000, "pass_rate": 0.98, "reports": 6000, "by_disposition": {}}},
+           "delta": {"previous_generated_utc": "2026-10-01T15:00:00Z", "genuine_failures": None,
+                     "maillog_window": {"comparable": False}, "rua": {"comparable": False, "now_messages": 828000, "previous_messages": 40},
+                     "notes": []}}
+    view = next_steps.maillog_view(rep)
+    trend = next_steps.merge_trends([next_steps.trend_from_delta(rep["delta"], 613, 0.98),
+                                     next_steps.trend_from_report({"generated_utc": "2026-10-01T15:00:00Z",
+                                                                   "maillog": {"counters": {"genuine_failures": 2100}},
+                                                                   "rua": {"totals": {"messages": 40, "pass_rate": 0.0}}})])
+    trend = next_steps.apply_comparability(trend, rep["delta"], rep, view)
+    assert trend["previous_genuine_failures"] is None and trend["previous_pass_rate"] is None
+    stand = next_steps.where_we_stand(rep, view, trend)
+    line = next(l for l in stand["lines"] if l.startswith("**Trend vs"))
+    assert "not comparable" in line and "different spans" in line and "differ too much in size" in line
+    # without a delta, the previous report's own figures decide the same way
+    prev = {"generated_utc": "2026-10-01T15:00:00Z", "maillog": {"counters": {"genuine_failures": 2100}, "window": {"hours": 719.0}},
+            "rua": {"totals": {"messages": 40, "pass_rate": 0.0}}}
+    del rep["delta"]
+    trend = next_steps.apply_comparability(next_steps.trend_from_report(prev), {}, rep, view)
+    assert trend["previous_genuine_failures"] is None and trend["previous_pass_rate"] is None
+    prev["maillog"]["window"]["hours"] = 40.0
+    prev["rua"]["totals"]["messages"] = 800000
+    trend = next_steps.apply_comparability(next_steps.trend_from_report(prev), {}, rep, view)
+    assert trend["previous_genuine_failures"] == 2100 and trend["previous_pass_rate"] == 0.0

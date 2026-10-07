@@ -271,3 +271,9 @@ def test_truncation_text_comes_from_the_slicers_own_notes():
     assert collect.truncation_text(notes) == ("row budget kept only the newest 41h for example.com; "
                                               "an hour of corp.example (3h..2h ago) is truncated at the API cap")
     assert collect.truncation_text(["mail log: 30 rows for other.example (last 30 days)"]) is None
+
+
+def test_metrics_carry_the_mail_logs_span_for_the_trend():
+    report = {"gate": {"domains": {}}, "maillog": {"counters": {"genuine_failures": 3}, "window": {"hours": 41.0}},
+              "rua": {"totals": {}}, "summary": {}}
+    assert collect.metrics_entry("2026-10-07T150000Z", report, {"changes": []})["maillog_hours"] == 41.0

@@ -111,3 +111,10 @@ def test_a_domain_exception_never_excepts_the_domains_own_spoofs():
     spoof = {"sender": "ceo@example.com", "envelope_domain": "spam.invalid"}
     assert not config.matches_verdict(own, spoof)  # the From domain is the one being spoofed
     assert config.matches_verdict({"match": "spam.invalid", "kind": "domain"}, spoof)  # the envelope is the sender
+
+
+def test_audit_list_reads_a_string_or_a_list_the_same_way():
+    assert config.audit_list({"audit": {"vendor_domains": "vendor.example, other.example"}}, "vendor_domains") == [
+        "vendor.example", "other.example"]
+    assert config.audit_list({"audit": {"vendor_domains": ["vendor.example"]}}, "vendor_domains") == ["vendor.example"]
+    assert config.audit_list({}, "vendor_domains") == []

@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 import mcp_server
 
 
@@ -34,3 +36,18 @@ def test_env_var_beats_env_file(monkeypatch, tmp_path):
 def test_env_file_true_when_no_env_var(monkeypatch, tmp_path):
     _isolate(monkeypatch, tmp_path, "AI_ANALYSIS_ENABLED=true\n")
     assert mcp_server.ai_analysis_enabled() is True
+
+
+def test_the_server_module_imports_without_the_sdk(monkeypatch):
+    import importlib
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, "mcp.server.mcpserver", None)  # the import then raises ImportError
+    mod = importlib.reload(mcp_server)
+    try:
+        assert mod.MCP_AVAILABLE is False and callable(mod.dedupe_maillog) and callable(mod.run_audit)
+        with pytest.raises(SystemExit) as exc:
+            mod.server.run()
+        assert exc.value.code == 2
+    finally:
+        monkeypatch.undo()
+        importlib.reload(mcp_server)

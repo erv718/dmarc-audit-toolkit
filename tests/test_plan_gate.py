@@ -92,3 +92,27 @@ def test_an_audited_subdomains_spf_only_sender_does_not_hold_the_apex():
     assert plan.evidence_for(rep, "sub.example.com")["spf_only"] == ["news@sub.example.com (mail log, 2 msgs)"]
     rep["inputs"]["domains"] = ["example.com"]  # unaudited: it counts for its closest audited parent
     assert plan.evidence_for(rep, "example.com")["spf_only"] == ["news@sub.example.com (mail log, 2 msgs)"]
+
+
+def test_excepted_failures_of_other_labels_do_not_shrink_the_own_sender_hold():
+    ml = {"sender_domain": None, "counters": {"by_likely": {"likely_misconfigured_sender": 3, "unknown": 1}},
+          "alignment": {"available": True}, "spf_only_senders": [],
+          "by_domain": {"example.com": {"by_likely": {"likely_misconfigured_sender": 3, "unknown": 1}}}}
+    rep = make_report(maillog=ml, gate_exceptions={"excepted_maillog_failures": 1})
+    rep["gate"]["domains"] = {"example.com": {"excepted_failures": 1, "excepted_by_likely": {"unknown": 1}}}
+    ev = plan.evidence_for(rep, "example.com")
+    assert ev["legit_failing"] == ["3 message(s) in the mail log failed from a sender that looks like your own "
+                                   "misconfigured system, not a spoof"]
+
+
+def test_spf_only_senders_hold_the_gate_that_owns_them_on_both_sides():
+    ml = {"sender_domain": None, "counters": {"by_likely": {}}, "alignment": {"available": True},
+          "spf_only_senders": [{"sender": "news@deep.sub.example.com", "domain": "deep.sub.example.com", "spf_only": 2}]}
+    rua = {"totals": {"messages": 500}, "failing_streams": [],
+           "spf_only_senders": [{"source_ip": "192.0.2.9", "spf_only": 40, "header_from": ["mail.example.com"]},
+                                {"source_ip": "192.0.2.10", "spf_only": 7, "header_from": ["sub.example.com"]}]}
+    rep = make_report(maillog=ml, rua=rua)
+    rep["inputs"]["domains"] = ["example.com", "sub.example.com"]
+    apex, sub = plan.evidence_for(rep, "example.com"), plan.evidence_for(rep, "sub.example.com")
+    assert apex["spf_only"] == ["192.0.2.9"]  # the unaudited mail.example.com stream is the apex's
+    assert sub["spf_only"] == ["news@deep.sub.example.com (mail log, 2 msgs)", "192.0.2.10"]

@@ -431,6 +431,7 @@ def metrics_entry(stamp, report, plan):
                     for d, g in sorted(per.items())},
         "findings": (report.get("summary") or {}).get("by_severity") or {},
         "genuine_failures": ml.get("genuine_failures"),
+        "maillog_hours": ((report.get("maillog") or {}).get("window") or {}).get("hours"),
         "delivered_despite_fail": ml.get("delivered_despite_fail"),
         "likely_spoof": (ml.get("by_likely") or {}).get("likely_spoof"),
         "rua_messages": tot.get("messages"),

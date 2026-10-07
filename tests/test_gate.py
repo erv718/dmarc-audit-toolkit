@@ -189,3 +189,30 @@ def test_a_dmarc_pass_without_a_dkim_pass_is_not_dkim_carried(tmp_path):
     doc = audit.run_maillog(str(path), auth_column="DMARC")
     assert doc["alignment"]["available"] and doc["alignment"]["spf_only"] == 1 and doc["alignment"]["dkim_aligned"] == 0
     assert gate(dns(), doc)["verdict"] == "no_go"  # SPF alone holds the reject step; it is not a go
+
+
+def test_rua_spf_only_streams_are_attributed_by_header_from_like_the_rows(tmp_path):
+    rua_doc = {"totals": {"reports": 2, "messages": 500}, "policy_check": {"seen": []}, "failing_streams": [],
+               "by_header_from": [{"domain": "example.com", "pass": 400, "fail": 0},
+                                  {"domain": "sub.example.com", "pass": 100, "fail": 0}],
+               "spf_only_senders": [{"source_ip": "192.0.2.10", "spf_only": 7, "header_from": ["sub.example.com"]}]}
+    d = dns()
+    d["sub.example.com"] = dict(d["example.com"], domain="sub.example.com", dmarc_source="_dmarc.sub.example.com")
+    g = audit.gate_verdict(d, rua_doc, None, ["example.com", "sub.example.com"])
+    assert g["domains"]["example.com"]["verdict"] == "go"
+    assert g["domains"]["sub.example.com"]["verdict"] == "no_go"
+    rua_doc["spf_only_senders"][0]["header_from"] = ["mail.example.com"]  # unaudited: the apex's
+    g = audit.gate_verdict(d, rua_doc, None, ["example.com", "sub.example.com"])
+    assert g["domains"]["example.com"]["verdict"] == "no_go" and g["domains"]["sub.example.com"]["verdict"] == "go"
+
+
+def test_an_spf_and_dkim_pass_without_the_envelope_column_is_not_dkim_carried(tmp_path):
+    cols = [c for c in COLS if c != "Sender mail from domain"]
+    path = tmp_path / "log.csv"
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        w.writerow(["<m1@a>", "u1@example.com", "billing@example.com", "example.com", "Delivered", "Inbox/folder",
+                    "Statement", "pass", "pass", "pass"])
+    doc = audit.run_maillog(str(path), auth_column="DMARC")
+    assert doc["alignment"]["spf_and_dkim"] == 1 and doc["alignment"]["dkim_aligned"] == 0
