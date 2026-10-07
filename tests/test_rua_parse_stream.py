@@ -118,3 +118,37 @@ def test_the_stream_is_closed_after_parsing(tmp_path):
     rep = rua_parse.parse_report(stream, label)
     assert len(rep["records"]) == 50
     assert stream.fh.closed and all(f.closed for f in stream.owned)
+
+
+def test_damaged_gzip_files_are_skipped_never_fatal(tmp_path):
+    xml = report_xml(5)
+    good = gzip.compress(xml)
+    bad_crc = bytearray(good)
+    bad_crc[-8:-4] = b"\0\0\0\0"
+    damaged = {"bad_crc.xml.gz": bytes(bad_crc), "header_only.xml.gz": good[:10],
+               "flipped.xml.gz": good[:20] + bytes([good[20] ^ 0xFF]) + good[21:],
+               "method.xml.gz": good[:2] + b"\x07" + good[3:]}
+    for name, blob in damaged.items():
+        (tmp_path / name).write_bytes(blob)
+    gz(tmp_path / "lying_small.xml.gz", xml, isize=1)  # the trailer passes the declared-size check, then lies
+    gz(tmp_path / "fine.xml.gz", xml)
+    warnings = []
+    reports, skipped = rua_parse.load_reports(sorted(tmp_path.iterdir()), warnings)
+    assert len(reports) == 1 and len(reports[0]["records"]) == 5
+    assert skipped == 5 and len(warnings) == 5 and all(w.startswith("skipped ") for w in warnings)
+    assert all("damaged file" in w and "not an aggregate report" not in w for w in warnings)
+    result = rua_parse.analyse([str(tmp_path)])  # the whole sweep over the folder survives them too
+    doc = result[0] if isinstance(result, tuple) else result
+    assert doc["totals"]["reports"] == 1
+
+
+def test_only_record_elements_count_and_several_feedback_blocks_merge(tmp_path):
+    with_sub = report_xml(3).replace(b"</feedback>", b"<subrecord><row><count>500</count></row></subrecord></feedback>")
+    (tmp_path / "a.xml").write_bytes(with_sub)
+    rep = rua_parse.load_reports([tmp_path / "a.xml"], [])[0][0]
+    assert len(rep["records"]) == 3 and sum(r["count"] for r in rep["records"]) == sum(1 + i % 7 for i in range(3))
+    head = b'<?xml version="1.0" encoding="UTF-8"?>'
+    two = head + b"<wrapper>" + report_xml(2)[len(head):] + report_xml(4)[len(head):] + b"</wrapper>"
+    (tmp_path / "two.xml").write_bytes(two)
+    rep = rua_parse.load_reports([tmp_path / "two.xml"], [])[0][0]
+    assert len(rep["records"]) == 6 and rep["report_id"] == "2"  # one report under the first block's metadata

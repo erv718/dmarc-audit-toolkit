@@ -412,13 +412,46 @@ def maillog_window(rows, header, cols, sender_domain=None):
             "hours": round((hi - lo).total_seconds() / 3600, 1), "rows": n}
 
 
-def run_maillog(csv_path, sender_domain=None, auth_column=None, vendor_domains=(), columns=None):
+def windows_by_domain(rows, header, cols, names, sender_domain=None):
+    """{audited domain: {"own": window, "subdomains": window}} over the rows
+    attributed the way maillog_by_domain attributes verdicts: the domain's
+    own rows, and the rows of its subdomains that are not audited themselves.
+    A window is None when no such row carries a time the toolkit can read."""
+    col = next((c for c in TIME_COLUMNS if c in header), None)
+    if not col:
+        return {}
+    spans = {}
+    for row in rows:
+        if not dedupe.in_scope(row, cols, sender_domain):
+            continue
+        dom = dedupe.field(row, cols, "domain").lower() or dedupe.field(row, cols, "sender").lower().rpartition("@")[2]
+        home, is_sub = _home_domain(_norm_name(dom), names)
+        if home is None:
+            continue
+        t = _parse_time(row.get(col))
+        if t is None:
+            continue
+        key = (home, "subdomains" if is_sub else "own")
+        lo, hi, n = spans.get(key) or (None, None, 0)
+        spans[key] = (t if lo is None or t < lo else lo, t if hi is None or t > hi else hi, n + 1)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    out = {d: {"own": None, "subdomains": None} for d in names}
+    for (d, part), (lo, hi, n) in spans.items():
+        out[d][part] = {"column": col, "from": lo.strftime(fmt), "to": hi.strftime(fmt),
+                        "hours": round((hi - lo).total_seconds() / 3600, 1), "rows": n}
+    return out
+
+
+def run_maillog(csv_path, sender_domain=None, auth_column=None, vendor_domains=(), columns=None, domains=()):
     """dedupe as a library call. Returns dedupe.build_doc's document.
 
     columns: {logical name: column name} overrides for MAILLOG_COLUMNS (the
     --*-column flags). The auth column is auto-detected (a 'DMARC' column)
     when not given, because a verdict column the caller forgot to name
-    silently turns the failure counts into delivery-action guesses."""
+    silently turns the failure counts into delivery-action guesses. domains:
+    the audited names; with them the time span is recorded per domain too
+    (window_by_domain), so each domain's numbers can say how far they reach."""
+    sender_domain = (sender_domain or "").strip().lower().rstrip(".") or None
     path = repo_path(csv_path)
     if path.is_dir():
         raise UsageError(f"{path} is a directory, expected a CSV")
@@ -460,6 +493,9 @@ def run_maillog(csv_path, sender_domain=None, auth_column=None, vendor_domains=(
     window = maillog_window(rows, header, cols, sender_domain)
     if window:
         doc["window"] = window
+        names = [n for n in dict.fromkeys(_norm_name(d) for d in domains) if n]
+        if names:
+            doc["window_by_domain"] = windows_by_domain(rows, header, cols, names, sender_domain)
     if detected:
         doc["auth_column_detected"] = True
     if missing_opt:
@@ -525,6 +561,11 @@ def maillog_by_domain(maillog_doc, domains=()):
         c = _counters(own[d])
         subs = under[d]
         c["subdomains_total"] = dict(_counters([v for vs in subs.values() for v in vs]), domains=sorted(subs))
+        w = (maillog_doc.get("window_by_domain") or {}).get(d) or {}
+        if w.get("own"):
+            c["window"] = w["own"]  # how far this domain's own rows reach, often less than the whole log
+        if w.get("subdomains"):
+            c["subdomains_total"]["window"] = w["subdomains"]
         out[d] = c
     c = _counters([v for vs in other.values() for v in vs])
     c["sender_domains"] = sorted(
@@ -1475,7 +1516,7 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
 
     rua_doc = run_rua(rua_paths, known, min_volume, fail_threshold, since, until,
                       expect_policy, retiring) if rua_paths else None
-    maillog_doc = run_maillog(maillog, sender_domain, auth_column, vendor_domains, columns) if maillog else None
+    maillog_doc = run_maillog(maillog, sender_domain, auth_column, vendor_domains, columns, domains) if maillog else None
     headers_doc = run_headers(header_files, authserv_id, strict) if header_files else None
     tenant_docs = {name: (run_tenant_export(path, name) if path else None)
                    for name, path in tenant_paths.items()}

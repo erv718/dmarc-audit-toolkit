@@ -126,13 +126,13 @@ In a real run you would leave both exactly as the generator wrote them.
 
 # DMARC rollout - status and next steps, 2026-09-29
 
-**example.com is at p=reject. 21 messages from example.com failed with no passing copy in the mail log's 9-day span (2026-05-01 to 2026-05-09): 3 from 1 of our own senders (statements@example.com x3); 18 from 5 addresses that look like spoofing and are being handled by the policy. No policy step is left; what is left is keeping our own senders passing.**
+**example.com is at p=none. 6 senders still fail. The next safe step is
 p=quarantine at pct=10, and it is ready once the statements system (3
 misconfigured messages) is DKIM-signed.**
 
 ## Where we stand (last 30 days, deduplicated)
 
-- **Genuine failures: 21** (raw counts would say 33 - the gap is relay echoes, not broken senders), over the mail log's 9-day span (2026-05-01 to 2026-05-09)
+- **Genuine failures: 21** (raw counts would say 33)
 - **Delivered despite failing: 3** - purchase-order mail from our own
   statements system, arriving only because of an override
 - **Spoofing blocked by receivers: 300 rejected** - voicemail and ACH lures

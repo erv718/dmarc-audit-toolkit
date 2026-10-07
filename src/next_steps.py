@@ -514,10 +514,13 @@ def span_phrase(window):
     hours = _f(window.get("hours"))
     if hours is None:
         return "the mail log's span (%s to %s UTC)" % (_stamp(window.get("from")), _stamp(window.get("to")))
-    if hours >= 48:
-        return "the mail log's %d-day span (%s to %s)" % (round(hours / 24), str(window.get("from"))[:10],
+    if hours >= 48:  # halves round up: 60 hours is a 3-day span, as 84 is a 4-day one
+        return "the mail log's %d-day span (%s to %s)" % (int(hours / 24 + 0.5), str(window.get("from"))[:10],
                                                          str(window.get("to"))[:10])
-    return "the mail log's %d-hour span (%s to %s UTC)" % (round(hours), _stamp(window.get("from")),
+    if hours < 1:
+        return "the mail log's %d-minute span (%s to %s UTC)" % (int(hours * 60 + 0.5), _stamp(window.get("from")),
+                                                                  _stamp(window.get("to")))
+    return "the mail log's %d-hour span (%s to %s UTC)" % (int(hours + 0.5), _stamp(window.get("from")),
                                                             _stamp(window.get("to")))
 
 
@@ -624,7 +627,7 @@ def own_domain_view(report, view, org):
             "delivered_despite_fail": _n(c.get("delivered_despite_fail")),
             "by_likely": {k: _n(v) or 0 for k, v in by_likely.items()} if by_likely else None,
             "top_senders": _entries(c.get("top_senders"), SENDER_KEYS) or [], "senders": senders,
-            "subdomains": subs}
+            "subdomains": subs, "window": c.get("window") if isinstance(c.get("window"), dict) else None}
 
 
 def streams(view, rua, own=None):
@@ -636,7 +639,8 @@ def streams(view, rua, own=None):
         for s in own["senders"]:
             groups[s["likely"] if s.get("likely") in groups else "unknown"].append(s)
         scope = "unaudited subdomains" if own.get("subdomains") else "own domain"
-        return {"basis": "mail log", "scope": scope, "window": (view or {}).get("window"),
+        # the domain's own span when the report carries it: the whole log often reaches further
+        return {"basis": "mail log", "scope": scope, "window": own.get("window") or (view or {}).get("window"),
                 "own": groups["likely_misconfigured_sender"],
                 "spoof": groups["likely_spoof"], "unclear": groups["unknown"],
                 "genuine_failures": own["genuine_failures"], "logical_messages": own["logical_messages"],

@@ -63,6 +63,7 @@ import socket
 import sys
 import threading
 import zipfile
+import zlib
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -169,7 +170,13 @@ class _Capped:
     def read(self, n=-1):
         if n is None or n < 0 or n > CHUNK_BYTES:
             n = CHUNK_BYTES
-        chunk = self.fh.read(min(n, MAX_BYTES + 1 - self.total))
+        try:
+            chunk = self.fh.read(min(n, MAX_BYTES + 1 - self.total))
+        except (OSError, EOFError, zlib.error) as exc:
+            # a damaged archive (bad CRC, truncated, corrupt deflate, a lying trailer under the
+            # cap) surfaces here, mid-parse: it is this one file's problem, so it becomes the
+            # ValueError the caller already skips with a warning, never a crash
+            raise ValueError(f"{self.what}damaged file: {exc}") from exc
         if chunk:
             self.total += len(chunk)
             if self.total > MAX_BYTES:
@@ -438,7 +445,11 @@ def parse_report(data, label="report"):
     for its text; the stream is closed afterwards). Tolerates namespaces,
     missing elements and odd casing; raises ValueError or ET.ParseError on a
     broken file, and ValueError when a DTD or entity declaration appears
-    anywhere in the document.
+    anywhere in the document. Every <record> in the document is read,
+    wherever it sits, and the first <report_metadata> and <policy_published>
+    describe the report: a container holding several <feedback> elements (no
+    reporter emits one) comes back as one report under the first one's
+    policy; one report per archive member is the supported shape.
 
     Record-level problems never raise: rep["warnings"] lists them, a record
     with a missing or unparsable <count> is kept with count 1 and counted in
@@ -453,16 +464,16 @@ def parse_report(data, label="report"):
         i = 0
         events = ET.iterparse(_DtdGuard(stream), events=("end",))
         for _, el in events:
-            tag = el.tag.lower() if isinstance(el.tag, str) else ""
-            if tag.endswith("record"):
+            name = _local(el.tag)
+            if name == "record":
                 i += 1
                 _record(el, i, rep, label)
                 el.clear()  # the records are the bulk of a report; only the empty shell stays in the tree
-            elif meta is None and tag.endswith("report_metadata"):
+            elif meta is None and name == "report_metadata":
                 meta = el
                 rep.update(org_name=_text(el, "org_name"), email=_text(el, "email"), report_id=_text(el, "report_id"),
                            begin=_int(_text(el, "date_range", "begin")), end=_int(_text(el, "date_range", "end")))
-            elif pol is None and tag.endswith("policy_published"):
+            elif pol is None and name == "policy_published":
                 pol = el
                 rep["policy"] = {k: _text(el, k, lower=True) for k in ("domain", "adkim", "aspf", "p", "sp", "pct")}
         _find_root(events.root)  # a document with none of the report parts is not a report
@@ -503,7 +514,8 @@ def load_reports(files, warnings=None):
                 rep = parse_report(data, label)
             except (ET.ParseError, ValueError, OverflowError, RecursionError) as exc:
                 msg = _clean(str(exc), 200)
-                warn(f"skipped {label}: {msg}" if " cap" in msg else f"skipped {label}: not an aggregate report ({msg})")
+                plain = " cap" in msg or "damaged file" in msg  # the file is bad, not merely not a report
+                warn(f"skipped {label}: {msg}" if plain else f"skipped {label}: not an aggregate report ({msg})")
                 skipped += 1
                 continue
             for msg in rep["warnings"]:

@@ -692,3 +692,43 @@ def test_plan_holds_from_the_merged_gate_are_reworded_as_conditions():
     assert next_steps.gate_reasons(rep, "example.com") == [
         "4 logical message(s) from this domain failed with no passing copy (deduplicated; 2 more excepted)"]
     assert "first in audit.toml" in next_steps.TYPED_HEADLINES
+
+
+def test_the_one_liner_states_the_headline_domains_own_span(tmp_path):
+    import csv as _csv
+    cols = ["Email date (UTC)", "Internet message ID", "Sender address", "Sender domain", "Sender mail from domain",
+            "Recipients", "Subject", "Delivery action", "Latest delivery location", "DMARC"]
+    rows = [["2026-05-01 09:00:00", "<c1@x>", "hr@corp.example", "corp.example", "corp.example", "u@example.com",
+             "Hello", "Delivered", "Inbox/folder", "pass"],
+            ["2026-05-02 09:00:00", "<c2@x>", "hr@corp.example", "corp.example", "corp.example", "u@example.com",
+             "Hello", "Blocked", "Quarantine", "fail"]]
+    rows += [["2026-04-01 00:00:00" if i == 0 else "2026-05-09 00:00:00", "<o%d@x>" % i, "news@other.example",
+              "other.example", "other.example", "u@example.com", "News", "Delivered", "Inbox/folder", "pass"]
+             for i in range(2)]
+    path = tmp_path / "log.csv"
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = _csv.writer(fh)
+        w.writerow(cols)
+        w.writerows(rows)
+    domains = ["corp.example", "other.example"]
+    rep = audit.build_report(domains=domains, maillog=str(path), offline=True, auth_column="DMARC",
+                             domain_sources={d: ["tenant"] for d in domains},
+                             volume={"corp.example": 100, "other.example": 1})
+    assert rep["gate"]["headline_domain"] == "corp.example"
+    assert rep["maillog"]["by_domain"]["corp.example"]["window"]["hours"] == 24.0
+    assert rep["maillog"]["window"]["hours"] == 38 * 24.0  # the whole log reaches much further
+    doc = next_steps.build(rep)
+    assert "in the mail log's 24-hour span (2026-05-01 09:00 to 2026-05-02 09:00 UTC)" in doc["one_liner"]
+    assert any("over the mail log's 38-day span (2026-04-01 to 2026-05-09)" in l for l in doc["stand"]["lines"])
+    # a scope typed in mixed case still carries the span
+    scoped = audit.run_maillog(str(path), sender_domain="Corp.Example", auth_column="DMARC")
+    assert scoped["window"] == audit.run_maillog(str(path), sender_domain="corp.example", auth_column="DMARC")["window"]
+    assert scoped["window"]["hours"] == 24.0
+
+
+def test_span_phrase_rounds_halves_up_and_has_a_minute_form():
+    w = {"from": "2026-10-05T22:00:00Z", "to": "2026-10-05T22:30:00Z"}
+    assert next_steps.span_phrase(dict(w, hours=0.5)) == "the mail log's 30-minute span (2026-10-05 22:00 to 2026-10-05 22:30 UTC)"
+    assert next_steps.span_phrase(dict(w, hours=2.5)).startswith("the mail log's 3-hour span")
+    assert next_steps.span_phrase(dict(w, hours=60.0)).startswith("the mail log's 3-day span")
+    assert next_steps.span_phrase(dict(w, hours=84.0)).startswith("the mail log's 4-day span")
