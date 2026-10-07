@@ -175,19 +175,25 @@ def evidence_for(report, domain):
                 # exceptions the gate applied to them - the same numbers the status document shows
                 by = own.get("by_likely") or {}
                 gate_dom = ((report.get("gate") or {}).get("domains") or {}).get(domain) or {}
-                excepted = gate_dom.get("excepted_failures") or 0
+                excepted = (gate_dom.get("excepted_by_likely") or {}).get("likely_misconfigured_sender")
+                if excepted is None:  # a gate without the per-label split: every excepted failure counts
+                    excepted = gate_dom.get("excepted_failures") or 0
             else:
+                # a report from before the attribution: the whole log, less everything excepted
                 by = (ml.get("counters") or {}).get("by_likely") or {}
                 excepted = gate_exc.get("excepted_maillog_failures") or 0
             n = by.get("likely_misconfigured_sender", 0)
-            if n:
+            remaining = n - min(excepted, n)
+            if remaining > 0:  # only what the gate did not formally except holds the step
                 ev["legit_failing"].append("%d message(s) in the mail log failed from a sender that looks like your own misconfigured system, not a spoof%s"
-                                           % (n, " (%d failure(s) are excepted in the gate)" % excepted if excepted else ""))
+                                           % (remaining, " (%d more are excepted in the gate)" % excepted if excepted else ""))
         if (ml.get("alignment") or {}).get("available"):
             ev["dkim_evidence"] = True
+        audited = {str(x).lower() for x in ((report.get("inputs") or {}).get("domains") or [])}
+        audited |= {str(x).lower() for x in ((report.get("gate") or {}).get("domains") or {})}
         for s in ml.get("spf_only_senders") or []:
             d = (s.get("domain") or "").lower()
-            if d == domain or d.endswith("." + domain):
+            if d == domain or (d.endswith("." + domain) and d not in audited):  # an audited subdomain is its own gate
                 ev["spf_only"].append("%s (mail log, %d msgs)" % (s.get("sender") or d, s.get("spf_only") or 0))
     rua = report.get("rua") or {}
     if rua:

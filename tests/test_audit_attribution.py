@@ -5,6 +5,7 @@ no network."""
 
 import csv
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -484,3 +485,41 @@ def test_the_mcp_wrapper_reads_the_direction_column(tmp_path):
     assert details["<i1@x>"]["passed"] is False
     loud = mcp_server.dedupe_maillog(str(path), auth_column="DMARC", direction_column="Mail direction")
     assert "Mail direction" in loud["missing_optional_columns"]
+
+
+def test_the_mcp_wrapper_buckets_alignment_and_lists_spf_only_senders(tmp_path):
+    import mcp_server
+    path = tmp_path / "log.csv"
+    _write(path, COLUMNS + ["SPF", "DKIM"], [
+        ["2026-05-01 09:00:00", "<a@x>", "billing@corp.example", "corp.example", "corp.example",
+         "u@example.com", "Statement", "Delivered", "Inbox/folder", "pass", "pass", "none"],
+        ["2026-05-01 09:00:00", "<b@x>", "news@corp.example", "corp.example", "bounce.vendor.example",
+         "u@example.com", "News", "Delivered", "Inbox/folder", "pass", "fail", "pass"]])
+    reply = mcp_server.dedupe_maillog(str(path), auth_column="DMARC")
+    assert reply["alignment"]["available"] and reply["alignment"]["spf_only"] == 1 and reply["alignment"]["dkim_aligned"] == 1
+    assert [s["sender"] for s in reply["spf_only_senders"]] == ["billing@corp.example"]
+    assert any(f["id"] == "MAILFLOW-010" for f in reply["findings"])
+    loud = mcp_server.dedupe_maillog(str(path), auth_column="DMARC", spf_column="SPF verdict")
+    assert "SPF verdict" in loud["missing_optional_columns"]
+
+
+def test_the_mcp_audit_reads_the_settings_file(tmp_path):
+    import mcp_server
+    path = tmp_path / "log.csv"
+    _write(path, COLUMNS, [["2026-05-01 09:00:00", "<f@x>", "printer@corp.example", "corp.example",
+                            "printer.vendor.example", "u@corp.example", "Invoice", "Blocked", "Quarantine", "fail"]])
+    cfg = tmp_path / "audit.toml"
+    cfg.write_text('[audit]\nvendor_domains = ["vendor.example"]\n\n[[exceptions]]\nmatch = "vendor.example"\n'
+                   'reason = "printer"\nuntil = 2099-01-01\nremoval_criterion = "replaced"\n', encoding="utf-8")
+    out = mcp_server.ROOT / "audit-out" / ("mcp-test-%d" % os.getpid())
+    try:
+        reply = mcp_server.run_audit(domains=["corp.example"], maillog=str(path), offline=True, out_dir=str(out),
+                                     config=str(cfg))
+        assert "error" not in reply, reply
+        assert reply["exceptions"]["applied"][0]["match"] == "vendor.example"
+        assert reply["exceptions"]["excepted_maillog_failures"] == 1
+        assert reply["gate"]["domains"]["corp.example"]["verdict"] != "no_go"
+        assert str(reply["settings"]).endswith("audit.toml")
+    finally:
+        import shutil
+        shutil.rmtree(out, ignore_errors=True)

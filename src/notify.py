@@ -19,6 +19,11 @@ or the environment and is never printed. Teams is designed in
 webhook.
 
   python src/notify.py --report audit-out/report.json --dry-run
+  python src/notify.py --report audit-out/latest/report.json --senders audit-out/senders.json --metrics audit-out/metrics.json --dry-run
+
+The newly-identified-senders and trend lines need senders.json and
+metrics.json, which collect.py supplies when it posts; standalone, pass them
+with --senders and --metrics or the message carries the rest only.
   python src/notify.py --report audit-out/report.json --previous audit-out/history/2026-01-01/report.json --plan audit-out/plan.json
 
 Exit codes: 0 posted or printed, 1 the post failed, 2 usage error.
@@ -83,16 +88,30 @@ def sender_label(u):
 
 
 def census_top(census, n=CENSUS_TOP):
-    """(labels, failing) for a census dict: the n worst entries as short labels,
-    senders when the census has them, else envelope domains; entries with no
-    genuine failures are skipped. failing counts every failing entry."""
-    rows = census.get("by_sender") or census.get("by_envelope") or []
-    rows = [r for r in rows if isinstance(r, dict) and r.get("genuine_failures")]
+    """(labels, failing) for a census dict: the n worst entries as short labels
+    made of domains only - envelope domains with their genuine failures, and
+    sender rows (the delta's new senders) folded to their From domain and
+    envelope domain first - never a From address: the message is aggregates
+    only. Entries with no genuine failures are skipped; failing counts every
+    failing entry."""
+    rows = [r for r in (census.get("by_envelope") or []) if isinstance(r, dict) and r.get("genuine_failures")]
+    if not rows:
+        folded = {}
+        for r in census.get("by_sender") or []:
+            if not isinstance(r, dict) or not r.get("genuine_failures"):
+                continue
+            dom = str(r.get("domain") or str(r.get("sender") or "").rpartition("@")[2] or "?").lower()
+            env = str(r.get("envelope_domain") or "").lower()
+            f = folded.setdefault((dom, env), {"domain": dom, "envelope_domain": env, "genuine_failures": 0,
+                                              "likely": r.get("likely") or "unknown"})
+            f["genuine_failures"] += int(r["genuine_failures"])
+        rows = sorted(folded.values(), key=lambda r: (-r["genuine_failures"], r["domain"]))
     out = []
     for r in rows[:n]:
-        name = r.get("sender") or r.get("envelope_domain") or "?"
-        via = (" via %s" % r["envelope_domain"]) if r.get("sender") and r.get("envelope_domain") else ""
-        out.append("%s x%d%s (%s)" % (name, int(r["genuine_failures"]), via, r.get("likely") or "unknown"))
+        name = r.get("envelope_domain") or r.get("domain") or "?"
+        if r.get("domain") and r.get("envelope_domain") and r["domain"] != r["envelope_domain"]:
+            name = "%s via %s" % (r["domain"], r["envelope_domain"])
+        out.append("%s x%d (%s)" % (name, int(r["genuine_failures"]), r.get("likely") or "unknown"))
     return out, len(rows)
 
 
@@ -154,7 +173,7 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     per = gate.get("domains") or {}
     for dom in sorted(per):
         g = per[dom]
-        line = "- `%s`: p=%s, gate *%s*, next: %s" % (dom, g.get("current_policy", "?"), g.get("verdict", "?"),
+        line = "- `%s`: p=%s, gate *%s*, next: %s" % (dom, g.get("current_policy") or "unknown", g.get("verdict", "?"),
                                                       g.get("next_step", "?"))
         own = by_dom.get(dom)
         if isinstance(own, dict) and own.get("genuine_failures") is not None:
@@ -270,7 +289,10 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
         if any(x is not None for x in pr):
             parts.append("pass rate " + ", ".join("-" if x is None else "%.1f%%" % (100 * float(x)) for x in pr))
         if parts:
-            lines.append("- trend over the last %d runs (%s): %s" % (len(pts), trend_word(gf), "; ".join(parts)))
+            known_gf = [x for x in gf if x is not None]
+            # with no failure counts to compare, the pass rate decides: a higher rate is the improvement
+            word = trend_word(gf) if len(known_gf) >= 2 else trend_word([None if x is None else -float(x) for x in pr])
+            lines.append("- trend over the last %d runs (%s): %s" % (len(pts), word, "; ".join(parts)))
 
     if plan:
         ch = plan.get("changes") or []
@@ -313,6 +335,8 @@ def main():
     ap.add_argument("--report", required=True, help="this run's report.json")
     ap.add_argument("--previous", help="the previous run's report.json, for deltas (report.delta wins when present)")
     ap.add_argument("--plan", help="this run's plan.json")
+    ap.add_argument("--senders", help="collect.py's senders.json: 'newly identified' then means new to the whole history")
+    ap.add_argument("--metrics", help="collect.py's metrics.json, for the trend over the last runs")
     ap.add_argument("--webhook", help="webhook URL (default: SLACK_WEBHOOK_URL or TEAMS_WEBHOOK_URL from .env)")
     ap.add_argument("--target", choices=TARGETS, help="payload shape (default: guessed from the URL; slack)")
     ap.add_argument("--dry-run", action="store_true", help="print the message, post nothing")
@@ -322,7 +346,17 @@ def main():
     report = load(args.report)
     previous = load(args.previous) if args.previous else None
     plan = load(args.plan) if args.plan else None
-    text = summarize(report, previous, plan)
+    known = history = None
+    if args.senders:
+        known = set((load(args.senders).get("senders") or {}))
+    if args.metrics:
+        try:
+            history = json.loads(Path(args.metrics).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as err:
+            die("cannot read %s: %s" % (args.metrics, err))
+        if not isinstance(history, list):
+            die("%s: expected the metrics list collect.py writes" % args.metrics)
+    text = summarize(report, previous, plan, known_senders=known, history=history)
     if args.dry_run:
         print(text)
         return

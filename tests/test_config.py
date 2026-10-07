@@ -104,3 +104,10 @@ def test_matches_stream_and_verdict():
     verdict = {"sender": "billing@example.com", "envelope_domain": "bounce.vendor.example"}
     assert config.matches_verdict(addr, verdict) and config.matches_verdict(dom, verdict)
     assert not config.matches_verdict(ip, verdict)  # the mail log carries no source IP at this grain
+
+
+def test_a_domain_exception_never_excepts_the_domains_own_spoofs():
+    own = {"match": "example.com", "kind": "domain"}
+    spoof = {"sender": "ceo@example.com", "envelope_domain": "spam.invalid"}
+    assert not config.matches_verdict(own, spoof)  # the From domain is the one being spoofed
+    assert config.matches_verdict({"match": "spam.invalid", "kind": "domain"}, spoof)  # the envelope is the sender

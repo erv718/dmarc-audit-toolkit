@@ -60,3 +60,34 @@ def test_payload_seam_and_target_detection():
     assert notify.target_for("https://hooks.slack.com/services/x") == "slack"
     assert notify.target_for("https://example.webhook.office.com/webhookb2/x") == "teams"
     assert notify.target_for(None) == "slack"
+
+
+def test_the_message_names_domains_never_addresses():
+    census = {"by_envelope": [{"envelope_domain": "bounce.vendor.example", "genuine_failures": 7, "likely": "likely_misconfigured_sender"},
+                              {"envelope_domain": "spam.invalid", "genuine_failures": 3, "likely": "likely_spoof"}],
+              "by_sender": [{"sender": "billing@example.com", "domain": "example.com",
+                             "envelope_domain": "bounce.vendor.example", "genuine_failures": 7, "likely": "likely_misconfigured_sender"}]}
+    labels, failing = notify.census_top(census)
+    assert labels == ["bounce.vendor.example x7 (likely_misconfigured_sender)", "spam.invalid x3 (likely_spoof)"] and failing == 2
+    labels, failing = notify.census_top({"by_sender": census["by_sender"] + [
+        {"sender": "alerts@example.com", "domain": "example.com", "envelope_domain": "bounce.vendor.example",
+         "genuine_failures": 2, "likely": "likely_misconfigured_sender"}]})
+    assert labels == ["example.com via bounce.vendor.example x9 (likely_misconfigured_sender)"] and failing == 1
+    rep = report()
+    rep["maillog"]["census"] = census
+    text = notify.summarize(rep)
+    assert "@" not in text.split("top failing senders (census): ")[1].splitlines()[0]
+
+
+def test_the_trend_word_falls_back_to_the_pass_rate():
+    history = [{"genuine_failures": None, "rua_pass_rate": 0.70}, {"genuine_failures": None, "rua_pass_rate": 0.77}]
+    text = notify.summarize(report(), history=history)
+    assert "trend over the last 2 runs (improving): pass rate 70.0%, 77.0%" in text
+    history = [{"genuine_failures": None, "rua_pass_rate": 0.80}, {"genuine_failures": None, "rua_pass_rate": 0.72}]
+    assert "(worsening)" in notify.summarize(report(), history=history)
+
+
+def test_a_domain_without_a_record_is_not_p_none():
+    rep = report()
+    rep["gate"]["domains"]["example.com"]["current_policy"] = None
+    assert "p=unknown" in notify.summarize(rep) and "p=None" not in notify.summarize(rep)

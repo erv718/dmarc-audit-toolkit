@@ -77,3 +77,40 @@ def test_notify_switch_off_prints_instead_of_posting(tmp_path):
     assert p.returncode in (0, 1), p.stderr
     assert "summary not posted: [notify] enabled = false" in p.stderr
     assert "*DMARC audit*" in p.stdout
+
+
+def test_latest_holds_only_this_runs_files(tmp_path):
+    out = tmp_path / "out"
+    p = run("example.com", "--no-config", "--no-notify", "--out", str(out), *OFFLINE)
+    assert p.returncode in (0, 1), p.stderr
+    stray = out / "latest" / "plan.json"  # as if an earlier run with DNS had written a plan
+    stray.write_text("{}", encoding="utf-8")
+    p = run("example.com", "--no-config", "--no-notify", "--out", str(out), *OFFLINE)
+    assert p.returncode in (0, 1), p.stderr
+    assert not stray.exists() and (out / "latest" / "next_steps.md").exists()
+
+
+def test_domains_from_the_settings_file_are_labelled_as_such(tmp_path):
+    cfg = tmp_path / "audit.toml"
+    cfg.write_text('[audit]\ndomains = ["example.com"]\n', encoding="utf-8")
+    out = tmp_path / "out"
+    p = run("--config", str(cfg), "--no-notify", "--out", str(out), *OFFLINE)
+    assert p.returncode in (0, 1), p.stderr
+    report = json.loads((out / "latest" / "report.json").read_text(encoding="utf-8"))
+    assert report["gate"]["headline_source"] == "first in audit.toml"
+    inv = json.loads((out / "latest" / "inventory.json").read_text(encoding="utf-8"))
+    assert "settings" in inv["domains"][0]["sources"] and "cli" not in inv["domains"][0]["sources"]
+    p = run("example.com", "--config", str(cfg), "--no-notify", "--out", str(out), *OFFLINE)  # typed: the command line
+    report = json.loads((out / "latest" / "report.json").read_text(encoding="utf-8"))
+    assert report["gate"]["headline_source"] == "first on the command line"
+
+
+def test_run_json_records_the_notification_outcome(tmp_path):
+    cfg = tmp_path / "audit.toml"
+    cfg.write_text("[notify]\nenabled = false\n", encoding="utf-8")
+    out = tmp_path / "out"
+    p = run("example.com", "--config", str(cfg), "--out", str(out), *OFFLINE,
+            env_extra={"SLACK_WEBHOOK_URL": "https://hooks.example/never-called"})
+    assert p.returncode in (0, 1), p.stderr
+    run_doc = json.loads((out / "latest" / "run.json").read_text(encoding="utf-8"))
+    assert any("summary not posted: [notify] enabled = false" in n for n in run_doc["notes"])

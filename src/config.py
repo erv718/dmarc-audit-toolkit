@@ -229,11 +229,12 @@ def matches_stream(exc, stream):
 
 def matches_verdict(exc, verdict):
     """Does an exception cover one deduplicated mail-log message? An address
-    matches the From address exactly; a domain matches the envelope domain or
-    the From domain. The mail log carries no source IP at this grain."""
+    matches the From address exactly; a domain matches the envelope (MAIL
+    FROM) domain, the sender's own identity - never the From domain, which is
+    the one being spoofed, so a domain match can never except a domain's own
+    spoofs. The mail log carries no source IP at this grain."""
     if exc["kind"] == "address":
         return (verdict.get("sender") or "").lower() == exc["match"]
     if exc["kind"] == "domain":
-        sender_dom = (verdict.get("sender") or "").rpartition("@")[2]
-        return _domain_under(verdict.get("envelope_domain"), exc["match"]) or _domain_under(sender_dom, exc["match"])
+        return _domain_under(verdict.get("envelope_domain"), exc["match"])
     return False

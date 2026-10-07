@@ -100,7 +100,7 @@ the audience line above them names the sources and their sizes):
 ```markdown
 **example.com is at p=reject. 21 messages from example.com failed with no passing copy in the mail log's 9-day span (2026-05-01 to 2026-05-09): 3 from 1 of our own senders (statements@example.com x3); 18 from 5 addresses that look like spoofing and are being handled by the policy. No policy step is left; what is left is keeping our own senders passing.**
 
-## Where we stand (last 30 days, deduplicated)
+## Where we stand (2026-09-01 to 2026-09-02, deduplicated)
 
 - **Genuine failures: 21** (raw counts would say 33 - the gap is relay echoes, not broken senders), over the mail log's 9-day span (2026-05-01 to 2026-05-09)
 - **Delivered despite failing: 3** - these only arrive because of our own overrides; outside receivers are not as forgiving (statements@example.com x3)

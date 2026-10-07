@@ -665,3 +665,30 @@ def test_caveats_and_a_cut_short_log_reach_the_stand_section():
     assert any(l.startswith("**Caveat:** mail log: example.com row budget reached") for l in doc["stand"]["lines"])
     assert any("the log export was cut short (row budget kept only the newest 41h for example.com), so this count "
                "is a floor" in l for l in doc["stand"]["lines"])
+
+
+def test_plan_holds_from_the_merged_gate_are_reworded_as_conditions():
+    def reword(text):
+        for rx, fn in next_steps.PREREQ_REWORDS:
+            m = rx.match(text)
+            if m:
+                return fn(m)
+        return None
+    assert reword("3 message(s) in the mail log failed from a sender that looks like your own misconfigured system, "
+                  "not a spoof (2 more are excepted in the gate)") == "the 3 mail-log failures from our own systems are fixed"
+    assert reword("SPF-only aligned senders (news@example.com (mail log, 2 msgs)): they break on forwarding at reject "
+                  "- aligned DKIM first") == ("the SPF-only senders (news@example.com (mail log, 2 msgs)) are DKIM-signed, "
+                                               "because SPF alone breaks on forwarding")
+    assert reword("no aligned-DKIM evidence in this run (no aggregate reports; the mail log has no SPF/DKIM columns): "
+                  "run queries/dkim_alignment.kql or supply reports before this step - DKIM before reject, always"
+                  ).startswith("the run carries aligned-DKIM evidence")
+    m = next_steps.GAP_RX.match("4 logical message(s) from this domain failed with no passing copy "
+                                "(deduplicated; 2 more excepted); top senders: other@example.com x4")
+    assert m and m.group(1) == "4"
+    rep = {"gate": {"domains": {"example.com": {"reasons": [
+        "exception: 1 mail-log failure(s) from vendor.example excepted until 2099-01-01: r; remove when c",
+        "example.com: 4 logical message(s) from this domain failed with no passing copy (deduplicated; 2 more excepted)",
+        "step being gated: p=reject"]}}, "evidence": {"statement": "s"}}}
+    assert next_steps.gate_reasons(rep, "example.com") == [
+        "4 logical message(s) from this domain failed with no passing copy (deduplicated; 2 more excepted)"]
+    assert "first in audit.toml" in next_steps.TYPED_HEADLINES

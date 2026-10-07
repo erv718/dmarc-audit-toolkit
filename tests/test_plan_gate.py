@@ -62,9 +62,33 @@ def test_the_hold_counts_the_domains_own_rows_when_the_report_attributes_them():
     rep = make_report(maillog=ml, gate_exceptions={"excepted_maillog_failures": 7})
     rep["gate"]["domains"] = {"example.com": {"excepted_failures": 2}}
     ev = plan.evidence_for(rep, "example.com")
-    assert ev["legit_failing"][0].startswith("90 message(s) in the mail log")
-    assert "(2 failure(s) are excepted in the gate)" in ev["legit_failing"][0]
-    del ml["by_domain"]  # a report without the attribution falls back to the whole log, as before
+    assert ev["legit_failing"][0].startswith("88 message(s) in the mail log")  # 90 own, 2 of them excepted
+    assert "(2 more are excepted in the gate)" in ev["legit_failing"][0]
+    rep["gate"]["domains"]["example.com"]["excepted_by_likely"] = {"likely_misconfigured_sender": 90}
+    assert plan.evidence_for(rep, "example.com")["legit_failing"] == []  # everything excepted: no hold at all
+    del ml["by_domain"]  # a report without the attribution falls back to the whole log, less everything excepted
     ev = plan.evidence_for(rep, "example.com")
-    assert ev["legit_failing"][0].startswith("155 message(s) in the mail log")
-    assert "(7 failure(s) are excepted in the gate)" in ev["legit_failing"][0]
+    assert ev["legit_failing"][0].startswith("148 message(s) in the mail log")
+    assert "(7 more are excepted in the gate)" in ev["legit_failing"][0]
+
+
+def test_a_clean_domain_is_not_held_on_another_domains_failures():
+    ml = {"sender_domain": None, "counters": {"by_likely": {"likely_misconfigured_sender": 2}},
+          "alignment": {"available": True}, "spf_only_senders": [],
+          "by_domain": {"example.com": {"by_likely": {"likely_misconfigured_sender": 0}, "logical_messages": 2},
+                        "alpha.example": {"by_likely": {"likely_misconfigured_sender": 2}, "logical_messages": 2}}}
+    rep = make_report(maillog=ml)
+    rep["inputs"]["domains"] = ["example.com", "alpha.example"]
+    assert plan.evidence_for(rep, "example.com")["legit_failing"] == []
+    assert plan.evidence_for(rep, "alpha.example")["legit_failing"][0].startswith("2 message(s) in the mail log")
+
+
+def test_an_audited_subdomains_spf_only_sender_does_not_hold_the_apex():
+    ml = {"sender_domain": None, "counters": {"by_likely": {}}, "alignment": {"available": True},
+          "spf_only_senders": [{"sender": "news@sub.example.com", "domain": "sub.example.com", "spf_only": 2}]}
+    rep = make_report(maillog=ml)
+    rep["inputs"]["domains"] = ["example.com", "sub.example.com"]
+    assert plan.evidence_for(rep, "example.com")["spf_only"] == []
+    assert plan.evidence_for(rep, "sub.example.com")["spf_only"] == ["news@sub.example.com (mail log, 2 msgs)"]
+    rep["inputs"]["domains"] = ["example.com"]  # unaudited: it counts for its closest audited parent
+    assert plan.evidence_for(rep, "example.com")["spf_only"] == ["news@sub.example.com (mail log, 2 msgs)"]

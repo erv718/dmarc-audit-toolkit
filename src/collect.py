@@ -445,7 +445,8 @@ def render_metrics(entries, last=12):
     rows = entries[-last:]
     L = ["# Runs", "", "| run | domains: policy / gate | findings | genuine failures | pass rate | plan rows |", "|---|---|---|---|---|---|"]
     for e in rows:
-        doms = "; ".join("%s %s/%s" % (d, v.get("policy"), v.get("gate")) for d, v in list(e["domains"].items())[:4])
+        doms = "; ".join("%s %s/%s" % (d, v.get("policy") or "unknown", v.get("gate"))
+                         for d, v in list(e["domains"].items())[:4])
         if len(e["domains"]) > 4:
             doms += " (+%d)" % (len(e["domains"]) - 4)
         f = e.get("findings") or {}
@@ -664,15 +665,17 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print the summary instead of posting it")
     ap.add_argument("--ignore-setup", action="store_true", help="continue even if verify_setup reports a failure")
     ap.add_argument("--env-file", help="credentials file (default: <repo root>/.env)")
-    cfg = {}
+    cfg, defaults = {}, {}
     try:
         if not pre_args.no_config:
             cfg = config_mod.load(pre_args.config)
-            ap.set_defaults(**config_mod.collect_defaults(cfg))
+            defaults = config_mod.collect_defaults(cfg)
+            ap.set_defaults(**defaults)
         notify_cfg = config_mod.notify_settings(cfg)
     except config_mod.ConfigError as err:
         die(str(err))
     args = ap.parse_args()
+    from_settings = "domains" in defaults and args.domains is defaults["domains"]  # nothing typed: the file's list
     owners, owners_path, owners_problem = load_owners(args.owners, args.no_owners)
     if owners_problem and args.owners:
         die(owners_problem)
@@ -742,6 +745,9 @@ def main():
     if not inventory:
         die("nothing to audit: give domains, --file, or credentials with Domain.Read.All")
     domains = [r["domain"] for r in inventory]
+    if from_settings:  # the domains came from audit.toml, not the command line: label them so
+        for row in inventory:
+            row["sources"] = ["settings" if s == "cli" else s for s in (row.get("sources") or [])]
     domain_sources = {r["domain"]: r["sources"] for r in inventory}
     typed, _ = discover.parse_domains(list(args.domains))  # the inventory is sorted; this is the order typed
     headline = typed[0] if typed and typed[0] in domain_sources else None
@@ -872,6 +878,8 @@ def main():
 
     latest = out / "latest"
     latest.mkdir(parents=True, exist_ok=True)
+    for name in RUN_FILES:  # latest/ holds exactly this run's files: one an earlier run wrote and this one did not goes
+        (latest / name).unlink(missing_ok=True)
     for name in RUN_FILES:
         src = run_dir / name
         if src.exists():
@@ -895,16 +903,20 @@ def main():
             strict_reasons.append("%d plan hold(s)" % len(plan["holds"]))
         strict_reasons += degraded
     code = 1 if (report.get("exit_code") == 1 or strict_reasons) else 0
-    (run_dir / "run.json").write_text(json.dumps({"run": stamp, "notes": notes, "domains": domains,
-                                                  "maillog": bool(maillog), "rua_paths": rua_paths,
-                                                  "previous_run": prev_dir.name if prev_dir else None,
-                                                  "owners_file": str(owners_path) if owners_path else None,
-                                                  "next_steps": steps is not None,
-                                                  "settings": cfg.get("_path"), "new_senders": new_senders,
-                                                  "caveats": caveats, "degraded": degraded,
-                                                  "strict_reasons": strict_reasons,
-                                                  "exit_code": code}, indent=1), encoding="utf-8")
-    shutil.copy2(run_dir / "run.json", latest / "run.json")  # written after the RUN_FILES copy, like summary.txt
+
+    def write_run_json():
+        (run_dir / "run.json").write_text(json.dumps({"run": stamp, "notes": notes, "domains": domains,
+                                                      "maillog": bool(maillog), "rua_paths": rua_paths,
+                                                      "previous_run": prev_dir.name if prev_dir else None,
+                                                      "owners_file": str(owners_path) if owners_path else None,
+                                                      "next_steps": steps is not None,
+                                                      "settings": cfg.get("_path"), "new_senders": new_senders,
+                                                      "caveats": caveats, "degraded": degraded,
+                                                      "strict_reasons": strict_reasons,
+                                                      "exit_code": code}, indent=1), encoding="utf-8")
+        shutil.copy2(run_dir / "run.json", latest / "run.json")  # written after the RUN_FILES copy, like summary.txt
+
+    write_run_json()  # now, so a failure inside the notification still leaves a run record
     if args.no_notify:
         pass
     elif args.dry_run:
@@ -926,6 +938,7 @@ def main():
                 note("summary not posted: %s" % err)
         else:
             print(text)
+    write_run_json()  # once more: the notification outcome is on record too
 
     out_paint = console.painter()
     if steps and steps.get("one_liner"):

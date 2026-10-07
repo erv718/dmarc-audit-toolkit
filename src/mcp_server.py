@@ -36,6 +36,7 @@ import dns_audit
 import spf_lookups
 import run_hunting
 import audit as audit_mod
+import config as config_mod
 
 try:
     import dns.resolver
@@ -214,6 +215,8 @@ def dedupe_maillog(
     subject_column: str = "Subject",
     envelope_column: str = "Sender mail from domain",
     direction_column: str = "Direction",
+    spf_column: str = "SPF",
+    dkim_column: str = "DKIM",
     vendor_domains: list[str] | None = None,
 ) -> dict:
     """Collapse a mail-log CSV into logical messages by Message-ID plus
@@ -230,12 +233,16 @@ def dedupe_maillog(
     misspelled column is an error, never a silent zero. Each message detail
     carries passed (some copy passed authentication) and internal (every
     leg of that Message-ID stayed inside the tenant, read from
-    direction_column; a log without that column marks nothing internal)."""
+    direction_column; a log without that column marks nothing internal).
+    With spf_column and dkim_column present, passing mail is bucketed the
+    way queries/dkim_alignment.kql does (alignment: dkim_aligned, spf_only,
+    spf_and_dkim) and the senders passing on SPF alone are listed
+    (spf_only_senders): the DKIM-before-reject work."""
     cols = {"msgid": msgid_column, "recipient": recipient_column,
             "sender": sender_column, "domain": domain_column,
             "action": action_column, "location": location_column,
             "subject": subject_column, "envelope": envelope_column,
-            "direction": direction_column}
+            "direction": direction_column, "spf": spf_column, "dkim": dkim_column}
     sender_domain = (sender_domain or "").strip().lower() or None
     auth_column = (auth_column or "").strip() or None
     vendors = [v.strip().lower() for v in (vendor_domains or []) if v and v.strip()]
@@ -258,8 +265,9 @@ def dedupe_maillog(
     # the same column gate audit.py and dedupe.py apply before counting
     # anything: a typo in a column name dies loudly, it never returns zero
     missing_req, missing_opt = dedupe_mod.check_columns(header, cols, auth_column, sender_domain)
-    if direction_column != "Direction" and direction_column not in header:
-        missing_opt.append(direction_column)  # named by hand and absent: say so, as for any other column
+    for key, default in (("direction", "Direction"), ("spf", "SPF"), ("dkim", "DKIM")):
+        if cols[key] != default and cols[key] not in header:
+            missing_opt.append(cols[key])  # named by hand and absent: say so, as for any other column
     if missing_req:
         return {"error": "column not found: %s. Available columns: %s"
                          % (", ".join(missing_req), ", ".join(header) or "(none)")}
@@ -289,6 +297,7 @@ def dedupe_maillog(
         "delivered_despite_fail": counts["delivered_despite_fail"],
         "blocked_despite_pass": counts["blocked_despite_pass"],
         "by_likely": counts["by_likely"],
+        "alignment": counts.get("alignment"),
         "counters": counts,
         "findings": findings,
         "summary": {"findings": len(findings),
@@ -306,6 +315,7 @@ def dedupe_maillog(
     reply["detail_truncated"] = reply["genuine_failure_details_truncated"]
     reply.update(_cap_list(messages_where("delivered_despite_fail"), "delivered_despite_fail_details"))
     reply.update(_cap_list(messages_where("blocked_despite_pass"), "blocked_despite_pass_details"))
+    reply.update(_cap_list(dedupe_mod.spf_only_senders(verdicts), "spf_only_senders"))
     return reply
 
 
@@ -504,27 +514,40 @@ def run_audit(
     known: str | None = None,
     sender_domain: str | None = None,
     authserv_id: str | None = None,
+    config: str | None = None,
 ) -> dict:
     """Run the full audit: DNS posture (live, unless offline), aggregate
     reports, deduplicated mail log, and message headers, ending in a gate
     verdict (go / no_go / insufficient_data) for the DMARC policy ratchet.
+    The settings file (config, default: the repo's audit.toml when it exists)
+    supplies the formal [[exceptions]] the gate honours and vendor_domains,
+    exactly as audit.py reads them, so the verdict here is the CLI's verdict.
     Writes report.md and report.json into out_dir, which must resolve inside
     the repo folder - those two files are the only writes. The reply carries
-    the verdict, a capped findings preview, and the report paths."""
+    the verdict, the exceptions applied, a capped findings preview, and the
+    report paths."""
     opath = Path(out_dir)
     opath = (opath if opath.is_absolute() else ROOT / opath).resolve()
     if not opath.is_relative_to(ROOT):
         return {"error": "out_dir must stay inside the repo folder; "
                          "got a path resolving outside it"}
     try:
+        cfg = config_mod.load(config)
+    except config_mod.ConfigError as err:
+        return {"error": str(err)}
+    try:
         report = audit_mod.build_report(
             domains=domains or (), rua_paths=rua or (), maillog=maillog,
             header_files=header_files or (), offline=offline, known=known,
-            sender_domain=sender_domain, authserv_id=authserv_id)
+            sender_domain=sender_domain, authserv_id=authserv_id,
+            vendor_domains=[str(v) for v in ((cfg.get("audit") or {}).get("vendor_domains") or [])],
+            exceptions=cfg.get("exceptions") or [])
     except audit_mod.UsageError as err:
         return {"error": str(err)}
     reply = {
         "gate": report["gate"],
+        "exceptions": report["gate"].get("exceptions"),
+        "settings": cfg.get("_path"),
         "summary": report["summary"],
         "offline": report["offline"],
         "note": ("full detail is in the two report files on this machine; the "

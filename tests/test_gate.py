@@ -127,3 +127,65 @@ def test_build_report_carries_exceptions_and_alignment_into_the_files(tmp_path):
     md = audit.render_md(report)
     assert "alignment of passing mail" in md and "SPF-only senders in the mail log" in md
     assert "aligned-DKIM evidence (needed before p=reject)" in md
+
+
+def test_spf_only_senders_stay_with_their_own_gate(tmp_path):
+    rows = [passing("<m1@a>", "billing@example.com", "example.com", "fail", "pass"),
+            passing("<m2@a>", "billing@example.com", "example.com", "fail", "pass"),
+            ["<m3@a>", "u1@example.com", "news@sub.example.com", "sub.example.com", "sub.example.com", "Delivered",
+             "Inbox/folder", "News", "pass", "pass", "none"]]  # the audited subdomain's SPF-only sender
+    doc = audit.run_maillog(write_log(tmp_path / "log.csv", rows), auth_column="DMARC")
+    d = dns()
+    d["sub.example.com"] = dict(d["example.com"], domain="sub.example.com", dmarc_source="_dmarc.sub.example.com")
+    g = audit.gate_verdict(d, None, doc, ["example.com", "sub.example.com"])
+    assert g["domains"]["example.com"]["verdict"] == "go"
+    assert g["domains"]["sub.example.com"]["verdict"] == "no_go"
+    assert any("pass on SPF alone" in r for r in g["domains"]["sub.example.com"]["reasons"])
+    assert not any("pass on SPF alone" in r for r in g["domains"]["example.com"]["reasons"])
+    # unaudited: the subdomain's sender counts for its closest audited parent
+    g = audit.gate_verdict(dns(), None, doc, ["example.com"])
+    assert g["domains"]["example.com"]["verdict"] == "no_go"
+    assert any("pass on SPF alone" in r for r in g["domains"]["example.com"]["reasons"])
+
+
+def test_the_remaining_blocker_names_only_the_senders_still_failing(tmp_path):
+    log = write_log(tmp_path / "log.csv", [
+        passing("<m1@a>", "news@example.com", "bounce.vendor.example", "fail", "pass"),
+        failing("<m2@a>", "printer@example.com", "printer.vendor.example"),
+        failing("<m3@a>", "other@example.com", "other.example"),
+    ])
+    doc = audit.run_maillog(log, auth_column="DMARC")
+    exc = {"match": "vendor.example", "reason": "printer", "until": "2099-01-01", "removal_criterion": "replaced"}
+    g = gate(dns(), doc, exceptions=[exc])
+    line = next(r for r in g["domains"]["example.com"]["reasons"] if "failed with no passing copy" in r)
+    assert "1 logical message(s) from this domain failed with no passing copy (deduplicated; 1 more excepted)" in line
+    assert "other@example.com x1" in line and "printer@example.com" not in line
+    assert g["domains"]["example.com"]["excepted_failures"] == 1
+    assert g["domains"]["example.com"]["excepted_by_likely"] == {"likely_misconfigured_sender": 1} or \
+        sum(g["domains"]["example.com"]["excepted_by_likely"].values()) == 1
+
+
+def test_the_report_says_what_the_exceptions_lifted(tmp_path):
+    log = write_log(tmp_path / "log.csv", [passing("<m1@a>", "billing@example.com", "example.com", "pass", "none")])
+    unused = {"match": "192.0.2.0/24", "reason": "r", "until": "2099-01-01", "removal_criterion": "c"}
+    report = audit.build_report(domains=["example.com"], maillog=log, offline=True, exceptions=[unused])
+    md = audit.render_md(report)
+    assert "1 active exception(s) from audit.toml; none matched the evidence in this run" in md
+    assert "lifted blockers" not in md
+    log2 = write_log(tmp_path / "log2.csv", [failing("<m2@a>", "printer@example.com", "printer.vendor.example")])
+    used = {"match": "vendor.example", "reason": "r", "until": "2099-01-01", "removal_criterion": "c"}
+    md = audit.render_md(audit.build_report(domains=["example.com"], maillog=log2, offline=True, exceptions=[used]))
+    assert "1 active exception(s) from audit.toml: 0 stream(s) and 1 mail-log failure(s) excepted" in md
+
+
+def test_a_dmarc_pass_without_a_dkim_pass_is_not_dkim_carried(tmp_path):
+    cols = [c for c in COLS if c != "Sender mail from domain"]  # an export without the envelope column
+    path = tmp_path / "log.csv"
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        w.writerow(["<m1@a>", "u1@example.com", "billing@example.com", "example.com", "Delivered", "Inbox/folder",
+                    "Statement", "pass", "pass", "none"])
+    doc = audit.run_maillog(str(path), auth_column="DMARC")
+    assert doc["alignment"]["available"] and doc["alignment"]["spf_only"] == 1 and doc["alignment"]["dkim_aligned"] == 0
+    assert gate(dns(), doc)["verdict"] == "no_go"  # SPF alone holds the reject step; it is not a go

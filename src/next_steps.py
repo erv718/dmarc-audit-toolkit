@@ -129,19 +129,23 @@ JARGON_WORDS = tuple((re.compile(p, re.I), r) for p, r in (
 # A finding or plan id outside parentheses: kept, but only as a reference in parentheses.
 ID_RX = re.compile(r"(?<![\w(-])((?:[A-Z]{2,}|P)-\d{2,})(?![\w-])(?![^(]*\))")
 # The gate's mail-log blocker, split by blocker_items() so spoofs are never a gap to close.
-GAP_RX = re.compile(r"^(\d+) logical message\(s\) from this domain failed with no passing copy \(deduplicated\)"
+GAP_RX = re.compile(r"^(\d+) logical message\(s\) from this domain failed with no passing copy "
+                    r"\(deduplicated(?:; \d+ more excepted)?\)"
                     r"(?:; top senders: .*)?$")
 # Plan prerequisites written as observations, reworded as the condition that clears them.
 PREREQ_REWORDS = (
     (re.compile(r"^(\d+) message\(s\) in the mail log failed from a sender that looks like your own "
-                r"misconfigured system, not a spoof$"),
+                r"misconfigured system, not a spoof(?: \(\d+ more are excepted in the gate\))?$"),
      lambda m: "the %s mail-log failure%s from our own systems %s fixed"
      % (m.group(1), "" if m.group(1) == "1" else "s", "is" if m.group(1) == "1" else "are")),
     (re.compile(r"^aggregate reports: (\S+) sends (\d+) message\(s\) as (\S+) and fails"),
      lambda m: "the sender at %s (%s messages as %s) is fixed" % (m.group(1), m.group(2), m.group(3))),
     (re.compile(r"^no failure evidence in this run"),
      lambda m: "a mail log or aggregate reports are supplied to the audit"),
-    (re.compile(r"^SPF-only aligned senders in the aggregate reports \((.+)\): they break on forwarding at reject$"),
+    (re.compile(r"^no aligned-DKIM evidence in this run"),
+     lambda m: "the run carries aligned-DKIM evidence (aggregate reports, or a mail log pulled with SPF and DKIM columns)"),
+    (re.compile(r"^SPF-only aligned senders(?: in the aggregate reports)? \((.+)\): they break on forwarding at reject"
+                r"(?: - aligned DKIM first)?$"),
      lambda m: "the SPF-only senders (%s) are DKIM-signed, because SPF alone breaks on forwarding" % m.group(1)),
     (re.compile(r"^every legitimate sender proven with an aligned DKIM header( within 7 days)?$"),
      lambda m: "every legitimate sender is proven with an aligned DKIM header%s" % (m.group(1) or "")),
@@ -911,7 +915,7 @@ def holds_for(plan, domain=None):
 # ------------------------------------------------------------------ the document
 
 WEAK_HEADLINES = ("shortest audited apex", "shortest audited domain")
-TYPED_HEADLINES = ("first on the command line", "first in --file", "first domain given")
+TYPED_HEADLINES = ("first on the command line", "first in --file", "first in audit.toml", "first domain given")
 # labels the gate gives a headline its volume rule chose: it ranked the org families
 # and picked the member already, so the subject is settled
 VOLUME_HEADLINES = ("most internal mail", "most passing or internal mail in the mail log",
@@ -1085,7 +1089,7 @@ def gate_reasons(report, domain):
         if domain:
             r = re.sub(r"^%s: " % re.escape(domain), "", r)
         if r == statement or re.match(r"^(policy (is|p=)|step being gated|no DMARC policy could be determined"
-                                      r"|\d+ failing stream\(s\) look like spoofs)", r):
+                                      r"|\d+ failing stream\(s\) look like spoofs|exception: )", r):
             continue
         out.append(r)
     return out

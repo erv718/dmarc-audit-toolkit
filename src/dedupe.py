@@ -216,8 +216,8 @@ def _aligned(envelope, from_domain):
 
 def message_alignment(legs, cols, auth, from_domain):
     """queries/dkim_alignment.kql's bucket for one logical message, or
-    not_passing. dkim_aligned: a leg passed DMARC without an aligned SPF pass,
-    so DKIM carried it. spf_only: passed, and no leg had a DKIM pass at all -
+    not_passing. dkim_aligned: a leg passed DMARC without an aligned SPF pass
+    and with a DKIM pass, so DKIM carried it. spf_only: passed, and no leg had a DKIM pass at all -
     breaks on forwarding. spf_and_dkim: both passed; DKIM alignment likely but
     unproven from this table (confirm d= in one live header, rule 9)."""
     if not any(p for p, _ in auth):
@@ -226,8 +226,8 @@ def message_alignment(legs, cols, auth, from_domain):
     for leg, (passed, _) in zip(legs, auth):
         spf_ok = field(leg, cols, "spf").lower() == "pass" and _aligned(
             envelope_domain(field(leg, cols, "envelope")), from_domain)
-        if passed and not spf_ok:
-            carried = True
+        if passed and not spf_ok and field(leg, cols, "dkim").lower() == "pass":
+            carried = True  # DKIM carried it only when a DKIM pass is on that leg
         if field(leg, cols, "dkim").lower() == "pass":
             dkim_any = True
     if carried:

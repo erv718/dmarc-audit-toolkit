@@ -164,6 +164,7 @@ python src/collect.py                       # tenant domains, tenant data, every
 python src/collect.py --dry-run             # same, but print the Slack summary instead of posting it
 python src/collect.py example.com --offline --rua samples/rua --maillog samples/sample_maillog.csv --auth-column DMARC
 
+python src/dedupe.py samples/sample_maillog.csv --auth-column DMARC    # the deduplication alone, on the same samples
 rows read                   : 93
 logical messages            : 81
   with more than one leg    : 12
@@ -179,8 +180,9 @@ logical messages            : 81
 ```
 
 The third line runs entirely from the bundled synthetic samples with no
-credentials and no network, which is the quickest way to see the outputs. A
-run verifies the registration, reads the domain list, pulls the raw mail log
+credentials and no network, which is the quickest way to see the outputs; the
+block under it is `dedupe.py`'s own report on those samples, the
+deduplication every run performs. A run verifies the registration, reads the domain list, pulls the raw mail log
 for each organizational domain (sized by the hour and pulled in complete
 windows, newest first, so a busy domain never comes back as a truncated day),
 pulls new aggregate reports from the report mailbox, audits DNS, runs the
