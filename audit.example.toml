@@ -1,0 +1,46 @@
+# dmarc-audit-toolkit settings. Copy this file to audit.toml (gitignored, because
+# it names your domains) and edit. Secrets stay in .env; nothing here is secret.
+# Every key is optional. A command-line flag beats this file, and this file
+# beats the built-in default. Reading it needs Python 3.11 or newer.
+
+[audit]
+# Domains to audit. Leave the list empty (or delete the line) to audit every
+# verified domain in the tenant, which needs Domain.Read.All.
+domains = ["example.com", "example.net"]
+# Also add every subdomain seen sending in the last 30 days (needs ThreatHunting.Read.All).
+mailflow = true
+# Mail-log window in days (30 is the API maximum) and the aggregate-report window.
+days = 30
+report_days = 30
+# Senders you recognise: vendor domains and IP prefixes, for the unknown-sender check.
+known = ["vendor.example", "192.0.2.0/24"]
+# Envelope domains that belong to your vendors, for the mail-log heuristic labels.
+vendor_domains = ["vendor.example"]
+# DKIM selectors to probe in addition to the common list.
+selectors = ["s1", "mail"]
+# Reporting address the plan writes into new DMARC records.
+rua_address = "mailto:dmarc-reports@example.com"
+# Where runs are written, and how many dated runs to keep (older ones are deleted).
+out = "audit-out"
+keep = 12
+# strict = true widens exit code 1 to: a gate that is not "go", a plan hold, or a
+# tenant step that failed or was truncated. For schedulers that alert on exit codes.
+strict = false
+
+[notify]
+# The summary is posted only when SLACK_WEBHOOK_URL is set in .env AND enabled is true.
+enabled = true
+# "teams" is designed in but not yet verified against a live webhook; keep "slack".
+target = "slack"
+
+# Formal exceptions (docs/methodology.md step 5). A failing sender listed here
+# stops holding the gate until the date passes. All four fields are required;
+# an entry missing one is reported and NOT applied. match is an IP, an IP
+# prefix, an envelope or DKIM signing domain, or a From address.
+#
+# [[exceptions]]
+# match = "192.0.2.30"
+# reason = "legacy statements printer, SPF-only by design; the business accepts the loss at reject"
+# owner = "finance-systems"
+# until = 2026-12-31
+# removal_criterion = "printer replaced, or the vendor enables DKIM signing for example.com"

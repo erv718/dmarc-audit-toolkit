@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pre-push gate: nothing private and no typographic dashes leave this repo.
 
-Two kinds of checks run over every tracked text file:
+Three kinds of checks run over every tracked file:
 
 1. Deny terms. Company names, employee names, account numbers, ticket IDs -
    the things that must never appear in a public commit. The real list lives
@@ -9,6 +9,10 @@ Two kinds of checks run over every tracked text file:
    list itself is not published. Copy `.denylist.example` to `.denylist` and
    fill in your own terms before your first push.
 2. Em dash (U+2014) and en dash (U+2013). The project style is " - ".
+3. Credential material. A tracked file with a key or certificate suffix
+   (.pfx .p12 .key .pem .cer .crt .der .jks), or any text line carrying a PEM
+   private-key header, is a finding: those files are made under private/
+   (gitignored) and never enter the repo, whatever the .gitignore says today.
 
 Allowlisting one line: end it with the marker `# publish-ok` and the scanner
 skips that line for both checks. The rule is "the line ends with publish-ok"
@@ -28,6 +32,7 @@ the file list could not be produced (git missing, or not run inside the repo).
 """
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +45,8 @@ DASHES = {"\u2014": "em dash", "\u2013": "en dash"}  # escapes, so this file pas
 ALLOW_MARKER = "publish-ok"  # a line ENDING with this is skipped; canonical form: "# publish-ok"
 COMMENT_CLOSERS = ("-->", "*/")  # closing tokens ignored after the marker (HTML and C-style comments)
 BUILTIN_TERMS: list[str] = []  # built-ins stay empty on purpose; your terms go in .denylist
+CREDENTIAL_SUFFIXES = {".pfx", ".p12", ".key", ".pem", ".cer", ".crt", ".der", ".jks"}
+PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----")
 
 
 def tracked_files(staged_only):
@@ -62,6 +69,11 @@ def load_terms():
             if line and not line.startswith("#"):
                 terms.append(line)
     return terms
+
+
+def credential_file(path):
+    """True for a key or certificate file by suffix; the content is never read."""
+    return Path(path).suffix.lower() in CREDENTIAL_SUFFIXES
 
 
 def is_allowed(line):
@@ -89,6 +101,8 @@ def scan_file(path, terms):
         for ch, name in DASHES.items():
             if ch in line:
                 hits.append((lineno, name))
+        if PRIVATE_KEY_RE.search(line):
+            hits.append((lineno, "private key material"))
         lcline = line.lower()
         for term in terms:
             if term.lower() in lcline:
@@ -120,9 +134,16 @@ def main():
     for path in tracked_files(args.staged):
         if any(part in SKIP_DIRS for part in path.parts):
             continue
-        if path.suffix.lower() in SKIP_SUFFIXES or not path.exists():
+        if not path.exists():
             continue
         rel = path.relative_to(ROOT).as_posix()
+        if credential_file(path):
+            bad += 1
+            print(f"{rel}: credential material file ({path.suffix.lower()}) - keys and certificates never "
+                  "belong in the repo: move it under private/, git rm --cached it, and treat the key as compromised")
+            continue
+        if path.suffix.lower() in SKIP_SUFFIXES:
+            continue
         hits, skipped = scan_file(path, terms)
         for lineno, what in hits:
             bad += 1

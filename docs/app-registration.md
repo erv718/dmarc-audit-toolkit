@@ -22,6 +22,7 @@ that can write to your tenant. No AI is involved in any of this.
 | `ThreatHunting.Read.All` | the hunting queries (30 days of mail-flow data) | yes |
 | `Domain.Read.All` | reading the tenant's own domain list, so `audit.py` with no arguments audits everything you own | recommended; without it, name the domains on the command line |
 | `Mail.Read` | reading the aggregate report mailbox for the outside view | only if you set `RUA_MAILBOX`; must be scoped, see below |
+| `Exchange.ManageAsApp` (Office 365 Exchange Online, not Graph) plus the **Global Reader** directory role and a certificate | unattended runs of the three PowerShell auditors, which read Exchange settings Graph does not expose | optional; only for `audit_rules.ps1`, `audit_bypasses.ps1`, `audit_groups.ps1` on a schedule - see the last section |
 
 3. **Grant admin consent** for the tenant. Until an admin consents, the
    token is issued with no roles and every call returns 401 or 403.
@@ -84,44 +85,56 @@ that can write (`ReadWrite`, `Manage`, `Send`, and the like). Remove those.
 `Directory.Read.All` works in place of `Domain.Read.All` but is far broader;
 swap it.
 
-## Optional: unattended PowerShell audits
+## Optional: unattended PowerShell audits (`Exchange.ManageAsApp`)
 
 `audit_rules.ps1`, `audit_bypasses.ps1` and `audit_groups.ps1` read Exchange
 settings that have no Graph API. They run fine interactively after
 `Connect-ExchangeOnline`. To run them from a schedule with no human signed
-in, add the Office 365 Exchange Online application permission
-`Exchange.ManageAsApp`, assign the app's service principal a **view-only**
-Exchange role (View-Only Organization Management, or Global Reader), and use
-a certificate credential - app-only Exchange PowerShell does not accept
-secrets. The role assignment, not the permission name, is what decides
-whether the app can change anything; keep it view-only. Skip this entirely
-on the Python path.
+in, the same registration needs three more things. App-only Exchange
+PowerShell does not accept client secrets, so one of them is a certificate.
+Skip this whole section on the Python path.
 
-To make and upload the credential, pick your platform:
+1. **The permission.** API permissions > **Add a permission** > **APIs my
+   organization uses** > search **Office 365 Exchange Online** >
+   **Application permissions** > `Exchange.ManageAsApp` > **Add permissions**
+   > **Grant admin consent for <your tenant>** > **Yes**.
+2. **The role.** Identity > Roles & admins > **Global Reader** > **Add
+   assignments** > search the app's name (`dmarc-audit-toolkit-readonly`) >
+   select it > **Add**. The role assignment, not the permission name, decides
+   what the app can change: Global Reader can change nothing, which is why it
+   is the one to use. (View-Only Organization Management through Exchange
+   RBAC for Applications is the other view-only option; document whichever
+   you pick.)
+3. **The certificate.** Make it under `private/`, which is gitignored, so the
+   key can never be committed by accident. Pick your platform:
 
-**Windows** (PowerShell, built in - private key stays in the cert store):
+**Windows** (PowerShell, built in - the private key stays in the cert store):
 
 ```powershell
+mkdir private -Force | Out-Null
 $c = New-SelfSignedCertificate -Subject "CN=DMARC-Audit-ReadOnly" `
     -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable
-Export-Certificate -Cert $c -FilePath .\dmarc-audit-readonly.cer
+Export-Certificate -Cert $c -FilePath .\private\dmarc-audit-readonly.cer
 ```
 
 **macOS / Linux** (OpenSSL, built in on both - two files come out):
 
 ```bash
+mkdir -p private && chmod 700 private
 # private key + public cert, no passphrase so scripts can run unattended
-openssl req -x509 -newkey rsa:2048 -keyout dmarc-audit.key \
-    -out dmarc-audit-readonly.cer -days 365 -nodes -subj "/CN=DMARC-Audit-ReadOnly"
-chmod 600 dmarc-audit.key
+openssl req -x509 -newkey rsa:2048 -keyout private/dmarc-audit.key \
+    -out private/dmarc-audit-readonly.cer -days 365 -nodes -subj "/CN=DMARC-Audit-ReadOnly"
+chmod 600 private/dmarc-audit.key
 # bundle both into the .pfx the scripts read on this platform
-openssl pkcs12 -export -out dmarc-audit-readonly.pfx \
-    -inkey dmarc-audit.key -in dmarc-audit-readonly.cer -passout pass:
+openssl pkcs12 -export -out private/dmarc-audit-readonly.pfx \
+    -inkey private/dmarc-audit.key -in private/dmarc-audit-readonly.cer -passout pass:
 ```
 
-Upload `dmarc-audit-readonly.cer` (same file on every platform) under
-**Certificates & secrets**; the `.key` / `.pfx` never leaves your machine.
-Then in `.env`:
+Upload `private/dmarc-audit-readonly.cer` (the public half; the same file on
+every platform) under **Certificates & secrets** > **Certificates** >
+**Upload certificate**. The `.key` and `.pfx` never leave `private/` and are
+never committed; `scripts/check_public.py` refuses a push that carries any
+key or certificate file. Then in `.env`:
 
 ```
 # Windows:
@@ -129,20 +142,19 @@ EXO_CERT_THUMBPRINT=<the cert's thumbprint>
 EXO_ORGANIZATION=<yourtenant>.onmicrosoft.com
 
 # macOS / Linux:
-EXO_CERT_FILE=dmarc-audit-readonly.pfx
+EXO_CERT_FILE=private/dmarc-audit-readonly.pfx
 EXO_ORGANIZATION=<yourtenant>.onmicrosoft.com
 ```
 
 `EXO_APP_ID` is optional and defaults to `AZURE_CLIENT_ID`; `EXO_CERT_PASSWORD`
 is only needed if you put a passphrase on the PFX. A Windows thumbprint is
 shown by `Get-ChildItem Cert:\CurrentUser\My`; on OpenSSL it is
-`openssl x509 -in dmarc-audit-readonly.cer -noout -fingerprint -sha1`.
+`openssl x509 -in private/dmarc-audit-readonly.cer -noout -fingerprint -sha1`.
 
 With those set, the three scripts connect app-only on their own (via
 `src/ToolkitExo.ps1`) and only offer interactive sign-in when app-only is not
-configured.
-Close-out when the project wraps: delete the certificate from the
-registration and remove the role assignment.
+configured. Close-out when the project wraps: delete the certificate from the
+registration, remove the role assignment, and delete `private/`.
 
 ## Run
 

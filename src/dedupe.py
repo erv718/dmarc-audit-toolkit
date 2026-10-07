@@ -36,6 +36,14 @@ with its genuine failures, worst first: the sender inventory to work through
 before enforcement. The report prints the failing top of each list; --json
 carries the full lists under "census".
 
+When the export also carries SPF and DKIM verdict columns (the ones
+queries/raw_maillog.kql writes), every passing message is bucketed the way
+queries/dkim_alignment.kql does - dkim_aligned, spf_only, spf_and_dkim - and
+the senders that pass on SPF alone are listed. They break on forwarding, so
+they are the DKIM-before-reject work (docs/methodology.md step 8). A
+Direction column (the same query writes it) marks the messages whose every
+leg stayed inside the tenant.
+
 Usage
 -----
     python dedupe.py export.csv --sender-domain example.com --auth-column DMARC
@@ -51,6 +59,8 @@ override with the --*-column flags for other tools) with these columns:
                --sender-domain is given
     optional : Sender address, Sender domain, Latest delivery location,
                Subject, Sender mail from domain (a warning names any absent one)
+    alignment: SPF and DKIM - used only when both are present, for the
+               dkim_alignment buckets and the SPF-only sender list
 
 Exit codes: 0 clean, 1 findings at severity major or blocking, 2 usage or
 input error.
@@ -64,6 +74,11 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+try:
+    from dns_audit import org_domain  # same apex logic as the DNS audit
+except ImportError:  # running outside the repo: last two labels
+    def org_domain(domain):
+        return ".".join(domain.lower().strip(".").split(".")[-2:])
 import console
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
@@ -78,6 +93,8 @@ OPTIONAL_COLS = ("sender", "domain", "location", "subject", "envelope")
 # mail sent from inside the tenant (a Direction column, when the log has one): it carries
 # no DMARC verdict, and no outside sender can fake it
 INTERNAL_DIRECTIONS = ("intra-org", "outbound")
+ALIGNMENT_COLS = ("spf", "dkim")
+ALIGNMENT_BUCKETS = ("dkim_aligned", "spf_only", "spf_and_dkim")
 
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocking": 3}
 
@@ -192,6 +209,32 @@ def count_rows(rows, cols, sender_domain=None, auth_column=None):
 
 # --------------------------------------------------------------- classify
 
+def _aligned(envelope, from_domain):
+    """Relaxed SPF alignment: the envelope domain shares the From domain's apex."""
+    return bool(envelope) and bool(from_domain) and org_domain(envelope) == org_domain(from_domain)
+
+
+def message_alignment(legs, cols, auth, from_domain):
+    """queries/dkim_alignment.kql's bucket for one logical message, or
+    not_passing. dkim_aligned: a leg passed DMARC without an aligned SPF pass,
+    so DKIM carried it. spf_only: passed, and no leg had a DKIM pass at all -
+    breaks on forwarding. spf_and_dkim: both passed; DKIM alignment likely but
+    unproven from this table (confirm d= in one live header, rule 9)."""
+    if not any(p for p, _ in auth):
+        return "not_passing"
+    carried = dkim_any = False
+    for leg, (passed, _) in zip(legs, auth):
+        spf_ok = field(leg, cols, "spf").lower() == "pass" and _aligned(
+            envelope_domain(field(leg, cols, "envelope")), from_domain)
+        if passed and not spf_ok:
+            carried = True
+        if field(leg, cols, "dkim").lower() == "pass":
+            dkim_any = True
+    if carried:
+        return "dkim_aligned"
+    return "spf_and_dkim" if dkim_any else "spf_only"
+
+
 def classify(rows, cols, sender_domain=None, auth_column=None, vendor_domains=None):
     """Return per-message verdicts keyed by (message-id, recipient)."""
     sender_domain = (sender_domain or "").strip().lower() or None
@@ -231,6 +274,9 @@ def classify(rows, cols, sender_domain=None, auth_column=None, vendor_domains=No
         caught = any(a in FAIL_ACTIONS for a in actions)
         sender = field(legs[0], cols, "sender").lower()
         domain = field(legs[0], cols, "domain").lower() or sender.rpartition("@")[2]
+        alignment = None
+        if auth_column and all(cols.get(k) and cols[k] in legs[0] for k in ALIGNMENT_COLS):
+            alignment = message_alignment(legs, cols, auth, domain)
 
         verdicts[key] = {
             "legs": len(legs),
@@ -250,6 +296,7 @@ def classify(rows, cols, sender_domain=None, auth_column=None, vendor_domains=No
             "subject": field(legs[0], cols, "subject"),
             "actions": actions,
             "locations": locations,
+            "alignment": alignment,
             "likely": None,
             "likely_signals": [],
         }
@@ -303,6 +350,34 @@ def label_failures(verdicts, vendor_domains=None):
 
 # ---------------------------------------------------------------- summary
 
+def alignment_summary(vs):
+    """Counts of the alignment buckets over passing messages; available says
+    whether the export carried SPF and DKIM columns at all."""
+    seen = [v.get("alignment") for v in vs if v.get("alignment")]
+    by = Counter(a for a in seen if a in ALIGNMENT_BUCKETS)
+    out = {"available": bool(seen), "passing": sum(by.values())}
+    out.update({k: by.get(k, 0) for k in ALIGNMENT_BUCKETS})
+    return out
+
+
+def spf_only_senders(verdicts):
+    """Passing senders that had no DKIM pass on any leg, by From address and
+    envelope domain (the dkim_alignment.kql grain): fine at quarantine, bounced
+    at reject once a forwarder touches the mail."""
+    by = {}
+    for v in verdicts.values():
+        a = v.get("alignment")
+        if a not in ALIGNMENT_BUCKETS:
+            continue
+        key = (v["sender"], v["envelope_domain"])
+        s = by.setdefault(key, {"sender": v["sender"], "domain": v["domain"], "envelope_domain": v["envelope_domain"],
+                                "passing": 0, "dkim_aligned": 0, "spf_only": 0, "spf_and_dkim": 0})
+        s["passing"] += 1
+        s[a] += 1
+    out = [dict(s, spf_only_pct=round(100.0 * s["spf_only"] / s["passing"], 1)) for s in by.values() if s["spf_only"]]
+    return sorted(out, key=lambda s: (-s["spf_only"], s["sender"]))
+
+
 def summarize(verdicts):
     """Message-level counters over the verdicts."""
     vs = list(verdicts.values())
@@ -316,6 +391,7 @@ def summarize(verdicts):
         "delivered_despite_fail": sum(1 for v in vs if v["delivered_despite_fail"]),
         "blocked_despite_pass": sum(1 for v in vs if v["blocked_despite_pass"]),
         "by_likely": {k: by_likely.get(k, 0) for k in LIKELY_LABELS},
+        "alignment": alignment_summary(vs),
     }
 
 
@@ -416,6 +492,16 @@ def build_findings(c, verdicts, auth_column=None, missing_optional=(), sender_do
             "verify from live headers and the sender inventory before acting; "
             "--vendor-domain teaches the heuristic your vendors' envelope domains",
             verified=False)
+    spf_only = spf_only_senders(verdicts)
+    if spf_only:
+        msgs = sum(s["spf_only"] for s in spf_only)
+        add("MAILFLOW-010", "minor",
+            "%d sender(s) pass DMARC on SPF alone in the mail log (%d msgs): breaks on forwarding, rejected at p=reject"
+            % (len(spf_only), msgs),
+            "; ".join("%s (envelope %s) x%d" % (s["sender"] or "?", s["envelope_domain"] or "?", s["spf_only"])
+                      for s in spf_only[:5]) + (" ..." if len(spf_only) > 5 else ""),
+            "set up aligned DKIM at each of these platforms before ratcheting to p=reject, and confirm "
+            "it with one live header (src/headers.py); SPF alone is fine at quarantine only")
     if c["rows_without_msgid"]:
         add("MAILFLOW-005", "minor",
             "%d rows have no Message-ID and were left out of the dedupe" % c["rows_without_msgid"],
@@ -458,6 +544,8 @@ def build_doc(source, counts, verdicts, findings, sender_domain=None, auth_colum
         "findings": findings,
         "verdicts": [dict(v, msgid=k[0], recipient=k[1]) for k, v in verdicts.items()],
         "census": census(verdicts),
+        "alignment": counts.get("alignment") or alignment_summary(list(verdicts.values())),
+        "spf_only_senders": spf_only_senders(verdicts),
         "heuristic": {"lure_words": list(LURE_WORDS), "esp_domains": list(ESP_DOMAINS),
                       "vendor_domains": list(vendor_domains or []), "stable_repeats": STABLE_REPEATS,
                       "note": "likely labels are a heuristic, not a verdict"},
@@ -533,6 +621,19 @@ def print_report(c, verdicts, findings, auth_column=None, top=20):
     if c["logical_messages"]:
         print(paint.bold(f"counting rows would report {c['raw_failing_rows']} failures; "
                          f"the true count is {c['genuine_failures']}."))
+    al = c.get("alignment") or {}
+    if al.get("available"):
+        print()
+        print("alignment of passing mail (dkim_alignment.kql buckets, from the SPF and DKIM columns):")
+        print(f"  DKIM carried it (aligned)   : {al['dkim_aligned']}")
+        print(f"  SPF and DKIM both passed    : {al['spf_and_dkim']}   <-- DKIM alignment likely; confirm d= in a live header")
+        print(f"  SPF only                    : {al['spf_only']}   <-- breaks on forwarding; DKIM before reject")
+        so = spf_only_senders(verdicts)
+        if so:
+            print("\nsenders passing on SPF alone (no DKIM pass on any leg):")
+            for s in so[:top]:
+                print(f"  {s['spf_only']:>6}  {(s['sender'] or '(no sender)'):<40} envelope {s['envelope_domain'] or '(none)'}"
+                      f"  ({s['spf_only_pct']}% of {s['passing']} passing)")
 
     genuine = {k: v for k, v in verdicts.items() if v["genuine_failure"]}
     if genuine:
@@ -604,6 +705,9 @@ def main():
     ap.add_argument("--direction-column", default="Direction",
                     help="column holding the mail direction (Inbound, Intra-org, Outbound); a message "
                          "whose every leg stayed inside the tenant is marked internal")
+    ap.add_argument("--spf-column", default="SPF",
+                    help="column holding the SPF verdict (with --dkim-column: alignment buckets and SPF-only senders)")
+    ap.add_argument("--dkim-column", default="DKIM", help="column holding the DKIM verdict")
     ap.add_argument("--vendor-domain", action="append", default=[], metavar="DOMAIN",
                     help="envelope domain you know belongs to one of your vendors; the heuristic "
                          "treats it like a known platform (repeatable)")
@@ -622,6 +726,8 @@ def main():
         "subject": args.subject_column,
         "envelope": args.envelope_column,
         "direction": args.direction_column,
+        "spf": args.spf_column,
+        "dkim": args.dkim_column,
     }
 
     csv_path = repo_path(args.csv_path)
@@ -636,8 +742,9 @@ def main():
         die("cannot parse %s as CSV: %s" % (csv_path, err))
 
     missing_req, missing_opt = check_columns(header, cols, args.auth_column, args.sender_domain)
-    if args.direction_column != ap.get_default("direction_column") and args.direction_column not in header:
-        missing_opt.append(args.direction_column)  # named by hand and absent: say so, as for any other column
+    for key in ("direction", "spf", "dkim"):  # named by hand and absent: say so, as for any other column
+        if getattr(args, key + "_column") != ap.get_default(key + "_column") and cols[key] not in header:
+            missing_opt.append(cols[key])
     if missing_req:
         die("column not found: %s. Available columns: %s"
             % (", ".join(missing_req), ", ".join(header) or "(none)"))
