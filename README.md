@@ -300,10 +300,16 @@ the raw ones, the worst failing senders from the census, spoofing blocked by
 receivers, newly identified senders (new to the whole history, not just absent
 last week), the week-over-week deltas, and the trend over the last four runs.
 A delta is withheld, and the message says so, when two runs cannot bear the
-comparison: mail logs whose spans differ by half or more (a row budget keeps
-the newest hours of a busy domain), or outside views that differ tenfold in
-size (a first full archive against a near-empty one); the trend word then
-follows the pass rate rather than the failure counts.
+comparison. Failure counts are not compared when the row budget (or an hour
+at the API row cap) cut an organization's mail log in either run - the note
+names the organization, the run and how many hours were kept, and every
+domain under that organization is withheld with it - or when the two mail
+logs' spans differ by half or more. The pass rate is not compared when the
+outside views differ tenfold in size (a first full archive against a
+near-empty one) or carry no messages. The trend word compares the first and
+last runs: it follows the failure counts when they compare, else the pass
+rate when the outside views compare, else it says "not comparable"; a short
+clause names what was not compared and why.
 Aggregates only: domains, counts and sender identities, never addresses or
 subject lines. `[notify] enabled = false` in `audit.toml` pauses posting
 without removing the webhook; `--dry-run` prints the message. Teams is
@@ -422,10 +428,12 @@ would leave the machine.
   Raise `--max-rows` to keep more.
 - **"needs Python 3.11 or newer"**: the settings file is TOML; upgrade Python
   or pass everything as flags.
-- **The delta or the trend says "not comparable"**: the two runs' mail logs
+- **The delta or the trend says "not comparable"**: the row budget or the
+  API row cap cut an organization's mail log in one of the two runs (the note
+  names it; raise `--max-rows` if it is the budget), the two runs' mail logs
   cover very different spans, or one outside view is near-empty. The counts
   are still in the report; only the comparison is withheld, and it returns
-  from the next run of a similar shape.
+  once two runs of a similar shape follow each other.
 - **One of your own platforms shows as `unknown` in the aggregate reports**,
   with "SPF passes for ..., which looks like the forwarding hop": if that
   platform sends for you, list its domain among the vendors in `audit.toml`

@@ -52,6 +52,8 @@ from collections import Counter, OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import audit  # the delta's own rules: the recorded cuts, a window's span, which spans compare
+
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = "0.5"
 DEFAULT_OWNERS = "owners.csv"
@@ -910,17 +912,22 @@ def trend_from_delta(delta, now_gf, now_pr):
 
 
 def merge_trends(candidates):
-    """The first candidate that knows anything, its gaps filled from later
-    candidates that describe the same previous run (audit.py's delta carries
-    the failure change but no pass rate; metrics.json carries both)."""
+    """The first candidate that carries a figure (a failure count or a pass
+    rate), its gaps filled from the other candidates that describe the same
+    previous run (audit.py's delta carries the failure change but no pass
+    rate; metrics.json carries both). A delta the audit refused to compare
+    carries no figure: it is the trend only when no candidate carries one."""
     cands = [c for c in candidates if c]
     if not cands:
         return None
-    out = dict(cands[0])
-    for c in cands[1:]:
-        if c["label"] != out["label"]:
+    base = next((c for c in cands if c.get("previous_genuine_failures") is not None
+                 or c.get("previous_pass_rate") is not None), cands[0])
+    out = dict(base)
+    for c in cands:
+        if c is base or c["label"] != out["label"]:
             continue
-        for k in ("previous_genuine_failures", "previous_pass_rate", "previous_rua_messages", "previous_maillog_hours"):
+        for k in ("previous_genuine_failures", "previous_pass_rate", "previous_rua_messages", "previous_maillog_hours",
+                  "previous_cuts"):
             if out.get(k) is None and c.get(k) is not None:
                 out[k] = c[k]
                 if k in ("previous_genuine_failures", "previous_pass_rate"):
@@ -928,13 +935,35 @@ def merge_trends(candidates):
     return out
 
 
+def _cut_reason(cut_orgs):
+    """'the row budget cut the mail log for corp.example in the previous run',
+    from {org: {"now": cut info or None, "previous": cut info or None}}: the
+    orgs cut in each run, with the cause their recorded cut names (none when
+    it does not say), 'and N more' past three."""
+    order = ("this run", "the previous run", "both runs")
+    by_cause = {}
+    for org, sides in sorted(cut_orgs.items()):
+        now, prev = (sides.get("now"), sides.get("previous")) if isinstance(sides, dict) else (None, None)
+        if now is None and prev is None:
+            continue
+        when = order[2] if now is not None and prev is not None else (order[0] if now is not None else order[1])
+        by_cause.setdefault(audit._cut_cause(now, prev) or "", {}).setdefault(when, []).append(str(org))
+    parts = []  # this run's cuts first, then the previous run's; a named cause before an unnamed one
+    for cause in sorted(by_cause, key=lambda c: (min(order.index(w) for w in by_cause[c]), not c, c)):
+        runs = " and ".join("for %s in %s" % (audit._names(by_cause[cause][w]), w) for w in order if w in by_cause[cause])
+        parts.append("%s cut the mail log %s" % (cause, runs) if cause else "the mail log was cut %s" % runs)
+    return "; ".join(parts)
+
+
 def apply_comparability(trend, delta, report, view):
     """Drop a comparison the two runs cannot bear, and say why: failure
-    counts when the mail logs cover very different spans (a row budget keeps
-    the newest hours of a busy domain), the pass rate when the outside views
-    differ tenfold in size (a first full archive against an empty one). The
-    audit's delta carries the judgement when it ran; otherwise it is made
-    here from the previous run's figures."""
+    counts when collect.py cut an organization's mail log in either run (the
+    row budget keeps the newest hours of an org's pull; an hour can stay at
+    the API cap) or the two mail logs cover very different spans, the pass
+    rate when the outside views differ tenfold in size (a first full archive
+    against an empty one). The audit's delta carries the judgement when it
+    is about the trend's own run; otherwise it is made here, by the audit's
+    rules, from this report's cuts and span and the previous run's."""
     if not trend:
         return trend
     t, why = dict(trend), []
@@ -942,34 +971,45 @@ def apply_comparability(trend, delta, report, view):
     # that run (a trend from --previous or metrics.json about another run is judged on its own figures)
     same_run = isinstance(delta, dict) and _day(delta.get("previous_generated_utc")) == t.get("label")
     mw = delta.get("maillog_window") if same_run and isinstance(delta.get("maillog_window"), dict) else None
-    fail_ok = mw.get("comparable") if mw and mw.get("comparable") is not None else None
-    # the pass rate is judged from the trend's own figures, by the audit's tenfold rule: the delta carries no
-    # rate, and a trend merged by day could hold another same-day run's outside view
-    rate_ok = None
-    if fail_ok is None:
-        now_h = _f(((view or {}).get("window") or {}).get("hours")) if view else None
-        prev_h = _f(t.get("previous_maillog_hours"))
-        if now_h is not None and prev_h is not None and max(now_h, prev_h) > 0:  # 0.0 is a span, not a gap
-            fail_ok = min(now_h, prev_h) / max(now_h, prev_h) >= 0.5
-    if rate_ok is None:
-        now_m = _n(((report.get("rua") or {}).get("totals") or {}).get("messages"))
-        prev_m = _n(t.get("previous_rua_messages"))
-        if now_m is not None and prev_m is not None and (now_m or prev_m):
-            rate_ok = bool(now_m and prev_m and min(now_m, prev_m) / max(now_m, prev_m) >= 0.1)
-        elif now_m == 0 and prev_m == 0:
-            t["previous_pass_rate"] = None  # two empty outside views: a 0/0 rate on each side
-            why.append("the pass rate is not compared: neither outside view carries messages")
+    fail_ok = mw.get("comparable") if mw and isinstance(mw.get("comparable"), bool) else None
+    fail_why = []
+    if fail_ok is False and ("cut_orgs" in mw or "log_comparable" in mw):
+        if isinstance(mw.get("cut_orgs"), dict) and mw["cut_orgs"]:
+            fail_why.append(_cut_reason(mw["cut_orgs"]))
+        if mw.get("log_comparable") is False:
+            fail_why.append("the two mail logs cover very different spans")
+    elif fail_ok is False:  # a delta from before the cuts were recorded named the domains whose own spans differed
+        listed = mw.get("domains_not_comparable")
+        names = sorted(str(d) for d in listed if d) if isinstance(listed, list) else []
+        if names:
+            fail_why.append("the mail-log rows of %s cover very different spans in the two runs" % audit._names(names))
+    elif fail_ok is None and None not in (t.get("previous_genuine_failures"), (view or {}).get("genuine_failures")):
+        # no verdict about this trend's run: the audit's rules on both runs' own figures - the cuts each
+        # recorded, and the whole log's spans (this one from its stamps, two spans under an hour alike)
+        now_cut = audit.maillog_cuts(report)
+        prev_cut = audit._dict(t.get("previous_cuts"))
+        if now_cut or prev_cut:
+            fail_why.append(_cut_reason({org: {"now": now_cut.get(org), "previous": prev_cut.get(org)}
+                                         for org in set(now_cut) | set(prev_cut)}))
+        if not audit._spans_comparable(audit._hours(audit._dict(report.get("maillog")).get("window")),
+                                       audit._hours({"hours": t.get("previous_maillog_hours")})):
+            fail_why.append("the two mail logs cover very different spans")
+        fail_ok = not fail_why
     if fail_ok is False:
         t["previous_genuine_failures"] = None
-        cut = [str(d) for d in ((mw or {}).get("domains_not_comparable") or []) if d]
-        if cut:
-            why.append("failure counts are not compared: %s's own mail-log rows cover a much shorter span than in the "
-                       "previous run (the row budget keeps a busy domain's newest hours)" % ", ".join(cut[:3]))
-        else:
-            why.append("failure counts are not compared: the two mail logs cover very different spans")
-    if rate_ok is False:
-        t["previous_pass_rate"] = None
-        why.append("the pass rate is not compared: the two outside views differ too much in size")
+        why.append("failure counts are not compared: %s"
+                   % (", and ".join(fail_why) or "the two mail logs cover very different spans"))
+    # the pass rate is judged from the trend's own figures, by the audit's tenfold rule: the delta carries no
+    # rate, and a trend merged by day could hold another same-day run's outside view
+    now_m = _n(((report.get("rua") or {}).get("totals") or {}).get("messages"))
+    prev_m = _n(t.get("previous_rua_messages"))
+    if now_m is not None and prev_m is not None and (now_m or prev_m):
+        if not (now_m and prev_m and min(now_m, prev_m) / max(now_m, prev_m) >= 0.1):
+            t["previous_pass_rate"] = None
+            why.append("the pass rate is not compared: the two outside views differ too much in size")
+    elif now_m == 0 and prev_m == 0:
+        t["previous_pass_rate"] = None  # two empty outside views: a 0/0 rate on each side
+        why.append("the pass rate is not compared: neither outside view carries messages")
     t["not_comparable"] = why
     return t
 
@@ -977,14 +1017,17 @@ def apply_comparability(trend, delta, report, view):
 def trend_from_report(previous):
     if not isinstance(previous, dict):
         return None
-    gf = _n(((previous.get("maillog") or {}).get("counters") or {}).get("genuine_failures"))
-    pr = _f(((previous.get("rua") or {}).get("totals") or {}).get("pass_rate"))
+    ml = audit._dict(previous.get("maillog"))
+    tot = audit._dict(audit._dict(previous.get("rua")).get("totals"))
+    gf = _n(audit._dict(ml.get("counters")).get("genuine_failures"))
+    pr = _f(tot.get("pass_rate"))
     if gf is None and pr is None:
         return None
     return {"source": "previous report", "label": _day(previous.get("generated_utc")) or "the previous run",
             "previous_genuine_failures": gf, "previous_pass_rate": pr,
-            "previous_rua_messages": _n(((previous.get("rua") or {}).get("totals") or {}).get("messages")),
-            "previous_maillog_hours": _f(((previous.get("maillog") or {}).get("window") or {}).get("hours"))}
+            "previous_rua_messages": _n(tot.get("messages")),
+            "previous_maillog_hours": audit._hours(ml.get("window")),  # from its stamps, as the audit reads it
+            "previous_cuts": audit.maillog_cuts(previous)}
 
 
 def _same_run(entry, report, view):
@@ -1013,9 +1056,12 @@ def trend_from_metrics(metrics, report, view):
     gf, pr = _n(e.get("genuine_failures")), _f(e.get("rua_pass_rate"))
     if gf is None and pr is None:
         return None
+    orgs = e.get("maillog_cut_orgs")  # names only, no cause; an entry from before they were recorded has none
     return {"source": "metrics", "label": _day(e.get("run")) or str(e.get("run")),
             "previous_genuine_failures": gf, "previous_pass_rate": pr,
-            "previous_rua_messages": _n(e.get("rua_messages")), "previous_maillog_hours": _f(e.get("maillog_hours"))}
+            "previous_rua_messages": _n(e.get("rua_messages")), "previous_maillog_hours": _f(e.get("maillog_hours")),
+            "previous_cuts": ({str(o).strip().lower(): {} for o in orgs if isinstance(o, str) and o.strip()}
+                              if isinstance(orgs, list) else None)}
 
 
 def policy_since(metrics, org, policy):

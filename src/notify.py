@@ -31,7 +31,6 @@ Exit codes: 0 posted or printed, 1 the post failed, 2 usage error.
 
 import argparse
 import json
-from datetime import datetime, timedelta, timezone
 import os
 import sys
 import urllib.error
@@ -153,19 +152,57 @@ def _key_label(key):
     return value + (" (envelope)" if kind == "envelope" else "")
 
 
+def _number(value):
+    """A metrics value as a number, else None: a damaged entry reads as unknown."""
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 def _spans_alike(hours):
     """Mail-log spans (hours; None unknown) that bear comparing failure counts:
     an unknown span gets the benefit of the doubt, two spans under an hour are
     alike, otherwise neither may be under half of the other."""
-    known = [float(h) for h in hours if isinstance(h, (int, float)) and not isinstance(h, bool) and h >= 0]
+    known = [float(h) for h in hours if _number(h) is not None and 0 <= h < float("inf")]
     if len(known) < 2 or max(known) < 1:
         return True
     return min(known) / max(known) >= 0.5
 
 
+def _views_differ(sizes):
+    """Why two outside views (message counts; None unknown) do not bear comparing
+    pass rates, by the audit's rule, or None when they do: a view with no
+    messages never compares, nor two sizes more than tenfold apart; an unknown
+    size gets the benefit of the doubt."""
+    known = [s for s in sizes if _number(s) is not None and s >= 0]
+    if len(known) == 2 and not any(known):
+        return "neither outside view carries messages"
+    if not all(known):
+        return "one outside view carries no messages"
+    if len(known) == 2 and min(known) / max(known) < 0.1:
+        return "the outside views differ tenfold in size"
+    return None
+
+
+def _cut_orgs(entry):
+    """The orgs a metrics entry says the row budget or the API cap cut, or None
+    when it does not say (an entry from before they were recorded, or a value
+    of the wrong type): that gets the benefit of the doubt."""
+    orgs = entry.get("maillog_cut_orgs")
+    return [str(o) for o in orgs if isinstance(o, str) and o.strip()] if isinstance(orgs, list) else None
+
+
+def _names(items, cap=3):
+    """'a', 'a and b', 'a, b and c', 'a, b, c and 2 more'."""
+    items = list(items)
+    if len(items) > cap:
+        items = items[:cap] + ["%d more" % (len(items) - cap)]
+    if len(items) < 2:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
 def trend_word(values):
     """improving / worsening / flat from the first and last known value."""
-    pts = [v for v in values if v is not None]
+    pts = [v for v in values if _number(v) is not None]
     if len(pts) < 2:
         return "too few runs to call"
     if pts[-1] < pts[0]:
@@ -173,6 +210,38 @@ def trend_word(values):
     if pts[-1] > pts[0]:
         return "worsening"
     return "flat"
+
+
+def trend_judgement(pts):
+    """(word, reasons) for the trend line over metrics entries: the failure
+    counts decide when two runs carry them, the two ends' mail logs cover
+    alike spans and neither end's org was cut by the row budget or the API
+    cap; else the pass rate, when the first and last runs that carry one have
+    outside views of comparable size; else "not comparable". A reason names
+    each comparison refused, only when the line shows what it explains."""
+    gf = [_number(h.get("genuine_failures")) for h in pts]
+    pr = [_number(h.get("rua_pass_rate")) for h in pts]
+    counted = [i for i, x in enumerate(gf) if x is not None]
+    rated = [i for i, x in enumerate(pr) if x is not None]
+    why_counts = why_rate = None
+    if len(counted) >= 2:
+        first, last = pts[counted[0]], pts[counted[-1]]
+        cut = sorted(set(_cut_orgs(first) or []) | set(_cut_orgs(last) or []))
+        if cut:
+            why_counts = "the mail log was cut for %s in one of these runs" % _names(cut)
+        elif not _spans_alike([first.get("maillog_hours"), last.get("maillog_hours")]):
+            why_counts = "the mail-log spans differ"
+    if len(rated) >= 2:
+        why_rate = _views_differ([pts[rated[0]].get("rua_messages"), pts[rated[-1]].get("rua_messages")])
+    if len(counted) >= 2 and not why_counts:
+        word = trend_word(gf)
+    elif len(rated) >= 2 and not why_rate:
+        word = trend_word([None if x is None else -x for x in pr])  # a higher pass rate is the improvement
+    else:
+        word = "not comparable" if len(counted) >= 2 or len(rated) >= 2 else "too few runs to call"
+    reasons = (["failure counts not compared: " + why_counts] if why_counts else []) + \
+              (["pass rate not compared: " + why_rate] if why_rate else [])
+    return word, reasons
 
 
 def summarize(report, previous=None, plan=None, known_senders=None, history=None):
@@ -320,36 +389,19 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
 
     pts = [h for h in (history or []) if isinstance(h, dict)][-TREND_RUNS:]
     if len(pts) >= 2:
-        gf = [h.get("genuine_failures") for h in pts]
-        pr = [h.get("rua_pass_rate") for h in pts]
+        gf = [_number(h.get("genuine_failures")) for h in pts]
+        pr = [_number(h.get("rua_pass_rate")) for h in pts]
         parts = []
         if any(x is not None for x in gf):
             parts.append("genuine failures " + ", ".join("-" if x is None else str(x) for x in gf))
         if any(x is not None for x in pr):
-            parts.append("pass rate " + ", ".join("-" if x is None else "%.1f%%" % (100 * float(x)) for x in pr))
+            parts.append("pass rate " + ", ".join("-" if x is None else "%.1f%%" % (100 * x) for x in pr))
         if parts:
-            known = [i for i, x in enumerate(gf) if x is not None]
-            # the word compares the first and last failure counts, which means something only when their
-            # mail logs cover alike spans, whole log and busy domain alike (a row budget can keep 41 hours of
-            # one domain in one run and 30 days in another while the whole log's span holds); otherwise, as
-            # with no counts at all, the pass rate decides: a higher rate is the improvement
-            ends = [known[0], known[-1]] if len(known) >= 2 else []
-            spans_ok = _spans_alike([pts[i].get("maillog_hours") for i in ends])
-            if ends:
-                a, b = pts[ends[0]].get("maillog_hours_by_domain") or {}, pts[ends[-1]].get("maillog_hours_by_domain") or {}
-                for d in set(a) & set(b):
-                    spans_ok = spans_ok and _spans_alike([a.get(d), b.get(d)])
-            if len(pts) == 2 and dl and (dl.get("maillog_window") or {}).get("comparable") is False:
-                spans_ok = False  # the audit already judged these two runs
-            if len(known) >= 2 and spans_ok:
-                word = trend_word(gf)
-            else:
-                word = trend_word([None if x is None else -float(x) for x in pr])
-                if not spans_ok and word == "too few runs to call":
-                    word = "not comparable"
-            if not spans_ok:
-                parts.append("failure counts not comparable: the mail-log spans differ")
-            lines.append("- trend over the last %d runs (%s): %s" % (len(pts), word, "; ".join(parts)))
+            # the word compares the first and last runs on the entries' own figures: failure counts over
+            # mail logs that were not cut and cover alike spans, else pass rates over outside views of a
+            # comparable size, else nothing
+            word, why = trend_judgement(pts)
+            lines.append("- trend over the last %d runs (%s): %s" % (len(pts), word, "; ".join(parts + why)))
 
     if plan:
         ch = plan.get("changes") or []
@@ -396,26 +448,12 @@ def _run_stamp(report_path):
     return str(doc.get("run")) if isinstance(doc, dict) and doc.get("run") else None
 
 
-def _report_stamp(report):
-    """The report's own generation time in collect.py's run-stamp form
-    (2026-10-08T090000Z): the cut-off for 'new' when no run.json sits beside it."""
-    try:
-        t = datetime.fromisoformat(str((report or {}).get("generated_utc") or "").replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    t = t.astimezone(timezone.utc) if t.tzinfo else t.replace(tzinfo=timezone.utc)
-    return t.strftime("%Y-%m-%dT%H%M%SZ")
-
-
-def _same_run(updated, stamp, hours=3):
-    """Was a report generated by the run that last wrote senders.json? Its
-    generation time then falls within a few hours after that run's stamp."""
-    try:
-        a = datetime.strptime(str(updated), "%Y-%m-%dT%H%M%SZ")
-        b = datetime.strptime(str(stamp), "%Y-%m-%dT%H%M%SZ")
-    except (TypeError, ValueError):
-        return False
-    return timedelta(0) <= b - a <= timedelta(hours=hours)
+def _report_run(report):
+    """The run stamp collect.py writes into its report.json (inputs.run), so the
+    report names its run wherever it is copied; None for audit.py's own report."""
+    inp = report.get("inputs") if isinstance(report, dict) else None
+    run = inp.get("run") if isinstance(inp, dict) else None
+    return run.strip() if isinstance(run, str) and run.strip() else None
 
 
 def main():
@@ -444,15 +482,13 @@ def main():
         if not isinstance(senders, dict):
             die("%s: expected the senders.json collect.py writes" % args.senders)
         # known = the identities first seen BEFORE the run this report describes; collect.py records a
-        # run's own new senders into senders.json before the summary, so those must still count as new
-        # a report with no run.json beside it (audit.py's own) is dated by its generation time, so a
-        # sender first seen by the last collect run counts as known, not announced a second time - unless
-        # that run is the one that generated this report (collect.py's report.json copied on its own)
-        stamp = _run_stamp(args.report) or _report_stamp(report) or state.get("updated")
-        if not _run_stamp(args.report) and state.get("updated") and _same_run(state.get("updated"), stamp):
-            stamp = state.get("updated")
+        # run's own new senders into senders.json before the summary, so those must still count as new.
+        # The run is the stamp collect.py writes into report.json (inputs.run), else the run.json beside
+        # it; a report with neither is audit.py's own, which describes no collect run: every sender
+        # senders.json holds was seen, and announced, by a run before it
+        stamp = _report_run(report) or _run_stamp(args.report)
         known = {k for k, v in senders.items()
-                 if not (stamp and isinstance(v, dict) and str(v.get("first_seen") or "") >= str(stamp))}
+                 if not (stamp and isinstance(v, dict) and str(v.get("first_seen") or "") >= stamp)}
     if args.metrics:
         try:
             history = json.loads(Path(args.metrics).read_text(encoding="utf-8-sig"))

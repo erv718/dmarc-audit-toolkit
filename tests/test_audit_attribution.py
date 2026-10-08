@@ -574,30 +574,38 @@ def test_report_json_drops_the_verdicts_and_caps_the_source_tables(tmp_path):
     assert doc["truncated"] == {"by_source_ip": {"kept": 1000, "total": 1500}, "unknown_senders": {"kept": 1000, "total": 1200}}
 
 
-def test_the_delta_judges_each_domain_on_its_own_span():
-    """A per-domain row budget cuts one busy domain to hours while a quiet
-    domain still reaches back 30 days: the whole log's span stays put, yet
-    neither the busy domain's counts nor the whole log's can be compared."""
-    def rep(busy_hours, busy_gf):
-        return {"generated_utc": "2026-10-07T15:00:00Z", "gate": {"domains": {}}, "findings": [],
-                "maillog": {"counters": {"genuine_failures": busy_gf + 87, "delivered_despite_fail": 0},
-                            "window": {"hours": 719.0, "rows": 255000},
-                            "by_domain": {"corp.example": {"genuine_failures": busy_gf, "delivered_despite_fail": 0,
-                                                           "window": {"hours": busy_hours, "rows": 250000}},
-                                          "shop.example": {"genuine_failures": 87, "delivered_despite_fail": 0,
-                                                           "window": {"hours": 719.0, "rows": 4000}},
-                                          audit.OTHER: {"genuine_failures": 0, "delivered_despite_fail": 0,
-                                                        "window": {"hours": 2.0, "rows": 1000}}}},
-                "rua": {"totals": {"messages": 100, "pass_rate": 0.9}}}
-    dl = audit.build_delta(rep(41.0, 613), rep(719.0, 2100))
+def test_the_delta_withholds_a_cut_orgs_counts_by_the_recorded_cut_not_by_a_span():
+    """collect.py's row budget cuts one busy org to hours while a quiet domain
+    still reaches back 30 days: the whole log's span stays put, yet neither
+    the cut org's counts nor the whole log's can be compared. The cut is the
+    one collect.py recorded (maillog.cuts); a short span alone is no cut."""
+    def rep(busy_hours, busy_gf, cuts=None):
+        doc = {"generated_utc": "2026-10-07T15:00:00Z", "gate": {"domains": {}}, "findings": [],
+               "maillog": {"counters": {"genuine_failures": busy_gf + 87, "delivered_despite_fail": 0},
+                           "window": {"hours": 719.0, "rows": 255000},
+                           "by_domain": {"corp.example": {"genuine_failures": busy_gf, "delivered_despite_fail": 0,
+                                                          "window": {"hours": busy_hours, "rows": 250000}},
+                                         "shop.example": {"genuine_failures": 87, "delivered_despite_fail": 0,
+                                                          "window": {"hours": 719.0, "rows": 4000}},
+                                         audit.OTHER: {"genuine_failures": 0, "delivered_despite_fail": 0,
+                                                       "window": {"hours": 2.0, "rows": 1000}}}},
+               "rua": {"totals": {"messages": 100, "pass_rate": 0.9}}}
+        if cuts is not None:
+            doc["maillog"]["cuts"] = cuts
+        return doc
+    cut = {"corp.example": {"reason": "row budget", "kept_hours": 41, "kept_from": "2026-10-05T22:00:00Z"}}
+    dl = audit.build_delta(rep(41.0, 613, cut), rep(719.0, 2100, {}))
     assert dl["genuine_failures"] is None and dl["maillog_window"]["comparable"] is False
-    assert dl["maillog_window"]["domains_not_comparable"] == ["corp.example"]
+    assert dl["maillog_window"]["log_comparable"] is True and dl["maillog_window"]["domains_not_comparable"] == ["corp.example"]
+    assert dl["maillog_window"]["cut_orgs"] == {"corp.example": {"now": cut["corp.example"], "previous": None}}
     assert "corp.example" not in dl["by_domain"] and dl["by_domain"]["shop.example"]["genuine_failures"] == 0
-    assert any(n.startswith("corp.example: its own mail-log rows (98% of the log) cover 41 hours now and 30 days")
-               for n in dl["notes"])
-    dl = audit.build_delta(rep(700.0, 613), rep(719.0, 2100))  # alike spans: everything compares
+    assert audit.OTHER not in dl["by_domain"]  # rows under no audited domain follow the whole log
+    assert ("the row budget cut corp.example's mail log in this run (newest 41 hours kept): failure counts for its "
+            "domains, and the whole log's, are not compared") in dl["notes"]
+    dl = audit.build_delta(rep(41.0, 613), rep(719.0, 2100))  # the same spans with no cut recorded: a busy week
     assert dl["genuine_failures"] == -1487 and dl["by_domain"]["corp.example"]["genuine_failures"] == -1487
     assert dl["maillog_window"]["comparable"] is True and dl["maillog_window"]["domains_not_comparable"] == []
+    assert dl["maillog_window"]["cut_orgs"] == {}
 
 
 def test_a_window_of_minutes_is_a_span_not_a_missing_window():
@@ -650,7 +658,6 @@ def test_a_quiet_domains_rows_are_not_a_cut():
     assert dl["maillog_window"]["domains_not_comparable"] == [] and dl["by_domain"]["quiet.example"]["genuine_failures"] == -1
     assert not any("quiet.example" in n for n in dl["notes"])
     assert audit._spans_comparable(0.0, 0.33) is True and audit._spans_comparable(0.5, 40.0) is False
-    assert audit._row_share({"rows": 250000}, {"rows": 255000}) > 0.9 and audit._row_share({"rows": 1}, {}) == 0.0
 
 
 def test_an_address_exception_covers_a_blank_envelope_stream_everywhere(tmp_path):

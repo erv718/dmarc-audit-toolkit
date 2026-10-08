@@ -237,15 +237,18 @@ def pull_domain(tok, template, org, start_hours, end_hours, notes, budget=None, 
 
     Every call's Timespan reaches back to the slice's own start (the API
     applies Timespan from now). budget, a dict holding {"rows": n}, stops the
-    walk at the older slices once n rows are in hand. info, a dict, receives
-    the sizing totals (total, internal) and the planned and pulled slice
-    counts. Returns (rows, columns, data calls)."""
+    walk at the older slices once n rows are in hand, and records how many
+    hours back the kept rows reach (kept_hours). info, a dict, receives the
+    sizing totals (total, internal), the planned and pulled slice counts, and
+    each hour kept at the API cap (capped, as 'Xh..Yh'). Returns (rows,
+    columns, data calls)."""
     if budget is not None and budget.get("rows", 0) <= 0:
         if not budget.get("noted"):
             notes.append("mail log: %s row budget reached at %s ago - older rows skipped; the rows "
                          "cover only the last %s (raise --max-rows to keep more)"
                          % (org, _window(start_hours, end_hours), _ago(end_hours)))
             budget["noted"] = True
+            budget["kept_hours"] = end_hours  # the cut: pull_maillog records it for the delta
         return [], None, 0
     if not sized:
         counts = hourly_counts(tok, template, org, start_hours, end_hours, info)
@@ -261,7 +264,7 @@ def pull_domain(tok, template, org, start_hours, end_hours, notes, budget=None, 
                              "rows, newest first)" % (org, total, len(slices), SLICE_TARGET))
             rows, cols, calls, pulled = [], None, 0, 0
             for a, b in slices:
-                got, c, n = pull_domain(tok, template, org, a, b, notes, budget, sized=True)
+                got, c, n = pull_domain(tok, template, org, a, b, notes, budget, sized=True, info=info)
                 rows.extend(got)
                 cols = cols or c
                 calls += n
@@ -278,43 +281,63 @@ def pull_domain(tok, template, org, start_hours, end_hours, notes, budget=None, 
             raise
         notes.append("mail log: %s window %s ago dropped mid-stream after retries - splitting "
                      "the window" % (org, _window(start_hours, end_hours)))
-        return pull_halves(tok, template, org, start_hours, end_hours, notes, budget)
+        return pull_halves(tok, template, org, start_hours, end_hours, notes, budget, info)
     got = res.get("results") or []
     cols = run_hunting.columns(res)
     if len(got) < ROW_CAP or span <= 1:
         if len(got) >= ROW_CAP:
             notes.append("mail log: %s has more than 100,000 rows within one hour (%s ago) - that "
                          "hour is truncated" % (org, _window(start_hours, end_hours)))
+            if info is not None:
+                info.setdefault("capped", []).append(_window(start_hours, end_hours))
         if budget is not None:
             budget["rows"] -= len(got)
         return got, cols, 1
     notes.append("mail log: %s hit the 100,000-row API cap (%s ago) - splitting the window"
                  % (org, _window(start_hours, end_hours)))
-    return pull_halves(tok, template, org, start_hours, end_hours, notes, budget)
+    return pull_halves(tok, template, org, start_hours, end_hours, notes, budget, info)
 
 
-def pull_halves(tok, template, org, start_hours, end_hours, notes, budget):
+def pull_halves(tok, template, org, start_hours, end_hours, notes, budget, info=None):
     """Both halves of a window, the newer one first so a row budget keeps
     the hours that matter most."""
     mid = end_hours + (start_hours - end_hours) // 2
-    right, cols_r, n2 = pull_domain(tok, template, org, mid, end_hours, notes, budget, sized=True)
-    left, cols_l, n1 = pull_domain(tok, template, org, start_hours, mid, notes, budget, sized=True)
+    right, cols_r, n2 = pull_domain(tok, template, org, mid, end_hours, notes, budget, sized=True, info=info)
+    left, cols_l, n1 = pull_domain(tok, template, org, start_hours, mid, notes, budget, sized=True, info=info)
     return right + left, cols_r or cols_l, n1 + n2
 
 
-def pull_maillog(tok, org_domains, out_csv, days=30, max_rows=ROW_BUDGET, volumes=None):
+def org_cut(budget, info, pulled_at):
+    """What collect cut of one org's pull, as report.json's maillog.cuts
+    records it, or None: the row budget kept only the rows of the last
+    kept_hours (from kept_from on), and/or an hour stayed at the API cap."""
+    cut = {}
+    if budget is not None and budget.get("noted"):
+        kept = budget.get("kept_hours", 0)
+        cut = {"reason": "row budget", "kept_hours": kept,
+               "kept_from": (pulled_at - timedelta(hours=kept)).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    if info.get("capped"):
+        cut.setdefault("reason", "api cap")
+        cut["api_cap_hours"] = list(info["capped"])
+    return cut or None
+
+
+def pull_maillog(tok, org_domains, out_csv, days=30, max_rows=ROW_BUDGET, volumes=None, cuts=None):
     """raw_maillog.kql per organizational domain, merged into one CSV. Each
     domain's note names the rows it got and the time span they cover; when
     the row budget kept only the newest part of a busy domain, the note says
     so, with the sized total. volumes, a dict, receives each org domain's
     internal (Intra-org) row count from its sizing call: the uncapped,
-    spoof-proof volume collect.py hands audit.py for the headline."""
+    spoof-proof volume collect.py hands audit.py for the headline. cuts, a
+    dict, receives each org domain whose rows the row budget or the API cap
+    cut (org_cut): the apex and every subdomain of that org at one cutoff."""
     template = QUERY.read_text(encoding="utf-8-sig")
     rows, cols, notes = [], None, []
     seen = set()
     for org in org_domains:
         budget = {"rows": max_rows} if max_rows else None
         info = {}
+        pulled_at = datetime.now(timezone.utc).replace(microsecond=0)
         try:
             got, res_cols, calls = pull_domain(tok, template, org, days * 24, 0, notes, budget, info=info)
         except (graph_client.GraphError, ValueError) as err:
@@ -327,6 +350,9 @@ def pull_maillog(tok, org_domains, out_csv, days=30, max_rows=ROW_BUDGET, volume
                 volumes[org] = info["internal"]  # measured even when the rows themselves failed
         if got is None:
             continue
+        cut = org_cut(budget, info, pulled_at)
+        if cut and cuts is not None:
+            cuts[org] = cut
         cols = cols or res_cols
         before = len(rows)
         for r in got:
@@ -432,11 +458,9 @@ def metrics_entry(stamp, report, plan):
         "findings": (report.get("summary") or {}).get("by_severity") or {},
         "genuine_failures": ml.get("genuine_failures"),
         "maillog_hours": ((report.get("maillog") or {}).get("window") or {}).get("hours"),
-        # each audited domain's own span: the row budget cuts one busy domain while the whole log's span holds
-        "maillog_hours_by_domain": {d: c["window"].get("hours")
-                                    for d, c in (((report.get("maillog") or {}).get("by_domain") or {}).items())
-                                    if d != audit.OTHER and isinstance(c, dict) and isinstance(c.get("window"), dict)
-                                    and c["window"].get("hours") is not None},
+        # the orgs whose pull the row budget or the API cap cut: their counts, and the whole log's, are a
+        # floor over the hours kept, so the trend never compares them (the whole log's span can still hold)
+        "maillog_cut_orgs": sorted(audit.maillog_cuts(report)),
         "delivered_despite_fail": ml.get("delivered_despite_fail"),
         "likely_spoof": (ml.get("by_likely") or {}).get("likely_spoof"),
         "rua_messages": tot.get("messages"),
@@ -447,20 +471,34 @@ def metrics_entry(stamp, report, plan):
     }
 
 
+def _number(value):
+    """A metrics value as a number, else None: a hand-edited or damaged entry reads as unknown."""
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 def render_metrics(entries, last=12):
-    rows = entries[-last:]
+    """metrics.md, the last runs as a table. A run whose mail log the row
+    budget or the API cap cut shows its failure count as the floor it is;
+    an entry or a value of the wrong type reads as unknown, never an error."""
+    rows = [e for e in entries if isinstance(e, dict)][-last:]
     L = ["# Runs", "", "| run | domains: policy / gate | findings | genuine failures | pass rate | plan rows |", "|---|---|---|---|---|---|"]
     for e in rows:
-        doms = "; ".join("%s %s/%s" % (d, v.get("policy") or "unknown", v.get("gate"))
-                         for d, v in list(e["domains"].items())[:4])
-        if len(e["domains"]) > 4:
-            doms += " (+%d)" % (len(e["domains"]) - 4)
-        f = e.get("findings") or {}
-        fs = ", ".join("%s %d" % (k, v) for k, v in sorted(f.items())) or "-"
-        pr = "%.1f%%" % (100 * float(e["rua_pass_rate"])) if e.get("rua_pass_rate") is not None else "-"
-        L.append("| %s | %s | %s | %s | %s | %d (%d now) |" % (e["run"], doms, fs,
-                                                               e.get("genuine_failures") if e.get("genuine_failures") is not None else "-",
-                                                               pr, e.get("plan_changes", 0), e.get("plan_priority1", 0)))
+        per = e.get("domains") if isinstance(e.get("domains"), dict) else {}
+        doms = "; ".join("%s %s/%s" % (d, (v.get("policy") if isinstance(v, dict) else None) or "unknown",
+                                       v.get("gate") if isinstance(v, dict) else None)
+                         for d, v in list(per.items())[:4])
+        if len(per) > 4:
+            doms += " (+%d)" % (len(per) - 4)
+        f = e.get("findings") if isinstance(e.get("findings"), dict) else {}
+        fs = ", ".join("%s %d" % (k, v) for k, v in sorted(f.items()) if _number(v) is not None) or "-"
+        gf = _number(e.get("genuine_failures"))
+        cut = [str(o) for o in e.get("maillog_cut_orgs") or [] if o] if isinstance(e.get("maillog_cut_orgs"), list) else []
+        gfs = "-" if gf is None else ("%s (floor, %s cut)" % (gf, ", ".join(cut)) if cut else str(gf))
+        rate = _number(e.get("rua_pass_rate"))
+        pr = "%.1f%%" % (100 * rate) if rate is not None else "-"
+        L.append("| %s | %s | %s | %s | %s | %d (%d now) |" % (e.get("run") or "-", doms, fs, gfs, pr,
+                                                               _number(e.get("plan_changes")) or 0,
+                                                               _number(e.get("plan_priority1")) or 0))
     L.append("")
     return "\n".join(L)
 
@@ -770,9 +808,10 @@ def main():
     # 3. mail log
     maillog, auth_column = args.maillog, args.auth_column
     volumes = {}  # internal mail per org domain, from the sizing calls: the headline signal
+    cuts = {}  # the orgs whose pull the row budget or the API cap cut: the report records them for the delta
     if tok and not maillog:
         maillog, mnotes = pull_maillog(tok, orgs, run_dir / "maillog.csv", min(args.days, 30), args.max_rows,
-                                       volumes)
+                                       volumes, cuts)
         for n in mnotes:
             note(n)
             if "not pulled" in n or "that hour is truncated" in n:
@@ -821,6 +860,8 @@ def main():
         extra["headline"] = headline
     if volumes and len(volumes) == len(orgs) and accepts(audit.build_report, "volume"):
         extra["volume"] = volumes  # only a complete set ranks: a missing org would lose by default
+    if accepts(audit.build_report, "maillog_cuts"):
+        extra["maillog_cuts"] = cuts  # read before the delta is built: a cut org's counts are never compared
     try:
         report = audit.build_report(
             domains=domains, domain_sources=domain_sources, rua_paths=rua_paths, maillog=maillog,
@@ -830,6 +871,12 @@ def main():
             vendor_domains=args.vendor_domain, exceptions=exceptions, **extra)
     except audit.UsageError as err:
         die(str(err))
+    if isinstance(report.get("inputs"), dict):
+        report["inputs"]["run"] = stamp  # which run wrote it, for a reader that finds report.json on its own
+    head = (report.get("gate") or {}).get("headline_domain")
+    if head in domains:  # the headline first: a --file domains.txt re-run types it first, and so keeps it
+        (run_dir / "domains.txt").write_text("\n".join([head] + [d for d in domains if d != head]) + "\n",
+                                             encoding="utf-8")
     if tok and not args.maillog and orgs:
         note(headline_note(report.get("gate") or {}, orgs, volumes))
     # an hour still at the API row cap dropped rows, and a row budget kept only the newest
@@ -874,6 +921,8 @@ def main():
     try:
         entries = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else []
     except ValueError:
+        entries = []
+    if not isinstance(entries, list):  # not the history this file holds: start it again, as for broken JSON
         entries = []
     entries.append(metrics_entry(stamp, report, plan))
     metrics_path.write_text(json.dumps(entries, indent=1), encoding="utf-8")

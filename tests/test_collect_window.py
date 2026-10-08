@@ -273,11 +273,12 @@ def test_truncation_text_comes_from_the_slicers_own_notes():
     assert collect.truncation_text(["mail log: 30 rows for other.example (last 30 days)"]) is None
 
 
-def test_metrics_carry_the_mail_logs_span_for_the_trend():
+def test_metrics_carry_the_mail_logs_span_and_the_cut_orgs_for_the_trend():
     report = {"gate": {"domains": {}}, "maillog": {"counters": {"genuine_failures": 3}, "window": {"hours": 41.0}},
               "rua": {"totals": {}}, "summary": {}}
-    assert collect.metrics_entry("2026-10-07T150000Z", report, {"changes": []})["maillog_hours"] == 41.0
-    report["maillog"]["by_domain"] = {"corp.example": {"window": {"hours": 41.0}}, "shop.example": {"window": {"hours": 719.0}},
-                                      collect.audit.OTHER: {"window": {"hours": 2.0}}, "none.example": {"window": None}}
-    assert collect.metrics_entry("2026-10-07T150000Z", report, {"changes": []})["maillog_hours_by_domain"] == {
-        "corp.example": 41.0, "shop.example": 719.0}
+    entry = collect.metrics_entry("2026-10-07T150000Z", report, {"changes": []})
+    assert entry["maillog_hours"] == 41.0 and entry["maillog_cut_orgs"] == [] and "maillog_hours_by_domain" not in entry
+    report["maillog"]["cuts"] = {"shop.example": {"reason": "api cap", "api_cap_hours": ["3h..2h"]},
+                                 "corp.example": {"reason": "row budget", "kept_hours": 41}}
+    assert collect.metrics_entry("2026-10-07T150000Z", report, {"changes": []})["maillog_cut_orgs"] == [
+        "corp.example", "shop.example"]

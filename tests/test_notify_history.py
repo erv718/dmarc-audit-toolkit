@@ -147,7 +147,7 @@ def test_the_trend_word_does_not_compare_failure_counts_across_different_spans()
                {"genuine_failures": 5, "rua_pass_rate": 0.69, "maillog_hours": 41.0}]
     text = notify.summarize(report(), history=history)
     assert "(improving)" not in text and "(worsening)" in text  # the pass rate fell: that is the word
-    assert "genuine failures 118, 120, 5" in text and "failure counts not comparable: the mail-log spans differ" in text
+    assert "genuine failures 118, 120, 5" in text and "failure counts not compared: the mail-log spans differ" in text
     history[2]["maillog_hours"] = 700.0
     assert "(improving)" in notify.summarize(report(), history=history)
     assert "trend over the last 2 runs" in notify.summarize(report(), history=[1, history[0], history[1]])  # a corrupt entry is skipped
@@ -171,7 +171,7 @@ def test_counts_and_the_sender_history_see_every_source_when_the_tables_are_capp
     assert "*newly seen senders*: 198.51.100.7, 203.0.113.9" in text
 
 
-def test_a_report_without_run_json_is_dated_by_its_own_generation_time(tmp_path):
+def test_a_report_without_a_run_stamp_counts_every_recorded_sender_as_known(tmp_path):
     import json as _json
     import subprocess
     import sys as _sys
@@ -189,23 +189,23 @@ def test_a_report_without_run_json_is_dated_by_its_own_generation_time(tmp_path)
                         "--dry-run"], capture_output=True, text=True)
     assert p.returncode == 0, p.stderr
     assert "newly identified senders: none" in p.stdout  # 198.51.100.7 was seen, and announced, by the last run
-    assert notify._report_stamp(rep) == "2026-10-08T090000Z" and notify._report_stamp({}) is None
     (tmp_path / "metrics.json").write_text("[1, 2]", encoding="utf-8")
     p = subprocess.run([_sys.executable, script, "--report", str(tmp_path / "report.json"), "--metrics",
                         str(tmp_path / "metrics.json"), "--dry-run"], capture_output=True, text=True)
     assert p.returncode == 2 and "expected the metrics list collect.py writes" in p.stderr
 
 
-def test_the_trend_word_honours_each_domains_span_and_the_audits_own_verdict():
-    history = [{"genuine_failures": 2187, "rua_pass_rate": 0.70, "maillog_hours": 719.0, "maillog_hours_by_domain": {"corp.example": 719.0}},
-               {"genuine_failures": 700, "rua_pass_rate": 0.69, "maillog_hours": 719.0, "maillog_hours_by_domain": {"corp.example": 41.0}}]
+def test_the_trend_word_honours_the_cuts_each_run_recorded():
+    history = [{"genuine_failures": 2187, "rua_pass_rate": 0.70, "maillog_hours": 719.0, "maillog_cut_orgs": []},
+               {"genuine_failures": 700, "rua_pass_rate": 0.69, "maillog_hours": 719.0, "maillog_cut_orgs": ["corp.example"]}]
     text = notify.summarize(report(), history=history)
-    assert "(improving)" not in text and "(worsening)" in text and "failure counts not comparable" in text
-    history[1]["maillog_hours_by_domain"]["corp.example"] = 700.0
+    assert "(improving)" not in text and "(worsening)" in text
+    assert "failure counts not compared: the mail log was cut for corp.example in one of these runs" in text
+    history[1]["maillog_cut_orgs"] = []
     assert "(improving)" in notify.summarize(report(), history=history)
     rep = report()
     rep["delta"] = {"previous_generated_utc": "2026-01-08T06:00:00Z", "maillog_window": {"comparable": False}}
-    assert "(improving)" not in notify.summarize(rep, history=history)  # two points: the audit already judged them
+    assert "(improving)" in notify.summarize(rep, history=history)  # the entries carry each run's own figures
     # a span of minutes stored as 0.0 hours is a span, and with no pass rate the word says what it is
     history = [{"genuine_failures": 2187, "maillog_hours": 719.0}, {"genuine_failures": 3, "maillog_hours": 0.0}]
     text = notify.summarize(report(), history=history)
@@ -220,6 +220,7 @@ def test_a_collect_report_copied_away_from_its_run_json_still_announces_that_run
     from pathlib import Path as _Path
     rep = report(sources=("192.0.2.10", "198.51.100.7"), envelopes=("example.com",))
     rep["generated_utc"] = "2026-10-07T15:12:30Z"  # twelve minutes into the run that wrote senders.json
+    rep["inputs"] = {"run": "2026-10-07T150000Z"}  # collect.py names its run in the report itself
     (tmp_path / "report.json").write_text(_json.dumps(rep), encoding="utf-8")
     senders = tmp_path / "senders.json"
     senders.write_text(_json.dumps({"updated": "2026-10-07T150000Z", "senders": {
@@ -230,6 +231,3 @@ def test_a_collect_report_copied_away_from_its_run_json_still_announces_that_run
                         "--senders", str(senders), "--dry-run"], capture_output=True, text=True)
     assert p.returncode == 0, p.stderr
     assert "*newly identified senders* (never seen in an earlier run): 198.51.100.7" in p.stdout
-    assert notify._report_stamp({"generated_utc": "2026-10-08T09:00:00+00:00"}) == "2026-10-08T090000Z"
-    assert notify._report_stamp({"generated_utc": "2026-10-08T11:00:00.250+02:00"}) == "2026-10-08T090000Z"
-    assert notify._same_run("2026-10-07T150000Z", "2026-10-07T151230Z") and not notify._same_run("2026-10-07T150000Z", "2026-10-08T090000Z")

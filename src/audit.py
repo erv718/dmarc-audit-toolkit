@@ -1459,31 +1459,41 @@ def read_previous_report(path):
 
 
 def _finding_keys(doc):
-    return {((f.get("source") or ""), (f.get("id") or "")): f for f in doc.get("findings") or []}
+    return {((f.get("source") or ""), (f.get("id") or "")): f for f in doc.get("findings") or [] if isinstance(f, dict)}
 
 
 def _sender_key(s):
     return (s.get("sender"), s.get("domain"), s.get("envelope_domain"))
 
 
+def _sender_org(s):
+    """The organizational domain of a census sender's From domain (its address's, when the row has none)."""
+    return discover.org_domain(str(s.get("domain") or "") or str(s.get("sender") or "").rpartition("@")[2])
+
+
+def _dict(value):
+    """value when it is a dict, else {}: a damaged report section reads as an empty one."""
+    return value if isinstance(value, dict) else {}
+
+
 def _hours(window):
     """A mail-log window's span in hours: from its stamps when they parse (the
     stored figure is rounded, so a few minutes read as 0.0), else the stored
     hours; None when the window carries neither. Zero is a span, not a gap."""
-    w = window if isinstance(window, dict) else {}
+    w = _dict(window)
     try:
         a = datetime.fromisoformat(str(w.get("from")).replace("Z", "+00:00"))
         b = datetime.fromisoformat(str(w.get("to")).replace("Z", "+00:00"))
         a = a if a.tzinfo else a.replace(tzinfo=timezone.utc)
         b = b if b.tzinfo else b.replace(tzinfo=timezone.utc)
         return max(0.0, (b - a).total_seconds() / 3600)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         pass
     try:
         h = float(w.get("hours"))
     except (TypeError, ValueError):
         return None
-    return h if h >= 0 else None
+    return h if 0 <= h < float("inf") else None
 
 
 def _spans_comparable(now_hours, prev_hours):
@@ -1493,17 +1503,6 @@ def _spans_comparable(now_hours, prev_hours):
     if now_hours is None or prev_hours is None or max(now_hours, prev_hours) < 1:
         return True
     return min(now_hours, prev_hours) / max(now_hours, prev_hours) >= 0.5
-
-
-# a domain can only have been cut by the row budget when it holds a real share of the log's rows: a quiet
-# domain's few rows fall where they fall, and their span says nothing about coverage
-CUT_ROWS, CUT_SHARE = 1000, 0.1
-
-
-def _row_share(window, log_window):
-    """The share of the log's rows a domain's window holds; 0.0 when either count is unknown."""
-    rows, total = _count((window or {}).get("rows")), _count((log_window or {}).get("rows"))
-    return rows / total if rows and total else 0.0
 
 
 def _count(value):
@@ -1521,49 +1520,144 @@ def _hours_text(hours):
     return "%d hours" % int(hours + 0.5) if hours < 48 else "%d days" % int(hours / 24 + 0.5)
 
 
+def _names(items, cap=3):
+    """'a', 'a and b', 'a, b and c', 'a, b, c and 2 more'."""
+    items = [str(i) for i in items]
+    if len(items) > cap:
+        items = items[:cap] + ["%d more" % (len(items) - cap)]
+    if len(items) < 2:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+# how an older report names a cut organization: collect.py's notes, copied into the caveats, and the
+# maillog.truncation clauses it builds from them (41h, or 2d when the hours fall on whole days)
+CUT_TEXTS = (
+    ("budget", re.compile(r"row budget kept only the newest (?P<n>\d+)(?P<unit>[hd]) for (?P<org>[^\s;]+)")),
+    ("budget", re.compile(r"mail log: (?P<org>\S+) row budget reached .*? cover only the last (?P<n>\d+)(?P<unit>[hd])")),
+    ("cap", re.compile(r"an hour of (?P<org>[^\s;]+) \((?P<span>[^)]+?) ago\) is truncated at the API cap")),
+    ("cap", re.compile(r"mail log: (?P<org>\S+) has more than [\d,]+ rows within one hour \((?P<span>[^)]+?) ago\)")),
+)
+
+
+def maillog_cuts(report):
+    """{organizational domain: cut info} for the orgs whose mail-log pull
+    collect.py cut in the run that wrote this report: the row budget kept
+    only the newest hours ({"reason": "row budget", "kept_hours": 41,
+    "kept_from": "2026-10-05T22:00:00Z"}), and/or an hour stayed at the API
+    row cap ("api_cap_hours": ["3h..2h"]; the reason is "api cap" when that
+    is the only cause). maillog.cuts holds them when the report records
+    them; an older report says the same in maillog.truncation and its
+    caveats, which are parsed. {} when nothing says so; an odd value reads
+    as nothing, never an error."""
+    doc = _dict(report)
+    ml = _dict(doc.get("maillog"))
+    if isinstance(ml.get("cuts"), dict):
+        return {_norm_name(org): dict(_dict(info)) for org, info in ml["cuts"].items()
+                if isinstance(org, str) and _norm_name(org)}
+    texts = [ml.get("truncation")] + (doc.get("caveats") if isinstance(doc.get("caveats"), list) else [])
+    found = {}
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        for kind, rx in CUT_TEXTS:
+            for m in rx.finditer(text):
+                cut = found.setdefault(_norm_name(m.group("org")), {})
+                if kind == "budget":
+                    cut["kept_hours"] = int(m.group("n")) * (24 if m.group("unit") == "d" else 1)
+                elif m.group("span") not in cut.setdefault("api_cap_hours", []):
+                    cut["api_cap_hours"].append(m.group("span"))
+    return {org: dict({"reason": "row budget" if "kept_hours" in cut else "api cap"}, **cut)
+            for org, cut in found.items()}
+
+
+def _cut_hours_capped(info):
+    caps = _dict(info).get("api_cap_hours")
+    return [c for c in caps if isinstance(c, str) and c.strip()] if isinstance(caps, list) else []
+
+
+def _cut_cause(*infos):
+    """What cut an org's mail log, from its recorded cut info: 'the row budget',
+    'the API row cap', both, or None when the info does not say."""
+    budget = any(_dict(i).get("reason") == "row budget" or "kept_hours" in _dict(i) for i in infos)
+    cap = any(_dict(i).get("reason") == "api cap" or _cut_hours_capped(i) for i in infos)
+    if budget and cap:
+        return "the row budget and the API row cap"
+    return "the row budget" if budget else ("the API row cap" if cap else None)
+
+
+def _cut_kept(info):
+    """What one run's cut left, for a note: 'newest 41 hours kept', 'an hour truncated, 3h..2h ago'.
+    The hours are collect.py's own cutoff, so they print exactly: days only when they fall on whole days."""
+    parts = []
+    kept = _dict(info).get("kept_hours")
+    if isinstance(kept, int) and not isinstance(kept, bool) and kept > 0:
+        parts.append("newest %s kept" % ("%d days" % (kept // 24) if kept % 24 == 0 and kept >= 48
+                                         else "%d hour%s" % (kept, "" if kept == 1 else "s")))
+    caps = _cut_hours_capped(info)
+    if caps:
+        parts.append("%s truncated, %s ago" % ("an hour" if len(caps) == 1 else "%d hours" % len(caps), ", ".join(caps)))
+    return "; ".join(parts)
+
+
+def _cut_note(org, now, prev):
+    """The delta's note for one cut organization: what cut its mail log, in which run, and what was kept."""
+    if now is not None and prev is not None:
+        when, kept = "both runs", [(_cut_kept(now), " now"), (_cut_kept(prev), " in the previous run")]
+    elif now is not None:
+        when, kept = "this run", [(_cut_kept(now), "")]
+    else:
+        when, kept = "the previous run", [(_cut_kept(prev), "")]
+    detail = "; ".join(k + suffix for k, suffix in kept if k)
+    cause = _cut_cause(now, prev)
+    head = "%s cut %s's mail log in %s" % (cause, org, when) if cause else "%s's mail log was cut in %s" % (org, when)
+    return "%s%s: failure counts for its domains, and the whole log's, are not compared" % (
+        head, " (%s)" % detail if detail else "")
+
+
+def _unknown_sender_check(doc):
+    """Whether a report's per-IP unknown-sender check ran: rua.filters.known.ip_check
+    when the report records it, else whether a known list was given (an older
+    report); None when the report has no outside view."""
+    rua = doc.get("rua")
+    if not isinstance(rua, dict):
+        return None
+    known = _dict(_dict(rua.get("filters")).get("known"))
+    return known["ip_check"] if isinstance(known.get("ip_check"), bool) else bool(known.get("given"))
+
+
 def build_delta(report, previous):
     """What changed since an earlier report.json: whole-log and per-domain
     counters, findings, policies, gates and census senders. A counter delta
-    is None when either side lacks the data; notes say why."""
+    is None when either side lacks the data, when the two mail logs cover
+    spans that cannot be compared, or when collect.py cut an organization's
+    mail log in either run (maillog.cuts: the row budget or the API cap left
+    a floor over the hours kept); notes say why."""
     notes = []
-    now_c = (report.get("maillog") or {}).get("counters") or {}
-    prev_c = (previous.get("maillog") or {}).get("counters") or {}
+    now_ml, prev_ml = _dict(report.get("maillog")), _dict(previous.get("maillog"))
+    now_c, prev_c = _dict(now_ml.get("counters")), _dict(prev_ml.get("counters"))
+    both = bool(now_c and prev_c)
     # a mail log that covers 41 hours and one that covers 30 days cannot be compared message for
-    # message: the deltas stay out and the note says why (a row budget or a cap shortens the span)
-    now_w = (report.get("maillog") or {}).get("window") or {}
-    prev_w = (previous.get("maillog") or {}).get("window") or {}
+    # message: the deltas stay out and the note says why
+    now_w, prev_w = _dict(now_ml.get("window")), _dict(prev_ml.get("window"))
     nh, ph = _hours(now_w), _hours(prev_w)
-    log_comparable = not (now_c and prev_c) or _spans_comparable(nh, ph)
+    log_comparable = not both or _spans_comparable(nh, ph)
     if not log_comparable:
         notes.append("the mail logs cover different spans (%s now, %s in the previous run): failure counts are "
                      "not comparable, so their deltas are not computed" % (_hours_text(nh), _hours_text(ph)))
-    # the row budget cuts one busy domain at a time, so the whole log's span can stay at 30 days (a
-    # quiet domain still reaches back that far) while the busy domain's own rows cover hours: each
-    # domain is judged on its own window, and one cut domain spoils the whole log's counts too
-    now_bd = (report.get("maillog") or {}).get("by_domain") or {}
-    prev_bd = (previous.get("maillog") or {}).get("by_domain") or {}
-    domain_comparable = {}
-    for d, c in now_bd.items():
-        p = prev_bd.get(d)
-        if d == OTHER or not isinstance(c, dict) or not isinstance(p, dict) or not (c.get("window") and p.get("window")):
-            continue
-        dh, dp = _hours(c.get("window")), _hours(p.get("window"))
-        ok = _spans_comparable(dh, dp)
-        if not ok:
-            # the shorter side must look like the budget's work: many rows, a real share of that log's rows
-            cut_w, cut_log = (c.get("window"), now_w) if (dh or 0) <= (dp or 0) else (p.get("window"), prev_w)
-            rows, share = _count((cut_w or {}).get("rows")) or 0, _row_share(cut_w, cut_log)
-            if rows >= CUT_ROWS and share >= CUT_SHARE:
-                notes.append("%s: its own mail-log rows (%d%% of the log) cover %s now and %s in the previous run: its "
-                             "failure counts, and the whole log's, are not comparable, so those deltas are not computed"
-                             % (d, int(share * 100 + 0.5), _hours_text(dh), _hours_text(dp)))
-            else:
-                ok = True  # a quiet domain's rows cluster as they fall: not a cut, its small counts compare
-        domain_comparable[d] = ok
-    windows_comparable = log_comparable and all(domain_comparable.values())
+    # collect.py records each org whose pull it cut: one row budget and one query per org, so the apex and
+    # every subdomain lose the same older hours, and the whole log holds that floor too, while the whole
+    # log's own span can stay at 30 days. A span is never taken for a cut: only the recorded cut counts
+    now_cut, prev_cut = maillog_cuts(report), maillog_cuts(previous)
+    cut_orgs = {org: {"now": now_cut.get(org), "previous": prev_cut.get(org)}
+                for org in sorted(set(now_cut) | set(prev_cut))}
+    cut_families = {discover.org_domain(org) for org in cut_orgs} if both else set()
+    for org, sides in cut_orgs.items() if both else ():
+        notes.append(_cut_note(org, sides["now"], sides["previous"]))
+    comparable = log_comparable and not cut_families
     # the outside view: a first full archive against a near-empty one is not a trend, it is a different archive
-    now_t = (report.get("rua") or {}).get("totals") or {}
-    prev_t = (previous.get("rua") or {}).get("totals") or {}
+    now_t = _dict(_dict(report.get("rua")).get("totals"))
+    prev_t = _dict(_dict(previous.get("rua")).get("totals"))
     nm, pm = _count(now_t.get("messages")), _count(prev_t.get("messages"))
     rua = {"now_messages": nm, "previous_messages": pm, "comparable": None, "pass_rate_change": None}
     if nm is not None and pm is not None and (nm or pm):  # two empty outside views have nothing to compare
@@ -1579,13 +1673,24 @@ def build_delta(report, previous):
                          "the pass-rate change is not computed" % (nm, pm))
 
     def diff(key):
-        if not windows_comparable:
+        if not comparable:
             return None
         return now_c[key] - prev_c[key] if key in now_c and key in prev_c else None
 
     if bool(now_c) != bool(prev_c):
         notes.append("a mail log on one side only: counter deltas not computed")
     now_f, prev_f = _finding_keys(report), _finding_keys(previous)
+    # the per-IP unknown-sender check (OUTSIDE-002; OUTSIDE-009 says it did not run) can run in one run only:
+    # its findings coming or going then say nothing about the senders
+    ran_now, ran_prev = _unknown_sender_check(report), _unknown_sender_check(previous)
+    if ran_now is not None and ran_prev is not None and ran_now != ran_prev:
+        dropped = [k for k in (("rua", "OUTSIDE-002"), ("rua", "OUTSIDE-009")) if k in now_f or k in prev_f]
+        for k in dropped:
+            now_f.pop(k, None)
+            prev_f.pop(k, None)
+        if dropped:
+            notes.append("the unknown-sender check ran in one of the two runs only: its findings (%s) are not "
+                         "compared" % ", ".join(k[1] for k in dropped))
 
     def brief(f, key):
         return {"id": key[1], "source": key[0], "severity": f.get("severity"), "title": f.get("title")}
@@ -1605,23 +1710,44 @@ def build_delta(report, previous):
             policy_changes[d] = {"from": p.get("current_policy"), "to": g.get("current_policy")}
         if p.get("verdict") != g.get("verdict"):
             gate_changes[d] = {"from": p.get("verdict"), "to": g.get("verdict")}
-    now_s = ((report.get("maillog") or {}).get("census") or {}).get("by_sender")
-    prev_s = ((previous.get("maillog") or {}).get("census") or {}).get("by_sender")
+    now_s = _dict(now_ml.get("census")).get("by_sender")
+    prev_s = _dict(prev_ml.get("census")).get("by_sender")
     new_senders, gone_senders = [], []
-    if now_s is None or prev_s is None:
+    if not isinstance(now_s, list) or not isinstance(prev_s, list):
         if now_c or prev_c:
             notes.append("sender census missing on one side (older report, or no mail log): "
                          "new_senders not computed")
     else:
+        now_s, prev_s = [s for s in now_s if isinstance(s, dict)], [s for s in prev_s if isinstance(s, dict)]
         prev_keys = {_sender_key(s) for s in prev_s}
         now_keys = {_sender_key(s) for s in now_s}
         new_senders = [s for s in now_s if _sender_key(s) not in prev_keys]
         gone_senders = [s for s in prev_s if _sender_key(s) not in now_keys]
-    by_domain = {}  # a domain whose own span held still keeps its delta when another domain was cut
-    for d, c in now_bd.items():
+        # a sender under an org the previous run cut may only have fallen outside the hours it kept, and one
+        # under an org this run cut may only fall outside this run's: that makes it neither new nor gone
+        for whose, cut, senders, word in (("the previous run's", prev_cut, new_senders, "new"),
+                                          ("this run's", now_cut, gone_senders, "gone")):
+            families = {discover.org_domain(org) for org in cut}
+            held = [s for s in senders if _sender_org(s) in families]
+            if held:
+                senders[:] = [s for s in senders if s not in held]
+                notes.append("%d sender%s under %s not listed as %s: %s cut mail log may simply have missed %s"
+                             % (len(held), "" if len(held) == 1 else "s", _names(sorted({_sender_org(s) for s in held})),
+                                word, whose, "it" if len(held) == 1 else "them"))
+    # every name under a cut org lost the same hours, quiet or busy, with or without rows on either side;
+    # a domain under another org keeps its delta. Rows under no audited domain may be any org's: they
+    # follow the whole log
+    by_domain, withheld = {}, []
+    prev_bd = _dict(prev_ml.get("by_domain"))
+    for d, c in _dict(now_ml.get("by_domain")).items():
         p = prev_bd.get(d)
-        if p and domain_comparable.get(d, log_comparable):
+        if not (isinstance(c, dict) and isinstance(p, dict)):
+            continue
+        ok = comparable if d == OTHER else (log_comparable and discover.org_domain(d) not in cut_families)
+        if ok:
             by_domain[d] = {k: c.get(k, 0) - p.get(k, 0) for k in ("genuine_failures", "delivered_despite_fail")}
+        elif d != OTHER:
+            withheld.append(d)
     return {"previous_generated_utc": previous.get("generated_utc"),
             "previous_version": previous.get("version"),
             "genuine_failures": diff("genuine_failures"),
@@ -1632,8 +1758,9 @@ def build_delta(report, previous):
             "domains_removed": [d for d in prev_g if d not in now_g],
             "new_senders": new_senders, "gone_senders": gone_senders,
             "by_domain": by_domain,
-            "maillog_window": {"now": now_w or None, "previous": prev_w or None, "comparable": windows_comparable,
-                               "domains_not_comparable": sorted(d for d, ok in domain_comparable.items() if not ok)},
+            "maillog_window": {"now": now_w or None, "previous": prev_w or None, "comparable": comparable,
+                               "log_comparable": log_comparable, "domains_not_comparable": sorted(withheld),
+                               "cut_orgs": cut_orgs},
             "rua": rua, "notes": notes}
 
 
@@ -1644,7 +1771,7 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                  expect_policy=None, retiring=(), columns=None, domain_file=None,
                  rules_json=None, bypasses_json=None, groups_json=None, domain_sources=None,
                  previous_report=None, headline=None, volume=None, exceptions=None, keep_verdicts=False,
-                 max_sources=REPORT_SOURCES):
+                 max_sources=REPORT_SOURCES, maillog_cuts=None):
     """The whole audit as one document. Raises UsageError on input problems.
     max_sources: the aggregate reports' source tables keep this many of their
     busiest rows in the document (0 = all), the totals in rua.truncated.
@@ -1653,6 +1780,9 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
     the census have used them, and maillog.verdicts_omitted says how many -
     a large tenant's verdicts alone ran to millions of lines of JSON.
     previous_report: an earlier run's report.json as a dict; adds report["delta"].
+    maillog_cuts: {org domain: cut info} for the orgs whose mail-log pull
+    collect.py cut (collect.pull_maillog fills it; {} when it cut none),
+    kept as maillog.cuts for the delta and the next run's (see maillog_cuts()).
     headline: an optional explicit headline override; without it the headline
     is a typed domain (cli, then --file), else the org family carrying the
     most mail, else the tenant default domain - see headline_domain.
@@ -1730,6 +1860,8 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                          "worst": worst_severity(findings), "exit_code": code,
                          "gate": report["gate"]["verdict"], "next_step": report["gate"]["next_step"]}
     report["verified_vs_inferred"] = verified_vs_inferred(report)
+    if maillog_doc and isinstance(maillog_cuts, dict):
+        maillog_doc["cuts"] = dict(maillog_cuts)  # what collect.py cut: the delta reads it, and so does the next run's
     if previous_report:
         report["delta"] = build_delta(report, previous_report)
     if maillog_doc and not keep_verdicts:
@@ -1943,12 +2075,22 @@ def _md_census(L, cs):
 
 
 def _md_delta(L, dl):
-    spans_differ = (dl.get("maillog_window") or {}).get("comparable") is False
+    mw = _dict(dl.get("maillog_window"))
+    why, said = [], 0  # what withheld the counts, and how many notes below say so
+    if mw.get("comparable") is False:
+        cut = sorted(_dict(mw.get("cut_orgs")))
+        if cut:
+            why.append("mail log cut for %s" % _names(cut))
+            said += len(cut)
+        if mw.get("log_comparable") is False or not cut:  # a delta from before the cuts were recorded judged spans only
+            why.append("mail-log spans not comparable")
+            said += 1
+    withheld = ("n/a (%s, see the note%s below)" % (" and ".join(why), "s" if said > 1 else "") if why
+                else "n/a (no mail log on one side)")
 
     def signed(n):
         if n is None:
-            return "n/a (%s)" % ("mail-log spans not comparable, see the note below" if spans_differ
-                                 else "no mail log on one side")
+            return withheld
         return f"{n:+d}"
 
     def more(items, cap=10):

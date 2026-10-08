@@ -959,10 +959,11 @@ def test_the_deltas_verdict_applies_only_to_a_trend_about_the_same_previous_run(
     # rate is judged from the trend's own figures, since a trend merged by day could hold another run's view
     t = next_steps.apply_comparability(dict(other, label="2026-10-01"), not_ok, rep, view)
     assert t["previous_genuine_failures"] is None and t["previous_pass_rate"] == 0.97 and len(t["not_comparable"]) == 1
+    # a delta from before the cuts were recorded named the domains whose own spans differed: no cause, no direction
     cut = dict(not_ok, maillog_window={"comparable": False, "domains_not_comparable": ["corp.example"]})
     t = next_steps.apply_comparability(dict(other, label="2026-10-01"), cut, rep, view)
-    assert t["not_comparable"] == ["failure counts are not compared: corp.example's own mail-log rows cover a much "
-                                   "shorter span than in the previous run (the row budget keeps a busy domain's newest hours)"]
+    assert t["not_comparable"] == ["failure counts are not compared: the mail-log rows of corp.example cover very "
+                                   "different spans in the two runs"]
     # and a comparable delta does not vouch for a trend about a run whose log covered 30 days
     ok = dict(not_ok, maillog_window={"comparable": True}, rua={"comparable": True})
     t = next_steps.apply_comparability(dict(other, previous_maillog_hours=719.0), ok, rep, view)
@@ -1075,12 +1076,14 @@ def test_a_delta_the_audit_refused_to_compare_is_a_trend_line_not_a_first_run():
                                     "delivered_despite_fail": 0, "by_likely": {}}, "auth_column": "DMARC",
                        "window": {"from": "2026-10-05T22:00:00Z", "to": "2026-10-07T15:00:00Z", "hours": 41.0}},
            "delta": {"previous_generated_utc": "2026-10-01T15:00:00Z", "genuine_failures": None, "delivered_despite_fail": None,
-                     "maillog_window": {"comparable": False, "domains_not_comparable": ["corp.example"]},
+                     "maillog_window": {"comparable": False, "log_comparable": True, "domains_not_comparable": ["corp.example"],
+                                        "cut_orgs": {"corp.example": {"now": {"reason": "row budget", "kept_hours": 41},
+                                                                      "previous": None}}},
                      "rua": {"comparable": None}, "notes": []}}
     doc = next_steps.build(rep)
     line = next(l for l in doc["stand"]["lines"] if l.startswith("**Trend"))
     assert line.startswith("**Trend vs 2026-10-01: not comparable**") and "first run" not in line
-    assert "corp.example's own mail-log rows cover a much shorter span" in line
+    assert "the row budget cut the mail log for corp.example in this run" in line
     assert next_steps.trend_from_delta({"previous_generated_utc": "2026-10-01T15:00:00Z", "genuine_failures": None}, 1, None) is None
 
 
