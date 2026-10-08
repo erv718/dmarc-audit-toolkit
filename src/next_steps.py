@@ -657,9 +657,9 @@ def own_domain_view(report, view, org):
     excepted = sum(_n(v) or 0 for v in exc_likely.values()) or (_n(gate_dom.get("excepted_failures")) or 0)
     # one entry per address whatever envelope it failed through, less what the gate formally excepted:
     # the gate's blocker counts are after the exceptions, so every number here is too. A gate that
-    # names no excepted senders (an older report.json) cannot be taken off the named counts: then the
-    # split and the names stay raw and the excepted total is a clause of its own.
-    reduce = exc_senders is not None
+    # does not say which of a sender's streams it excepted (an older report.json) cannot be taken off
+    # the named counts: then the split and the names stay raw and the excepted total is a subset clause.
+    reduce = exc_senders is not None and bool(exc_streams)
     merged = {}
     for s in senders:
         name = str(s.get("name") or "?").lower()
@@ -670,12 +670,19 @@ def own_domain_view(report, view, org):
     for e in merged.values():
         likes = e.pop("likes")
         if reduce:
-            per = exc_streams.get(e["name"])
-            if isinstance(per, dict):  # the exception comes off the stream it covered, label by label
-                for label, n in per.items():
-                    likes[label] -= _n(n) or 0
-            elif likes:  # a gate without the per-stream split: off the address's main label
-                likes[likes.most_common(1)[0][0]] -= _n(exc_senders.get(e["name"])) or 0
+            # the exception comes off the stream it covered, label by label; the census files a stream under
+            # its majority label while the gate counts each verdict's own, so what a label cannot absorb
+            # spills over the address's other labels, largest first: the address loses exactly the gate's total
+            per = exc_streams.get(e["name"]) if isinstance(exc_streams.get(e["name"]), dict) else {}
+            spill = 0
+            for label, n in per.items():
+                took = min(_n(n) or 0, likes.get(label, 0))
+                likes[label] -= took
+                spill += (_n(n) or 0) - took
+            for label, have in likes.most_common():
+                took = min(spill, have)
+                likes[label] -= took
+                spill -= took
             likes = Counter({k: v for k, v in likes.items() if v > 0})
             e["count"] = sum(likes.values())
         e["likely"] = likes.most_common(1)[0][0] if likes else "unknown"
@@ -692,31 +699,46 @@ def own_domain_view(report, view, org):
             cnt[s.get("likely") or "unknown"] += s["count"]
         by_likely = {k: cnt.get(k, 0) for k in ("likely_spoof", "likely_misconfigured_sender", "unknown")}
     return {"genuine_failures": _n(c["genuine_failures"]), "logical_messages": _n(c.get("logical_messages")),
-            "delivered_despite_fail": _n(c.get("delivered_despite_fail")),
+            "delivered_despite_fail": _n(c.get("delivered_despite_fail")), "excepted_reduced": reduce,
             "by_likely": {k: _n(v) or 0 for k, v in by_likely.items()} if by_likely else None,
             "top_senders": _entries(c.get("top_senders"), SENDER_KEYS) or [], "senders": senders,
             "subdomains": subs, "window": c.get("window") if isinstance(c.get("window"), dict) else None,
             "excepted": excepted}
 
 
+def _env_key(value):
+    """An envelope domain spelled the way the census keys it: lower-case, no
+    trailing dot, '(blank)' when the message had none."""
+    return str(value or "").strip().lower().rstrip(".") or "(blank)"
+
+
+def _excepted_names(entries, cap=3):
+    return ", ".join("%s x%d" % (e["name"], e["count"]) for e in entries[:cap]) + (", ..." if len(entries) > cap else "")
+
+
 def excepted_view(report, view):
     """The census view less what the gate formally excepted, stream by stream,
     for the sections that name senders: an excepted sender is not told to fix
     anything, what remains of it keeps its own stream's label, and the
-    excepted messages are listed once, as such, in view["excepted"]."""
+    excepted messages are listed once, as such, in view["excepted"]. A gate
+    that names excepted senders without their streams (an older report.json)
+    leaves the view as it is: nothing says which stream to take them off."""
     if view is None:
         return None
     budgets = {}  # (From domain, address) -> what the gate excepted of it: in total, by envelope, by label
     for dom, g in (((report.get("gate") or {}).get("domains") or {}).items()):
         if not isinstance(g, dict) or not isinstance(g.get("excepted_senders"), dict):
             continue
-        by_env = g.get("excepted_senders_by_envelope") if isinstance(g.get("excepted_senders_by_envelope"), dict) else {}
-        by_label = g.get("excepted_senders_by_likely") if isinstance(g.get("excepted_senders_by_likely"), dict) else {}
+        by_env = g.get("excepted_senders_by_envelope") if isinstance(g.get("excepted_senders_by_envelope"), dict) else None
+        by_label = g.get("excepted_senders_by_likely") if isinstance(g.get("excepted_senders_by_likely"), dict) else None
+        if by_env is None and by_label is None:
+            continue
         for sender, n in g["excepted_senders"].items():
-            envs, labels = by_env.get(str(sender).lower()), by_label.get(str(sender).lower())
+            envs = by_env.get(str(sender).lower()) if by_env else None
+            labels = by_label.get(str(sender).lower()) if by_label else None
             budgets[(str(dom).lower(), str(sender).lower())] = {
                 "total": _n(n) or 0,
-                "envelopes": {str(k).lower(): _n(v) or 0 for k, v in envs.items()} if isinstance(envs, dict) else None,
+                "envelopes": {_env_key(k): _n(v) or 0 for k, v in envs.items()} if isinstance(envs, dict) else None,
                 "labels": {str(k): _n(v) or 0 for k, v in labels.items()} if isinstance(labels, dict) else None}
     if not budgets:
         return view
@@ -725,11 +747,11 @@ def excepted_view(report, view):
         name = str(s.get("name") or "").lower()
         dom = str(s.get("domain") or name.rpartition("@")[2]).lower()
         b, count, label = budgets.get((dom, name)), _n(s.get("count")) or 0, s.get("likely") or "unknown"
-        env = str(s.get("envelope") or "").strip().lower().rstrip(".")
+        env = _env_key(s.get("envelope"))
         take = min(count, b["total"]) if b else 0
         if b and b["envelopes"] is not None:  # exceptions match on the envelope: exactly the stream they covered
             take = min(take, b["envelopes"].get(env, 0))
-        elif b and b["labels"] is not None:  # an older gate: the stream carrying the excepted label
+        elif b and b["labels"] is not None:  # a gate with the label split only: the stream carrying that label
             take = min(take, b["labels"].get(label, 0))
         if take <= 0:
             by_sender.append(s)
@@ -740,16 +762,24 @@ def excepted_view(report, view):
         elif b["labels"] is not None:
             b["labels"][label] -= take
         excepted.append({"name": s.get("name"), "domain": s.get("domain"), "envelope": s.get("envelope"), "count": take})
-        env_cut[str(s.get("envelope") or "").lower()] += take
+        env_cut[env] += take
         if count - take > 0:
             by_sender.append(dict(s, count=count - take))
     by_sender.sort(key=lambda s: (-(_n(s.get("count")) or 0), str(s.get("name"))))
     by_envelope = []
     for e in view["by_envelope"]:
-        cut = env_cut.get(str(e.get("name") or "").lower(), 0)
+        key = _env_key(e.get("name"))
+        cut = env_cut.get(key, 0)
         left = (_n(e.get("count")) or 0) - cut
-        if left > 0:
-            by_envelope.append(dict(e, count=left) if cut else e)
+        if left <= 0:
+            continue
+        if cut:  # the envelope's example senders are the ones still failing through it
+            e = dict(e, count=left)
+            names = [s["name"] for s in by_sender if _env_key(s.get("envelope")) == key]
+            if names:
+                e["senders"], e["sender_count"] = names[:3], len(names)
+        by_envelope.append(e)
+    by_envelope.sort(key=lambda e: (-(_n(e.get("count")) or 0), str(e.get("name"))))
     out.update(by_sender=by_sender, by_envelope=by_envelope, excepted=excepted)
     return out
 
@@ -765,7 +795,8 @@ def streams(view, rua, own=None):
         scope = "unaudited subdomains" if own.get("subdomains") else "own domain"
         # the domain's own span when the report carries it: the whole log often reaches further
         return {"basis": "mail log", "scope": scope, "window": own.get("window") or (view or {}).get("window"),
-                "excepted": own.get("excepted") or 0, "own": groups["likely_misconfigured_sender"],
+                "excepted": own.get("excepted") or 0, "excepted_reduced": own.get("excepted_reduced", True),
+                "own": groups["likely_misconfigured_sender"],
                 "spoof": groups["likely_spoof"], "unclear": groups["unknown"],
                 "genuine_failures": own["genuine_failures"], "logical_messages": own["logical_messages"],
                 "by_likely": own["by_likely"], "top_senders": own["top_senders"],
@@ -775,6 +806,7 @@ def streams(view, rua, own=None):
         spoof = [s for s in view["by_sender"] if s["likely"] == "likely_spoof"]
         unclear = [s for s in view["by_sender"] if s["likely"] not in ("likely_misconfigured_sender", "likely_spoof")]
         return {"basis": "mail log", "scope": "all audited domains", "window": view.get("window"),
+                "excepted": sum(e["count"] for e in (view.get("excepted") or [])), "excepted_reduced": True,
                 "own": own_s, "spoof": spoof, "unclear": unclear}
     if isinstance(rua, dict):
         fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict)]
@@ -868,6 +900,9 @@ def trend_from_delta(delta, now_gf, now_pr):
         change = pr["change"] if abs(pr["change"]) <= 1 else pr["change"] / 100.0
         prev_pr = now_pr - change
     if prev_gf is None and prev_pr is None:
+        mw = delta.get("maillog_window") if isinstance(delta.get("maillog_window"), dict) else None
+        if label and mw and mw.get("comparable") is False:  # refused on purpose: say so, never "first run"
+            return {"source": "delta", "label": label, "previous_genuine_failures": None, "previous_pass_rate": None}
         return None
     return {"source": "delta", "label": label or "the previous run",
             "previous_genuine_failures": int(prev_gf) if prev_gf is not None else None,
@@ -907,9 +942,10 @@ def apply_comparability(trend, delta, report, view):
     # that run (a trend from --previous or metrics.json about another run is judged on its own figures)
     same_run = isinstance(delta, dict) and _day(delta.get("previous_generated_utc")) == t.get("label")
     mw = delta.get("maillog_window") if same_run and isinstance(delta.get("maillog_window"), dict) else None
-    rc = delta.get("rua") if same_run and isinstance(delta.get("rua"), dict) else None
     fail_ok = mw.get("comparable") if mw and mw.get("comparable") is not None else None
-    rate_ok = rc.get("comparable") if rc and rc.get("comparable") is not None else None
+    # the pass rate is judged from the trend's own figures, by the audit's tenfold rule: the delta carries no
+    # rate, and a trend merged by day could hold another same-day run's outside view
+    rate_ok = None
     if fail_ok is None:
         now_h = _f(((view or {}).get("window") or {}).get("hours")) if view else None
         prev_h = _f(t.get("previous_maillog_hours"))
@@ -921,10 +957,16 @@ def apply_comparability(trend, delta, report, view):
         if now_m is not None and prev_m is not None and (now_m or prev_m):
             rate_ok = bool(now_m and prev_m and min(now_m, prev_m) / max(now_m, prev_m) >= 0.1)
         elif now_m == 0 and prev_m == 0:
-            t["previous_pass_rate"] = None  # two empty outside views: no rate to compare and nothing to explain
+            t["previous_pass_rate"] = None  # two empty outside views: a 0/0 rate on each side
+            why.append("the pass rate is not compared: neither outside view carries messages")
     if fail_ok is False:
         t["previous_genuine_failures"] = None
-        why.append("failure counts are not compared: the two mail logs cover very different spans")
+        cut = [str(d) for d in ((mw or {}).get("domains_not_comparable") or []) if d]
+        if cut:
+            why.append("failure counts are not compared: %s's own mail-log rows cover a much shorter span than in the "
+                       "previous run (the row budget keeps a busy domain's newest hours)" % ", ".join(cut[:3]))
+        else:
+            why.append("failure counts are not compared: the two mail logs cover very different spans")
     if rate_ok is False:
         t["previous_pass_rate"] = None
         why.append("the pass rate is not compared: the two outside views differ too much in size")
@@ -1407,9 +1449,12 @@ def _own_domain_sentence(org, policy, strm):
             k = len(strm["spoof"])
             who = ("%d %s" % (k, _plural(k, "address", "addresses"))) if k else "addresses"
             parts.append("%d from %s that look like spoofing%s" % (spoof_n, who, _handled(policy, k or spoof_n)))
-        if strm.get("excepted"):
+        if strm.get("excepted") and strm.get("excepted_reduced", True):
             parts.append("%d formally excepted in audit.toml" % strm["excepted"])
         mid += ": " + "; ".join(parts)
+        if strm.get("excepted") and not strm.get("excepted_reduced", True):  # raw counts: the excepted are among them
+            mid += " (of which %d %s formally excepted in audit.toml)" % (strm["excepted"],
+                                                                        _plural(strm["excepted"], "is", "are"))
     else:
         tops = _named(strm["top_senders"])
         if tops:
@@ -1448,6 +1493,8 @@ def one_liner(org, policy, pct, since, strm, nxt):
         if spoof:
             mid += "; %d %s like spoofing%s" % (len(spoof), _plural(len(spoof), unit + " looks", unit + "s look"),
                                                 _handled(policy, len(spoof)))
+        if strm.get("excepted"):
+            mid += "; %d formally excepted in audit.toml" % strm["excepted"]
         mid += "."
     if nxt and nxt.get("kind") == "first":
         ref = (" (plan %s)" % nxt["ref"]) if nxt.get("ref") else ""
@@ -1596,8 +1643,14 @@ def what_is_failing(report, view):
             lines.append("The mail log carried counts but no per-sender detail, so the census is not in this run.")
             data["notes"].append("mail log without verdicts or census")
         elif not view["by_envelope"] and not view["by_sender"]:
-            lines.append("No genuine failures in the mail log this run - every message that failed also had a "
-                         "passing copy, or nothing failed.")
+            if view.get("excepted"):
+                n = sum(e["count"] for e in view["excepted"])
+                lines.append("Every genuine failure the census names this run is formally excepted in audit.toml: "
+                             "%d %s (%s)." % (n, _plural(n, "message"), _excepted_names(view["excepted"])))
+                data["excepted"] = list(view["excepted"])
+            else:
+                lines.append("No genuine failures in the mail log this run - every message that failed also had a "
+                             "passing copy, or nothing failed.")
         else:
             for what, key, title in (("envelope", "by_envelope", "By envelope domain (who actually handed the mail over)"),
                                      ("sender", "by_sender", "By sender address (what the reader sees in From)")):
@@ -1615,11 +1668,10 @@ def what_is_failing(report, view):
                 lines.append("")
             if lines and lines[-1] == "":
                 lines.pop()
-        if view.get("excepted"):  # listed once, as what they are: not failures to fix, not counted above
+        if view.get("excepted") and "excepted" not in data:  # listed once, as what they are: not failures to fix
             n = sum(e["count"] for e in view["excepted"])
-            who = ", ".join("%s x%d" % (e["name"], e["count"]) for e in view["excepted"][:3])
             lines.append("Formally excepted in audit.toml and not counted above: %d %s (%s)." % (
-                n, _plural(n, "message"), who + (", ..." if len(view["excepted"]) > 3 else "")))
+                n, _plural(n, "message"), _excepted_names(view["excepted"])))
             data["excepted"] = list(view["excepted"])
     if rua:
         fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict)]
@@ -1792,8 +1844,8 @@ def build_actions(report, plan, view, owners):
             if top_env:
                 action += " (most came in via %s%s)" % (top_env, (", as %s" % top_dom) if top_dom else "")
             items.append({"kind": "spoof", "keys": [top_dom, top_env], "ref": ref, "hook": hook, "action": action})
-        if view["by_sender"] or view["genuine_failures"] == 0:
-            covered.add(("maillog", "MAILFLOW-001"))
+        if view["by_sender"] or view["genuine_failures"] == 0 or view.get("excepted"):
+            covered.add(("maillog", "MAILFLOW-001"))  # nothing left to work: every named failure is excepted
         ref = "MAILFLOW-002" if "MAILFLOW-002" in ids_present else "mail log"
         for s in view["ddf_senders"][:TOP_ENTRIES]:
             hook = "%s - %d %s reached inboxes despite failing" % (s["name"], s["count"], _plural(s["count"], "message"))
@@ -2080,7 +2132,8 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
     if not since and isinstance(changed, dict) and changed.get("to") == policy and changed.get("from"):
         since = date  # the delta shows the policy changed in this very run
     own = own_domain_view(report, view, org)
-    strm = streams(view, rua, own)
+    xview = excepted_view(report, view)  # the sections that name senders show what the gate did not except
+    strm = streams(xview, rua, own)
     nxt = org_next(report, plan, org, own)
     line = one_liner(org, policy, pct, since, strm, nxt)
     window = window_of(report)
@@ -2092,7 +2145,6 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
                           trend_from_metrics(metrics, report, view) if metrics else None])
     trend = apply_comparability(trend, delta, report, view)
     stand = where_we_stand(report, view, trend, window)
-    xview = excepted_view(report, view)  # the sections that name senders show what the gate did not except
     failing, failing_lines = what_is_failing(report, xview)
     domains = per_domain(report, plan)
     groups = build_actions(report, plan, xview, owners)

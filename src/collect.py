@@ -432,6 +432,11 @@ def metrics_entry(stamp, report, plan):
         "findings": (report.get("summary") or {}).get("by_severity") or {},
         "genuine_failures": ml.get("genuine_failures"),
         "maillog_hours": ((report.get("maillog") or {}).get("window") or {}).get("hours"),
+        # each audited domain's own span: the row budget cuts one busy domain while the whole log's span holds
+        "maillog_hours_by_domain": {d: c["window"].get("hours")
+                                    for d, c in (((report.get("maillog") or {}).get("by_domain") or {}).items())
+                                    if d != audit.OTHER and isinstance(c, dict) and isinstance(c.get("window"), dict)
+                                    and c["window"].get("hours") is not None},
         "delivered_despite_fail": ml.get("delivered_despite_fail"),
         "likely_spoof": (ml.get("by_likely") or {}).get("likely_spoof"),
         "rua_messages": tot.get("messages"),

@@ -581,19 +581,20 @@ def test_the_delta_judges_each_domain_on_its_own_span():
     def rep(busy_hours, busy_gf):
         return {"generated_utc": "2026-10-07T15:00:00Z", "gate": {"domains": {}}, "findings": [],
                 "maillog": {"counters": {"genuine_failures": busy_gf + 87, "delivered_despite_fail": 0},
-                            "window": {"hours": 719.0},
+                            "window": {"hours": 719.0, "rows": 255000},
                             "by_domain": {"corp.example": {"genuine_failures": busy_gf, "delivered_despite_fail": 0,
-                                                           "window": {"hours": busy_hours}},
+                                                           "window": {"hours": busy_hours, "rows": 250000}},
                                           "shop.example": {"genuine_failures": 87, "delivered_despite_fail": 0,
-                                                           "window": {"hours": 719.0}},
+                                                           "window": {"hours": 719.0, "rows": 4000}},
                                           audit.OTHER: {"genuine_failures": 0, "delivered_despite_fail": 0,
-                                                        "window": {"hours": 2.0}}}},
+                                                        "window": {"hours": 2.0, "rows": 1000}}}},
                 "rua": {"totals": {"messages": 100, "pass_rate": 0.9}}}
     dl = audit.build_delta(rep(41.0, 613), rep(719.0, 2100))
     assert dl["genuine_failures"] is None and dl["maillog_window"]["comparable"] is False
     assert dl["maillog_window"]["domains_not_comparable"] == ["corp.example"]
     assert "corp.example" not in dl["by_domain"] and dl["by_domain"]["shop.example"]["genuine_failures"] == 0
-    assert any(n.startswith("corp.example: its own mail-log rows cover 41 hours now and 30 days") for n in dl["notes"])
+    assert any(n.startswith("corp.example: its own mail-log rows (98% of the log) cover 41 hours now and 30 days")
+               for n in dl["notes"])
     dl = audit.build_delta(rep(700.0, 613), rep(719.0, 2100))  # alike spans: everything compares
     assert dl["genuine_failures"] == -1487 and dl["by_domain"]["corp.example"]["genuine_failures"] == -1487
     assert dl["maillog_window"]["comparable"] is True and dl["maillog_window"]["domains_not_comparable"] == []
@@ -629,3 +630,46 @@ def test_build_report_wires_the_source_cap_and_keeps_every_source_for_the_histor
                               max_sources=0)
     assert len(full["rua"]["by_source_ip"]) == total and "truncated" not in full["rua"] and "source_ips" not in full["rua"]
     assert rua["by_source_ip"][0]["count"] == max(r["count"] for r in full["rua"]["by_source_ip"])  # the busiest is kept
+
+
+def test_a_quiet_domains_rows_are_not_a_cut():
+    """A domain with one row now and three spread rows last run has a span that
+    says nothing about coverage: the whole log's delta stands, and so does its own."""
+    def rep(gf_total, quiet_window, quiet_gf):
+        return {"generated_utc": "2026-10-07T15:00:00Z", "gate": {"domains": {}}, "findings": [],
+                "maillog": {"counters": {"genuine_failures": gf_total, "delivered_despite_fail": 0},
+                            "window": {"from": "2026-04-01T00:00:00Z", "to": "2026-04-30T00:00:00Z", "hours": 696.0, "rows": 7},
+                            "by_domain": {"corp.example": {"genuine_failures": gf_total - quiet_gf, "delivered_despite_fail": 0,
+                                                           "window": {"hours": 696.0, "rows": 6}},
+                                          "quiet.example": {"genuine_failures": quiet_gf, "delivered_despite_fail": 0,
+                                                            "window": quiet_window}}}}
+    now = rep(5, {"from": "2026-04-15T12:00:00Z", "to": "2026-04-15T12:00:00Z", "hours": 0.0, "rows": 1}, 1)
+    prev = rep(8, {"from": "2026-03-05T12:00:00Z", "to": "2026-03-25T12:00:00Z", "hours": 480.0, "rows": 3}, 2)
+    dl = audit.build_delta(now, prev)
+    assert dl["genuine_failures"] == -3 and dl["maillog_window"]["comparable"] is True
+    assert dl["maillog_window"]["domains_not_comparable"] == [] and dl["by_domain"]["quiet.example"]["genuine_failures"] == -1
+    assert not any("quiet.example" in n for n in dl["notes"])
+    assert audit._spans_comparable(0.0, 0.33) is True and audit._spans_comparable(0.5, 40.0) is False
+    assert audit._row_share({"rows": 250000}, {"rows": 255000}) > 0.9 and audit._row_share({"rows": 1}, {}) == 0.0
+
+
+def test_an_address_exception_covers_a_blank_envelope_stream_everywhere(tmp_path):
+    """Null-sender mail (DSNs, out-of-office) has no MAIL FROM domain; the census
+    keys it '(blank)' and so does the gate, so the document takes it off."""
+    import next_steps
+    rows = [["2026-05-01 09:00:00", "<n%d@x>" % i, "noreply@corp.example", "corp.example", "",
+             "u@example.com", "Out of office", "Blocked", "Quarantine", "fail"] for i in range(2)]
+    rows += [["2026-05-01 09:00:00", "<a%d@x>" % i, "app@corp.example", "corp.example", "corp.example",
+              "u@example.com", "Purchase order 1 acknowledged", "Blocked", "Quarantine", "fail"] for i in range(3)]
+    path = tmp_path / "log.csv"
+    _write(path, COLUMNS, rows)
+    exc = {"match": "noreply@corp.example", "reason": "auto-replies", "until": "2099-01-01", "removal_criterion": "never"}
+    rep = audit.build_report(domains=["corp.example"], maillog=str(path), offline=True, auth_column="DMARC", exceptions=[exc])
+    g = rep["gate"]["domains"]["corp.example"]
+    assert g["excepted_senders"] == {"noreply@corp.example": 2}
+    assert g["excepted_senders_by_envelope"] == {"noreply@corp.example": {"(blank)": 2}}
+    doc = next_steps.build(rep)
+    assert doc["failing"]["excepted"] == [{"name": "noreply@corp.example", "domain": "corp.example", "envelope": "(blank)", "count": 2}]
+    md = next_steps.render_md(doc)
+    assert "Formally excepted in audit.toml and not counted above: 2 messages (noreply@corp.example x2)." in md
+    assert "noreply@corp.example - 2 messages" not in md and "2 formally excepted in audit.toml" in doc["one_liner"]

@@ -345,6 +345,16 @@ def _trim_rua(doc, keep):
     return doc
 
 
+def _analyse(args, kwargs):
+    """rua_parse.analyse, without the vendors keyword when the installed rua_parse predates it."""
+    try:
+        return rua_parse.analyse(*args, **kwargs)
+    except TypeError as exc:
+        if "vendors" in kwargs and "vendors" in str(exc):
+            return rua_parse.analyse(*args, **{k: v for k, v in kwargs.items() if k != "vendors"})
+        raise
+
+
 def run_rua(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, until=None,
             expect_policy=None, retiring=(), max_sources=REPORT_SOURCES, vendors=()):
     """rua_parse.analyse as a library call; its input errors become a UsageError
@@ -359,11 +369,11 @@ def run_rua(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, un
     args = ([str(repo_path(p)) for p in paths],)
     kwargs = dict(known=known, min_volume=min_volume, fail_threshold=fail_threshold,
                   since=since, until=until, expect_policy=expect_policy, retiring=retiring)
-    if vendors:  # only when given: an older rua_parse without the parameter still works otherwise
+    if vendors:
         kwargs["vendors"] = [str(v) for v in vendors if v]
     if err_cls is not _NoSuchError:
         try:
-            doc, _agg = rua_parse.analyse(*args, **kwargs)
+            doc, _agg = _analyse(args, kwargs)
         except err_cls as exc:
             raise UsageError(f"rua: {exc}") from exc
         except SystemExit as exc:
@@ -372,7 +382,7 @@ def run_rua(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, un
     buf = io.StringIO()
     try:
         with contextlib.redirect_stderr(buf):
-            doc, _agg = rua_parse.analyse(*args, **kwargs)
+            doc, _agg = _analyse(args, kwargs)
     except SystemExit as exc:  # die() printed the cause and tried to exit 2
         lines = buf.getvalue().splitlines()
         errors = [l[len("error: "):] for l in lines if l.startswith("error: ")]
@@ -1024,7 +1034,7 @@ def _excepted_by_domain(maillog_doc, active, names):
             d["senders"][sender] = d["senders"].get(sender, 0) + 1
             per = d["senders_by_likely"].setdefault(sender, {})  # which of the sender's streams it covered ...
             per[label] = per.get(label, 0) + 1
-            env = str(v.get("envelope_domain") or "").strip().lower().rstrip(".")  # ... by label and by envelope
+            env = str(v.get("envelope_domain") or "").strip().lower().rstrip(".") or "(blank)"  # ... and by envelope, keyed as the census keys it
             via = d["senders_by_envelope"].setdefault(sender, {})
             via[env] = via.get(env, 0) + 1
         hits.setdefault(hit["match"], [hit, 0])[1] += 1
@@ -1478,10 +1488,22 @@ def _hours(window):
 
 def _spans_comparable(now_hours, prev_hours):
     """Two mail-log spans bear a message-for-message comparison when neither is
-    under half of the other; an unknown span gets the benefit of the doubt."""
-    if now_hours is None or prev_hours is None or max(now_hours, prev_hours) <= 0:
+    under half of the other; an unknown span gets the benefit of the doubt, and
+    two spans under an hour are alike whatever their ratio."""
+    if now_hours is None or prev_hours is None or max(now_hours, prev_hours) < 1:
         return True
     return min(now_hours, prev_hours) / max(now_hours, prev_hours) >= 0.5
+
+
+# a domain can only have been cut by the row budget when it holds a real share of the log's rows: a quiet
+# domain's few rows fall where they fall, and their span says nothing about coverage
+CUT_ROWS, CUT_SHARE = 1000, 0.1
+
+
+def _row_share(window, log_window):
+    """The share of the log's rows a domain's window holds; 0.0 when either count is unknown."""
+    rows, total = _count((window or {}).get("rows")), _count((log_window or {}).get("rows"))
+    return rows / total if rows and total else 0.0
 
 
 def _count(value):
@@ -1526,11 +1548,18 @@ def build_delta(report, previous):
         if d == OTHER or not isinstance(c, dict) or not isinstance(p, dict) or not (c.get("window") and p.get("window")):
             continue
         dh, dp = _hours(c.get("window")), _hours(p.get("window"))
-        domain_comparable[d] = _spans_comparable(dh, dp)
-        if not domain_comparable[d]:
-            notes.append("%s: its own mail-log rows cover %s now and %s in the previous run: its failure counts, "
-                         "and the whole log's, are not comparable, so those deltas are not computed"
-                         % (d, _hours_text(dh), _hours_text(dp)))
+        ok = _spans_comparable(dh, dp)
+        if not ok:
+            # the shorter side must look like the budget's work: many rows, a real share of that log's rows
+            cut_w, cut_log = (c.get("window"), now_w) if (dh or 0) <= (dp or 0) else (p.get("window"), prev_w)
+            rows, share = _count((cut_w or {}).get("rows")) or 0, _row_share(cut_w, cut_log)
+            if rows >= CUT_ROWS and share >= CUT_SHARE:
+                notes.append("%s: its own mail-log rows (%d%% of the log) cover %s now and %s in the previous run: its "
+                             "failure counts, and the whole log's, are not comparable, so those deltas are not computed"
+                             % (d, int(share * 100 + 0.5), _hours_text(dh), _hours_text(dp)))
+            else:
+                ok = True  # a quiet domain's rows cluster as they fall: not a cut, its small counts compare
+        domain_comparable[d] = ok
     windows_comparable = log_comparable and all(domain_comparable.values())
     # the outside view: a first full archive against a near-empty one is not a trend, it is a different archive
     now_t = (report.get("rua") or {}).get("totals") or {}

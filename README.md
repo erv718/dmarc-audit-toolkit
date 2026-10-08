@@ -220,7 +220,7 @@ Read them in this order, all under `audit-out/latest/`:
    was measured and what was reasoned. `report.json` is the same as data and
    stays readable at scale: the per-message verdicts are dropped once the
    gate and the census have used them (`maillog.verdicts_omitted` says how
-   many; `--keep-verdicts` keeps them), and the aggregate-report source
+   many; `audit.py --keep-verdicts` keeps them), and the aggregate-report source
    tables keep their 1000 busiest rows with the totals in `rua.truncated` -
    the sender history still records every source.
 4. **`plan.md`**: the rollout plan as a DNS change ticket wants it: record,
@@ -299,10 +299,11 @@ one message: policy and gate per domain, deduplicated failure counts next to
 the raw ones, the worst failing senders from the census, spoofing blocked by
 receivers, newly identified senders (new to the whole history, not just absent
 last week), the week-over-week deltas, and the trend over the last four runs.
-A delta or a trend word is withheld, and the message says so, when two runs
-cannot bear the comparison: mail logs whose spans differ by half or more (a
-row budget keeps the newest hours of a busy domain), or outside views that
-differ tenfold in size (a first full archive against a near-empty one).
+A delta is withheld, and the message says so, when two runs cannot bear the
+comparison: mail logs whose spans differ by half or more (a row budget keeps
+the newest hours of a busy domain), or outside views that differ tenfold in
+size (a first full archive against a near-empty one); the trend word then
+follows the pass rate rather than the failure counts.
 Aggregates only: domains, counts and sender identities, never addresses or
 subject lines. `[notify] enabled = false` in `audit.toml` pauses posting
 without removing the webhook; `--dry-run` prints the message. Teams is
@@ -428,7 +429,8 @@ would leave the machine.
 - **One of your own platforms shows as `unknown` in the aggregate reports**,
   with "SPF passes for ..., which looks like the forwarding hop": if that
   platform sends for you, list its domain among the vendors in `audit.toml`
-  (or `--known`) and the stream reads as a broken DKIM key at your own sender.
+  (or `--known`) and, as long as nothing in the reports marks forwarding, the
+  stream reads as a broken DKIM key at your own sender.
 
 ## Methodology and background
 

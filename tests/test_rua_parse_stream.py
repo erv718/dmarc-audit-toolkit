@@ -211,3 +211,61 @@ def test_the_settings_vendors_are_known_platforms_for_the_labels(monkeypatch):
     assert seen["known"] == []
     with_vendors = audit.run_rua([str(root / "samples" / "rua")], max_sources=0, vendors=["platform.example"])
     assert seen["known"] == ["platform.example"] and with_vendors["totals"] == plain["totals"]
+
+
+def test_vendors_do_not_switch_on_the_ip_allow_list_check():
+    """vendors name platforms, not networks: with vendors alone the per-IP
+    unknown-sender check stays off, so no OUTSIDE-002 names the tenant's own
+    passing sources and the exit code does not move."""
+    import contextlib
+    import io
+    import pathlib
+
+    root = pathlib.Path(rua_parse.__file__).resolve().parent.parent
+    with contextlib.redirect_stderr(io.StringIO()):
+        plain, _ = rua_parse.analyse([str(root / "samples" / "rua")])
+        vend, _ = rua_parse.analyse([str(root / "samples" / "rua")], vendors=["platform.example"])
+    assert all(s.get("known") is None for s in vend["by_source_ip"])
+    assert sorted(f["id"] for f in vend["findings"]) == sorted(f["id"] for f in plain["findings"])
+    assert not any(f["id"] == "OUTSIDE-002" for f in vend["findings"]) and vend["exit_code"] == plain["exit_code"]
+
+
+def test_the_hint_names_only_the_platforms_not_yet_listed_and_vendors_reach_build_report(monkeypatch):
+    import pathlib
+
+    import audit
+    s = {"count": 400, "no_auth": 0, "aligned_dkim_failed": 400, "misaligned_spf": 400, "misaligned_dkim": 0,
+         "dkim_failed": 400, "header_from": {"news.example.com": 400}, "reasons": __import__("collections").Counter(),
+         "spf": {("platform.example", "mfrom", "pass"): 300, ("relay.example", "mfrom", "pass"): 100},
+         "dkim": {("news.example.com", "s1", "fail"): 400}}
+    label, signals = rua_parse.likely_label(s, {"example.com"}, known_domains=["platform.example"])
+    hint = next(x for x in signals if "list it under --known" in x)
+    assert label == "unknown" and "if relay.example sends for us" in hint and "platform.example sends" not in hint
+    assert rua_parse.likely_label(s, {"example.com"}, known_domains=["platform.example", "relay.example"])[0] == "likely_misconfigured"
+    seen, real = {}, rua_parse.failing_streams
+
+    def spy(agg, min_volume, fail_threshold, known_domains=()):
+        seen["known"] = list(known_domains)
+        return real(agg, min_volume, fail_threshold, known_domains)
+
+    monkeypatch.setattr(rua_parse, "failing_streams", spy)
+    root = pathlib.Path(rua_parse.__file__).resolve().parent.parent
+    audit.build_report(domains=["example.com"], rua_paths=[str(root / "samples" / "rua")], offline=True,
+                       vendor_domains=["platform.example"])
+    assert seen["known"] == ["platform.example"]
+
+
+def test_an_older_rua_parse_without_the_vendors_keyword_still_runs(monkeypatch):
+    import pathlib
+
+    import audit
+    real = rua_parse.analyse
+
+    def old_analyse(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, until=None,
+                    expect_policy=None, retiring=(), use_rdns=False, top=20):
+        return real(paths, known, min_volume, fail_threshold, since, until, expect_policy, retiring, use_rdns, top)
+
+    monkeypatch.setattr(rua_parse, "analyse", old_analyse)
+    root = pathlib.Path(rua_parse.__file__).resolve().parent.parent
+    doc = audit.run_rua([str(root / "samples" / "rua")], vendors=["platform.example"], max_sources=0)
+    assert doc["totals"]["messages"] > 0

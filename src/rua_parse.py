@@ -818,7 +818,8 @@ def likely_label(s, domains, known_domains=()):
                 return "likely_misconfigured", signals
             signals.append(f"SPF passes for {', '.join(doms) or '?'}, which looks like the forwarding hop")
             if own_key:
-                signals.append(f"or our own platform with a broken DKIM key: if {', '.join(doms)} sends for us, list it "
+                missing = [d for d in doms if not _under(d, known_domains or ())]
+                signals.append(f"or our own platform with a broken DKIM key: if {', '.join(missing)} sends for us, list it "
                                "under --known or the settings' vendors and this stream reads as likely_misconfigured")
         signals.append("not a sender misconfiguration if the original passed at the first hop; check tenant logs")
         return "unknown", signals
@@ -1305,7 +1306,9 @@ def analyse(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, un
             expect_policy=None, retiring=(), use_rdns=False, top=20, vendors=()):
     """Everything main does short of printing: the --json document.
     vendors: sending platforms from the settings, known senders like --known's
-    domains for the labels and the unknown-sender list.
+    domains for the labels and the DKIM-domain side of the unknown-sender list;
+    only --known switches on the IP allow-list check, since vendors name no
+    networks.
 
     Raises RuaInputError on input problems (missing path, no report files,
     nothing parsable, bad --since/--until or --known); main() prints that as
@@ -1340,7 +1343,7 @@ def analyse(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, un
     }
     opts = {"paths": list(paths), "since": since, "until": until, "min_volume": min_volume,
             "fail_threshold": fail_threshold, "expect_policy": expect_policy, "retiring": names,
-            "rdns": use_rdns, "nets": nets, "known_domains": known_domains, "known_given": bool(known) or bool(vendors),
+            "rdns": use_rdns, "nets": nets, "known_domains": known_domains, "known_given": bool(known),
             "parsed_total": parsed_total}
 
     ptr = {}

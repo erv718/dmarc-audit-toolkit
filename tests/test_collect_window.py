@@ -277,3 +277,7 @@ def test_metrics_carry_the_mail_logs_span_for_the_trend():
     report = {"gate": {"domains": {}}, "maillog": {"counters": {"genuine_failures": 3}, "window": {"hours": 41.0}},
               "rua": {"totals": {}}, "summary": {}}
     assert collect.metrics_entry("2026-10-07T150000Z", report, {"changes": []})["maillog_hours"] == 41.0
+    report["maillog"]["by_domain"] = {"corp.example": {"window": {"hours": 41.0}}, "shop.example": {"window": {"hours": 719.0}},
+                                      collect.audit.OTHER: {"window": {"hours": 2.0}}, "none.example": {"window": None}}
+    assert collect.metrics_entry("2026-10-07T150000Z", report, {"changes": []})["maillog_hours_by_domain"] == {
+        "corp.example": 41.0, "shop.example": 719.0}

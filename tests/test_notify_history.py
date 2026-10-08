@@ -194,3 +194,42 @@ def test_a_report_without_run_json_is_dated_by_its_own_generation_time(tmp_path)
     p = subprocess.run([_sys.executable, script, "--report", str(tmp_path / "report.json"), "--metrics",
                         str(tmp_path / "metrics.json"), "--dry-run"], capture_output=True, text=True)
     assert p.returncode == 2 and "expected the metrics list collect.py writes" in p.stderr
+
+
+def test_the_trend_word_honours_each_domains_span_and_the_audits_own_verdict():
+    history = [{"genuine_failures": 2187, "rua_pass_rate": 0.70, "maillog_hours": 719.0, "maillog_hours_by_domain": {"corp.example": 719.0}},
+               {"genuine_failures": 700, "rua_pass_rate": 0.69, "maillog_hours": 719.0, "maillog_hours_by_domain": {"corp.example": 41.0}}]
+    text = notify.summarize(report(), history=history)
+    assert "(improving)" not in text and "(worsening)" in text and "failure counts not comparable" in text
+    history[1]["maillog_hours_by_domain"]["corp.example"] = 700.0
+    assert "(improving)" in notify.summarize(report(), history=history)
+    rep = report()
+    rep["delta"] = {"previous_generated_utc": "2026-01-08T06:00:00Z", "maillog_window": {"comparable": False}}
+    assert "(improving)" not in notify.summarize(rep, history=history)  # two points: the audit already judged them
+    # a span of minutes stored as 0.0 hours is a span, and with no pass rate the word says what it is
+    history = [{"genuine_failures": 2187, "maillog_hours": 719.0}, {"genuine_failures": 3, "maillog_hours": 0.0}]
+    text = notify.summarize(report(), history=history)
+    assert "(not comparable)" in text and "too few runs" not in text
+    assert notify._spans_alike([0.0, 0.3]) is True and notify._spans_alike([None, 5.0]) is True and notify._spans_alike([41.0, 719.0]) is False
+
+
+def test_a_collect_report_copied_away_from_its_run_json_still_announces_that_runs_new_senders(tmp_path):
+    import json as _json
+    import subprocess
+    import sys as _sys
+    from pathlib import Path as _Path
+    rep = report(sources=("192.0.2.10", "198.51.100.7"), envelopes=("example.com",))
+    rep["generated_utc"] = "2026-10-07T15:12:30Z"  # twelve minutes into the run that wrote senders.json
+    (tmp_path / "report.json").write_text(_json.dumps(rep), encoding="utf-8")
+    senders = tmp_path / "senders.json"
+    senders.write_text(_json.dumps({"updated": "2026-10-07T150000Z", "senders": {
+        "ip:192.0.2.10": {"first_seen": "2026-09-30T060000Z", "last_seen": "2026-10-07T150000Z"},
+        "envelope:example.com": {"first_seen": "2026-09-30T060000Z", "last_seen": "2026-10-07T150000Z"},
+        "ip:198.51.100.7": {"first_seen": "2026-10-07T150000Z", "last_seen": "2026-10-07T150000Z"}}}), encoding="utf-8")
+    p = subprocess.run([_sys.executable, str(_Path(notify.__file__)), "--report", str(tmp_path / "report.json"),
+                        "--senders", str(senders), "--dry-run"], capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    assert "*newly identified senders* (never seen in an earlier run): 198.51.100.7" in p.stdout
+    assert notify._report_stamp({"generated_utc": "2026-10-08T09:00:00+00:00"}) == "2026-10-08T090000Z"
+    assert notify._report_stamp({"generated_utc": "2026-10-08T11:00:00.250+02:00"}) == "2026-10-08T090000Z"
+    assert notify._same_run("2026-10-07T150000Z", "2026-10-07T151230Z") and not notify._same_run("2026-10-07T150000Z", "2026-10-08T090000Z")
