@@ -559,9 +559,50 @@ def render_todo(report, plan, caveats=()):
     L.append("")
     items = []
     ml = report.get("maillog") or {}
+    # the census counts what the formal exceptions cover per sender stream (audit.py marks every excepted
+    # message): the work is what they left, and the excepted count is named once; a census without those
+    # counts (an older report) leaves the findings' own lines as they are
+    census = ml.get("census") if isinstance(ml.get("census"), dict) else {}
+    rows = census.get("by_sender") if isinstance(census.get("by_sender"), list) else []
+    rows = [r for r in rows if isinstance(r, dict)]
+    counted = any("excepted" in r for r in rows)
+
+    def whole(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+    def left(total_key, excepted_key):
+        """({sender: what is left}, how many the exceptions cover) over the census streams."""
+        out, gone = {}, 0
+        for r in rows:
+            n = whole(r.get(total_key))
+            x = min(whole(r.get(excepted_key)), n)
+            gone += x
+            if n > x:
+                s = str(r.get("sender") or "?")
+                out[s] = out.get(s, 0) + n - x
+        return out, gone
+
+    def tops(senders):
+        return "; ".join("%s x%d" % kv for kv in sorted(senders.items(), key=lambda kv: (-kv[1], kv[0]))[:5])
+
     for f in ml.get("findings") or []:
-        if f.get("id") in ("MAILFLOW-001", "MAILFLOW-002"):
+        if f.get("id") not in ("MAILFLOW-001", "MAILFLOW-002"):
+            continue
+        failures = f["id"] == "MAILFLOW-001"
+        senders, gone = left(*(("genuine_failures", "excepted") if failures
+                               else ("delivered_despite_fail", "excepted_delivered")))
+        if not counted or not gone:
             items.append("- mail log: %s (%s) - %s" % (f["title"], f["evidence"], f["action"]))
+        elif senders:
+            n = sum(senders.values())
+            what = ("logical %s failed with no passing copy" % ("message" if n == 1 else "messages") if failures
+                    else "%s failed authentication but reached a mailbox" % ("message" if n == 1 else "messages"))
+            items.append("- mail log: %d %s, from %d %s, besides %d formally excepted in audit.toml (section 6) "
+                         "(top senders: %s) - %s" % (n, what, len(senders), "sender" if len(senders) == 1 else "senders",
+                                                     gone, tops(senders), f["action"]))
+        elif failures:  # nothing left to work; the delivered ones are among these
+            items.append("- mail log: nothing to fix - %s formally excepted in audit.toml (section 6)"
+                         % ("the 1 genuine failure is" if gone == 1 else "all %d genuine failures are" % gone))
     for sender in ml.get("spf_only_senders") or []:
         items.append("- mail log: %s (envelope %s) passes on SPF alone, %d msgs - aligned DKIM at that platform before reject"
                      % (sender.get("sender") or "?", sender.get("envelope_domain") or "?", sender.get("spf_only") or 0))

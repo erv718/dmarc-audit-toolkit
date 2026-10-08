@@ -539,15 +539,36 @@ def run_maillog(csv_path, sender_domain=None, auth_column=None, vendor_domains=(
 
 # ------------------------------------------- per-domain attribution, census
 
+def mark_excepted(maillog_doc, active):
+    """Mark every genuine failure an active formal exception covers, in
+    place: v["excepted"] is the match of the first exception that covers it
+    (config.matches_verdict decides), False on every other verdict, whatever
+    its From domain. A delivered-despite-fail verdict is a genuine failure,
+    so it is marked too. The marks are the one place exceptions meet the mail
+    log: the attribution, the census and the gate all read them, so every
+    reader subtracts the same messages. Expired and invalid entries are not in
+    active and never mark."""
+    for v in (maillog_doc or {}).get("verdicts") or []:
+        hit = None
+        if v.get("genuine_failure"):
+            hit = next((e for e in active or [] if config_mod.matches_verdict(e, v)), None)
+        v["excepted"] = hit["match"] if hit else False
+
+
 def _counters(verdicts):
     """dedupe.summarize-style counters over one slice of verdicts, plus the
     senders behind its genuine failures. passing_messages had a copy pass
     authentication; internal_messages stayed inside the tenant without one
     (internal mail gets no DMARC verdict): together, the mail the domain
-    itself sent, which a spoof never is."""
+    itself sent, which a spoof never is. excepted, excepted_by_likely and
+    excepted_delivered: the genuine failures a formal exception covers (the
+    marks mark_excepted puts on the verdicts), of which the counts above
+    still hold every one."""
     failing = [v for v in verdicts if v.get("genuine_failure")]
     by_likely = Counter(v.get("likely") or "unknown" for v in failing)
     senders = Counter((v.get("sender") or "?").lower() for v in failing)
+    excepted = [v for v in failing if v.get("excepted")]
+    exc_likely = Counter(v.get("likely") or "unknown" for v in excepted)
     return {"logical_messages": len(verdicts),
             "genuine_failures": len(failing),
             "passing_messages": sum(1 for v in verdicts if v.get("passed")),
@@ -557,7 +578,10 @@ def _counters(verdicts):
             "delivered_despite_fail": sum(1 for v in verdicts if v.get("delivered_despite_fail")),
             "blocked_despite_pass": sum(1 for v in verdicts if v.get("blocked_despite_pass")),
             "by_likely": {k: by_likely.get(k, 0) for k in dedupe.LIKELY_LABELS},
-            "top_senders": [{"sender": s, "genuine_failures": n} for s, n in senders.most_common(5)]}
+            "top_senders": [{"sender": s, "genuine_failures": n} for s, n in senders.most_common(5)],
+            "excepted": len(excepted),
+            "excepted_by_likely": {k: exc_likely.get(k, 0) for k in dedupe.LIKELY_LABELS},
+            "excepted_delivered": sum(1 for v in excepted if v.get("delivered_despite_fail"))}
 
 
 def _home_domain(domain, audited):
@@ -610,6 +634,21 @@ def maillog_by_domain(maillog_doc, domains=()):
     return out
 
 
+def excepted_elsewhere(maillog_doc, domains=()):
+    """{From domain: excepted genuine failures} for the marked verdicts whose
+    From domain has no audited home (under no audited domain, or any domain
+    when none is audited), so every excepted message is accounted for: an
+    audited domain's own and its unaudited subdomains' are in by_domain."""
+    audited = [d for d in dict.fromkeys(_norm_name(d) for d in domains) if d]
+    out = Counter()
+    for v in (maillog_doc or {}).get("verdicts") or []:
+        if v.get("genuine_failure") and v.get("excepted"):
+            dom = _norm_name(v.get("domain"))
+            if _home_domain(dom, audited)[0] is None:
+                out[dom or "(blank)"] += 1
+    return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
 def _census_fields_match(cs):
     """True when a census document carries both lists with every field the
     report, the delta and the markdown read (CENSUS_FIELDS)."""
@@ -633,6 +672,26 @@ def maillog_census(maillog_doc):
     if not _census_fields_match(cs):
         return {"by_envelope": [], "by_sender": [], "note": CENSUS_UNAVAILABLE}
     return {"by_envelope": cs["by_envelope"], "by_sender": cs["by_sender"], "note": CENSUS_NOTE}
+
+
+def _follow_marks(maillog_doc, names=()):
+    """After the gate marks a library caller's verdicts itself, what the doc
+    already derived from them counts the new marks too: the census (which
+    dedupe.build_doc writes before any exception is known) and, when the doc
+    carries them, build_report's attribution and excepted_elsewhere, each
+    over the domains it already names. Every reader then subtracts the
+    messages the gate excepted."""
+    cs = maillog_doc.get("census")
+    if isinstance(cs, dict):
+        fresh = maillog_census(maillog_doc)
+        if fresh["note"] != CENSUS_UNAVAILABLE:
+            cs.update(by_envelope=fresh["by_envelope"], by_sender=fresh["by_sender"])
+    bd = maillog_doc.get("by_domain")
+    audited = [d for d in bd if d != OTHER] if isinstance(bd, dict) else list(names)
+    if isinstance(bd, dict):
+        maillog_doc["by_domain"] = maillog_by_domain(maillog_doc, audited)
+    if "excepted_elsewhere" in maillog_doc:
+        maillog_doc["excepted_elsewhere"] = excepted_elsewhere(maillog_doc, audited)
 
 # source tags a human put a domain on the list with, and the headline label each earns
 TYPED_LABELS = (("cli", "first on the command line"), ("file", "first in --file"), ("settings", "first in audit.toml"))
@@ -948,6 +1007,33 @@ def evidence_summary(rua_doc, maillog_doc, headers_doc=None):
             "dkim_evidence_sources": dkim_sources, "statement": stmt}
 
 
+def _excepted(maillog_doc, active):
+    """(verdict, exception) for every genuine failure an active exception
+    covers, read from the marks mark_excepted put on the verdicts: the gate
+    never matches a second time."""
+    by_match = {e["match"]: e for e in active or []}
+    out = []
+    for v in (maillog_doc or {}).get("verdicts") or []:
+        mark = v.get("excepted")
+        if v.get("genuine_failure") and isinstance(mark, str) and mark in by_match:
+            out.append((v, by_match[mark]))
+    return out
+
+
+def _exception_notes(excepted):
+    """One note per exception that lifted mail-log failures, in the order they
+    were hit. The ones a local override delivered are named: the override
+    that lets them in stays in place while the exception does."""
+    hits = {}
+    for v, e in excepted:
+        h = hits.setdefault(e["match"], [e, 0, 0])
+        h[1] += 1
+        h[2] += bool(v.get("delivered_despite_fail"))
+    return [f"{n} mail-log failure(s) from {match} excepted until {e['until']}"
+            + (f" ({d} of them reached a mailbox despite failing)" if d else "")
+            + f": {e['reason']}; remove when {e['removal_criterion']}" for match, (e, n, d) in hits.items()]
+
+
 def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None):
     """Blockers that apply to every domain in the run, plus what the formal
     exceptions (audit.toml [[exceptions]], already split to the active ones)
@@ -955,7 +1041,8 @@ def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None):
     and how many deduplicated mail-log failures were excepted. maillog_doc
     counts here only on the no-domain path: with named domains the mail log
     is attributed per sender domain (_maillog_blockers, _excepted_by_domain),
-    so no gate inherits another's rows."""
+    so no gate inherits another's rows. An excepted failure holds nothing,
+    delivered despite failing or not."""
     blockers, notes, excepted_streams = [], [], []
     active = list(exceptions or [])
     if rua_doc:
@@ -979,26 +1066,20 @@ def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None):
     excepted_failures = 0
     if maillog_doc:
         c = maillog_doc["counters"]
-        if active and maillog_doc.get("verdicts"):
-            hits = {}
-            for v in maillog_doc["verdicts"]:
-                if not v.get("genuine_failure"):
-                    continue
-                hit = next((e for e in active if config_mod.matches_verdict(e, v)), None)
-                if hit:
-                    hits.setdefault(hit["match"], [hit, 0])[1] += 1
-            for match, (hit, n) in hits.items():
-                excepted_failures += n
-                notes.append(f"{n} mail-log failure(s) from {match} excepted until {hit['until']}: "
-                             f"{hit['reason']}; remove when {hit['removal_criterion']}")
+        excepted = _excepted(maillog_doc, active)
+        notes += _exception_notes(excepted)
+        excepted_failures = len(excepted)
+        excepted_delivered = sum(1 for v, _ in excepted if v.get("delivered_despite_fail"))
         remaining = c["genuine_failures"] - excepted_failures
         if remaining > 0:
             tail = f"; {excepted_failures} more excepted" if excepted_failures else ""
             blockers.append(f"{remaining} logical message(s) in the mail log failed with "
                             f"no passing copy (deduplicated{tail})")
-        if c["delivered_despite_fail"]:
-            blockers.append(f"{c['delivered_despite_fail']} message(s) failed authentication but reached "
-                            "a mailbox - a local override is masking failures external receivers enforce")
+        delivered = c["delivered_despite_fail"] - excepted_delivered
+        if delivered > 0:
+            tail = f" ({excepted_delivered} more excepted)" if excepted_delivered else ""
+            blockers.append(f"{delivered} message(s) failed authentication but reached a mailbox{tail} - "
+                            "a local override is masking failures external receivers enforce")
     for name, doc in (tenant_docs or {}).items():
         for f in (doc or {}).get("findings", []):
             if f["severity"] == "blocking" or (f["severity"] == "major" and f["id"] in TENANT_GATE_BLOCKS):
@@ -1008,39 +1089,32 @@ def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None):
 
 
 def _excepted_by_domain(maillog_doc, active, names):
-    """The deduplicated mail-log failures the active exceptions cover, per
-    audited domain (its own rows, as maillog_by_domain attributes them: a
-    dict of total, by_likely, senders, senders_by_likely and
-    senders_by_envelope), the notes naming each excepted sender, and the total
-    excepted."""
-    counts, hits, total = {}, {}, 0
-    if not (active and maillog_doc and maillog_doc.get("verdicts")):
-        return counts, [], total
-    for v in maillog_doc["verdicts"]:
-        if not v.get("genuine_failure"):
-            continue
-        hit = next((e for e in active if config_mod.matches_verdict(e, v)), None)
-        if not hit:
-            continue
-        total += 1
+    """The deduplicated mail-log failures the active exceptions cover, read
+    from the marks on the verdicts: per audited domain (its own rows, as
+    maillog_by_domain attributes them) a dict of total, by_likely, delivered
+    (the excepted ones that reached a mailbox despite failing), senders,
+    senders_by_likely and senders_by_envelope; the notes naming each
+    exception's hits, whatever the From domain; and the total excepted."""
+    counts = {}
+    excepted = _excepted(maillog_doc, active)
+    for v, _ in excepted:
         home, is_sub = _home_domain(_norm_name(v.get("domain")), names)
-        if home and not is_sub:
-            d = counts.setdefault(home, {"total": 0, "by_likely": {}, "senders": {}, "senders_by_likely": {},
-                                         "senders_by_envelope": {}})
-            d["total"] += 1
-            label = v.get("likely") or "unknown"
-            d["by_likely"][label] = d["by_likely"].get(label, 0) + 1
-            sender = (v.get("sender") or "?").lower()
-            d["senders"][sender] = d["senders"].get(sender, 0) + 1
-            per = d["senders_by_likely"].setdefault(sender, {})  # which of the sender's streams it covered ...
-            per[label] = per.get(label, 0) + 1
-            env = str(v.get("envelope_domain") or "").strip().lower().rstrip(".") or "(blank)"  # ... and by envelope, keyed as the census keys it
-            via = d["senders_by_envelope"].setdefault(sender, {})
-            via[env] = via.get(env, 0) + 1
-        hits.setdefault(hit["match"], [hit, 0])[1] += 1
-    notes = [f"{n} mail-log failure(s) from {match} excepted until {hit['until']}: {hit['reason']}; "
-             f"remove when {hit['removal_criterion']}" for match, (hit, n) in hits.items()]
-    return counts, notes, total
+        if not home or is_sub:
+            continue
+        d = counts.setdefault(home, {"total": 0, "by_likely": {}, "delivered": 0, "senders": {},
+                                     "senders_by_likely": {}, "senders_by_envelope": {}})
+        d["total"] += 1
+        d["delivered"] += bool(v.get("delivered_despite_fail"))
+        label = v.get("likely") or "unknown"
+        d["by_likely"][label] = d["by_likely"].get(label, 0) + 1
+        sender = (v.get("sender") or "?").lower()
+        d["senders"][sender] = d["senders"].get(sender, 0) + 1
+        per = d["senders_by_likely"].setdefault(sender, {})
+        per[label] = per.get(label, 0) + 1
+        env = _norm_name(v.get("envelope_domain")) or "(blank)"
+        via = d["senders_by_envelope"].setdefault(sender, {})
+        via[env] = via.get(env, 0) + 1
+    return counts, _exception_notes(excepted), len(excepted)
 
 
 def _dns_blockers(r, domain):
@@ -1050,8 +1124,9 @@ def _dns_blockers(r, domain):
 
 def _maillog_blockers(domain, c, excepted=None):
     """One domain's mail-log blockers, from its own counters only; excepted
-    (total, by_likely, senders) is what a formal exception covers of them,
-    and the top senders named are the ones still failing."""
+    (total, delivered, senders) is what a formal exception covers of them:
+    it holds nothing, whether or not a local override delivered it, and the
+    top senders named are the ones still failing."""
     out = []
     exc = excepted or {}
     n_exc = exc.get("total", 0)
@@ -1064,9 +1139,12 @@ def _maillog_blockers(domain, c, excepted=None):
         tail = f"; {n_exc} more excepted" if n_exc else ""
         out.append(f"{domain}: {remaining} logical message(s) from this domain failed with "
                    f"no passing copy (deduplicated{tail})" + (f"; top senders: {tops}" if tops else ""))
-    if c["delivered_despite_fail"]:
-        out.append(f"{domain}: {c['delivered_despite_fail']} message(s) from this domain failed authentication "
-                   "but reached a mailbox - a local override is masking failures external receivers enforce")
+    n_ddf = exc.get("delivered", 0)
+    delivered = c["delivered_despite_fail"] - n_ddf
+    if delivered > 0:
+        tail = f" ({n_ddf} more excepted)" if n_ddf else ""
+        out.append(f"{domain}: {delivered} message(s) from this domain failed authentication but reached a "
+                   f"mailbox{tail} - a local override is masking failures external receivers enforce")
     return out
 
 
@@ -1083,9 +1161,12 @@ def _maillog_notes(domain, c, scope=None):
     if st.get("logical_messages"):
         subs = st.get("domains") or []
         shown = ", ".join(subs[:5]) + (f" (+{len(subs) - 5} more)" if len(subs) > 5 else "")
+        n_exc = st.get("excepted") or 0
         out.append(f"{domain}: unaudited subdomain(s) {shown} carry {st['logical_messages']} logical "
-                   f"message(s), {st['genuine_failures']} genuine failure(s) - counted separately under "
-                   "this record's sp=, not gated here; add them to the domain list to gate them")
+                   f"message(s), {st['genuine_failures']} genuine failure(s)"
+                   + (f" ({n_exc} of them formally excepted)" if n_exc else "")
+                   + " - counted separately under this record's sp=, not gated here; add them to the domain "
+                   "list to gate them")
     return out
 
 
@@ -1112,12 +1193,15 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence, maillog=
     whether failure evidence was supplied. maillog: this domain's own
     counters from maillog_by_domain (None when no mail log was supplied);
     excepted: what a formal exception covers of its genuine failures (total,
-    by_likely, senders); ml_spf_only: the mail-log senders attributed to this
-    domain (its own rows and its unaudited subdomains', like the counters)
-    that pass on SPF alone; rua_spf_only: the aggregate-report SPF-only
+    by_likely, delivered, senders); ml_spf_only: the mail-log senders
+    attributed to this domain (its own rows and its unaudited subdomains',
+    like the counters) that pass on SPF alone; rua_spf_only: the aggregate-report SPF-only
     streams attributed to it the same way, by header_from. The move to
     p=reject additionally needs aligned-DKIM evidence from somewhere (DKIM
-    before reject, always)."""
+    before reject, always). Besides the reasons, the verdict says what holds
+    the step (blockers: no_go's blockers, insufficient_data's missing
+    evidence, nothing for go) and what holds nothing (notes), so a reader
+    never sorts the prose itself."""
     policy, policy_from = info["policy"], info["source"]
     blockers = list(dns_blockers) + list(shared)
     notes = []
@@ -1140,8 +1224,10 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence, maillog=
     pct = str((info["tags"] or {}).get("pct", "100")).strip()
     reject_step = policy == "quarantine" and (int(pct) if pct.isdigit() else 100) >= 100
     name = domain or "the domain"
+    holds, said = [], []  # what holds the step, and what the verdict narrates that holds nothing
     if blockers:
         verdict = "no_go"
+        holds = list(blockers)
         reasons = list(blockers)
         if at_end:
             reasons.append(f"policy is already p=reject ({policy_from}); nothing to ratchet - the items "
@@ -1154,57 +1240,65 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence, maillog=
         verdict = "insufficient_data"
         reasons = [f"no DMARC policy could be determined for {name} - run without --offline so live "
                    "DNS is checked, or supply rua reports that cover it"]
+        holds = list(reasons)
     elif not evidence["failure_evidence"]:
         verdict = "insufficient_data"
         if at_end:
-            reasons = [f"policy is already p=reject ({policy_from}); nothing to ratchet - supply --rua "
-                       "reports and/or --maillog to confirm enforcement is not rejecting your own mail; "
-                       f"next step: {step}"]
+            hold = "supply --rua reports and/or --maillog to confirm enforcement is not rejecting your own mail"
+            reasons = [f"policy is already p=reject ({policy_from}); nothing to ratchet - {hold}; next step: {step}"]
+            holds = [f"no failure evidence was supplied: {hold}"]
         else:
-            reasons = [f"policy is p={policy} ({policy_from}) but no failure evidence was supplied: "
-                       "pass --rua reports and/or --maillog; a ratchet on zero data is a guess; "
-                       f"step being gated: {step}"]
+            hold = ("no failure evidence was supplied: pass --rua reports and/or --maillog; a ratchet on zero "
+                    "data is a guess")
+            reasons = [f"policy is p={policy} ({policy_from}) but {hold}; step being gated: {step}"]
+            holds = [hold]
     elif no_rows:
         # the run has evidence, but none of it is about this domain: no mail-log
         # rows of its own, no aggregate-report rows with it as the From domain
         verdict = "insufficient_data"
+        missing = (f"the evidence supplied has no rows for {name} (none in the mail log, none in the aggregate "
+                   "reports)")
         if at_end:
-            reasons = [f"policy is already p=reject ({policy_from}); nothing to ratchet - the evidence "
-                       f"supplied has no rows for {name} (none in the mail log, none in the aggregate "
-                       f"reports), so enforcement cannot be confirmed safe for it; next step: {step}"]
+            hold = f"{missing}, so enforcement cannot be confirmed safe for it"
+            reasons = [f"policy is already p=reject ({policy_from}); nothing to ratchet - {hold}; next step: {step}"]
         else:
-            reasons = [f"policy is p={policy} ({policy_from}) but the evidence supplied has no rows for "
-                       f"{name} (none in the mail log, none in the aggregate reports): a zero count is "
-                       f"not evidence of health - supply a mail log or aggregate reports that cover it; "
-                       f"step being gated: {step}"]
+            hold = (f"{missing}: a zero count is not evidence of health - supply a mail log or aggregate reports "
+                    "that cover it")
+            reasons = [f"policy is p={policy} ({policy_from}) but {hold}; step being gated: {step}"]
+        holds = [hold]
     elif reject_step and not evidence.get("dkim_evidence"):
         verdict = "insufficient_data"
+        hold = ("this run holds no aligned-DKIM evidence: supply --rua reports, or a mail log pulled with SPF and "
+                "DKIM columns (queries/raw_maillog.kql; queries/dkim_alignment.kql gives the same buckets in the "
+                "portal), before that move - DKIM before reject, always")
         reasons = [f"policy is p=quarantine at pct=100 ({policy_from}) and the step being gated is the move to "
-                   "p=reject, but this run holds no aligned-DKIM evidence: supply --rua reports, or a mail log "
-                   "pulled with SPF and DKIM columns (queries/raw_maillog.kql; queries/dkim_alignment.kql gives "
-                   "the same buckets in the portal), before that move - DKIM before reject, always"]
+                   f"p=reject, but {hold}"]
+        holds = [hold]
     else:
         verdict = "go"
         if at_end:
             reasons = [f"policy is already p=reject ({policy_from}); nothing to ratchet - keep watching "
                        f"the failing streams; next step: {step}"]
-            reasons += [f"{s['source_ip']} ({s['count']} msgs, {s['likely']})"
-                        for s in (rua_doc["failing_streams"] if rua_doc else [])[:5]]
+            said = [f"{s['source_ip']} ({s['count']} msgs, {s['likely']})"
+                    for s in (rua_doc["failing_streams"] if rua_doc else [])[:5]]
         else:
             reasons = [f"policy p={policy} ({policy_from}); no unexplained failures in the evidence "
                        f"supplied - next step: {step}"]
             if rua_doc and rua_doc["failing_streams"]:
                 spoof = [s for s in rua_doc["failing_streams"] if s["likely"] == "likely_spoof"]
                 if spoof:
-                    reasons.append(f"{len(spoof)} failing stream(s) look like spoofs - moving p= forward "
-                                   "is exactly what stops them")
+                    said = [f"{len(spoof)} failing stream(s) look like spoofs - moving p= forward "
+                            "is exactly what stops them"]
+        reasons += said
     reasons += notes
     reasons += [f"exception: {n}" for n in exception_notes]
     reasons.append(evidence["statement"])
     return {"verdict": verdict, "current_policy": policy, "policy_source": policy_from,
             "next_step": step, "reasons": reasons,
+            "blockers": holds, "notes": said + notes + [f"exception: {n}" for n in exception_notes],
             "maillog_rows": maillog["logical_messages"] if maillog is not None else None,
             "excepted_failures": (excepted or {}).get("total", 0),
+            "excepted_delivered": (excepted or {}).get("delivered", 0),
             "excepted_by_likely": dict((excepted or {}).get("by_likely") or {}),
             "excepted_senders": dict((excepted or {}).get("senders") or {}),
             "excepted_senders_by_likely": {s: dict(l) for s, l in ((excepted or {}).get("senders_by_likely") or {}).items()},
@@ -1224,7 +1318,7 @@ def _gate_names(dns_reports, rua_doc, domains=()):
 
 
 def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None, tenant_docs=None,
-                 domain_sources=None, headline=None, volume=None, exceptions=None):
+                 domain_sources=None, headline=None, volume=None, exceptions=None, marked=False):
     """The ratchet decision, per domain, plus the overall verdict (the worst).
     See the module docstring for the rule. Each domain's mail-log blockers
     come from its own rows (maillog.by_domain). The top-level current_policy,
@@ -1237,12 +1331,20 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
     internal mail from the mail log, else passing mail from the reports
     (mail_volume) - else the tenant default domain, else the shortest apex.
     exceptions: the raw or normalised [[exceptions]] entries; expired and
-    incomplete ones are named, not applied."""
+    incomplete ones are named, not applied. The mail log's exceptions are
+    read from the marks on its verdicts (mark_excepted): marked=True says
+    build_report put them there for these exceptions; otherwise the gate
+    marks the verdicts it was given itself, and the census (and any
+    attribution) the doc already carries follows those marks."""
     evidence = evidence_summary(rua_doc, maillog_doc, headers_doc)
     if dns_reports:  # a library caller's spelling must not lose the DNS blockers
         dns_reports = {_norm_name(d): r for d, r in dns_reports.items()}
     names = _gate_names(dns_reports, rua_doc, domains)
     active, expired, invalid = config_mod.parse_exceptions(exceptions or [])
+    remarked = bool(not marked and maillog_doc and maillog_doc.get("verdicts"))
+    if remarked:
+        mark_excepted(maillog_doc, active)
+        _follow_marks(maillog_doc, names)
     shared, exc = _shared_blockers(rua_doc, None if names else maillog_doc, tenant_docs, active)
     notes = list(exc["notes"])
     excepted = {}
@@ -1267,8 +1369,8 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
     by_domain, scope = None, None
     if maillog_doc and names:
         by_domain = maillog_doc.get("by_domain")
-        if not by_domain or any(d not in by_domain for d in names):
-            by_domain = maillog_by_domain(maillog_doc, names)
+        if remarked or not by_domain or any(d not in by_domain for d in names):
+            by_domain = maillog_by_domain(maillog_doc, names)  # its excepted counters follow the marks just made
         scope = _norm_name(maillog_doc.get("sender_domain")) or None
     per_domain = {}
     for d in names:
@@ -1684,8 +1786,13 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
     tenant_docs = {name: (run_tenant_export(path, name) if path else None)
                    for name, path in tenant_paths.items()}
     if maillog_doc:
+        # the formal exceptions mark the verdicts they cover, once, before anything counts them: the
+        # attribution, the census and the gate all subtract the same messages
+        mark_excepted(maillog_doc, config_mod.parse_exceptions(exceptions or [])[0])
         # each gate reads its own rows from here; the census is the sender inventory
-        maillog_doc["by_domain"] = maillog_by_domain(maillog_doc, _gate_names(dns_reports, rua_doc, domains))
+        names = _gate_names(dns_reports, rua_doc, domains)
+        maillog_doc["by_domain"] = maillog_by_domain(maillog_doc, names)
+        maillog_doc["excepted_elsewhere"] = excepted_elsewhere(maillog_doc, names)
         maillog_doc["census"] = maillog_census(maillog_doc)
     if previous_report is not None and not isinstance(previous_report, dict):
         raise UsageError("previous_report must be an earlier run's report.json document (a dict)")
@@ -1717,7 +1824,7 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
     }
     report.update(tenant_docs)
     report["gate"] = gate_verdict(dns_reports, rua_doc, maillog_doc, domains, headers_doc, tenant_docs,
-                                  domain_sources, headline, volume, exceptions)
+                                  domain_sources, headline, volume, exceptions, marked=True)
     findings = reword_for_reject(flatten_findings(report), report["gate"])
     report["findings"] = findings
     by_sev, by_area = {}, {}
@@ -1927,16 +2034,21 @@ def _md_census(L, cs):
         return
     env = [r for r in env_all if r["genuine_failures"]]
     snd = [r for r in snd_all if r["genuine_failures"]]
+
+    def excepted(r):  # what a formal exception covers of the entry's failures
+        return f" ({r['excepted']} formally excepted)" if r.get("excepted") else ""
+
     L.append(f"- by envelope (MAIL FROM) domain: {len(env)} failing, {len(env_all) - len(env)} clean")
     for r in env[:CENSUS_TOP]:
         L.append(f"  - {r['envelope_domain']}: {r['genuine_failures']} failing of {r['messages']} message(s), "
-                 f"{r['senders']} sender(s), for example {r['sample_sender']}; {r['likely'] or 'n/a'}")
+                 f"{r['senders']} sender(s), for example {r['sample_sender']}; {r['likely'] or 'n/a'}{excepted(r)}")
     if len(env) > CENSUS_TOP:
         L.append(f"  - (+{len(env) - CENSUS_TOP} more in report.json)")
     L.append(f"- by sender: {len(snd)} failing, {len(snd_all) - len(snd)} clean")
     for r in snd[:CENSUS_TOP]:
         L.append(f"  - {r['sender']} (envelope {r['envelope_domain']}): {r['genuine_failures']} failing of "
-                 f"{r['messages']} message(s); {r['likely'] or 'n/a'}; \"{r['sample_subject'] or 'no subject'}\"")
+                 f"{r['messages']} message(s); {r['likely'] or 'n/a'}; \"{r['sample_subject'] or 'no subject'}\""
+                 f"{excepted(r)}")
     if len(snd) > CENSUS_TOP:
         L.append(f"  - (+{len(snd) - CENSUS_TOP} more in report.json)")
     L.append("")

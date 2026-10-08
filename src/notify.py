@@ -94,24 +94,55 @@ def sender_label(u):
     return str(u)
 
 
+def _whole(value):
+    """A positive count, 0 for anything else (a bool, a non-number, a negative)."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(n, 0)
+
+
+def _left(r):
+    """A census entry's genuine failures less the ones a formal exception covers (the census counts
+    them per entry since audit.py marks every excepted message), and the label of what is left."""
+    gf = _whole(r.get("genuine_failures"))
+    return gf - min(_whole(r.get("excepted")), gf), (r.get("likely_after") or r.get("likely") or "unknown")
+
+
+def _rows(value):
+    """A census list as it is; anything else (a count, a map, None) reads as no rows."""
+    return value if isinstance(value, list) else []
+
+
 def census_top(census, n=CENSUS_TOP):
     """(labels, failing) for a census dict: the n worst entries as short labels
     made of domains only - envelope domains with their genuine failures, and
     sender rows (the delta's new senders) folded to their From domain and
     envelope domain first - never a From address: the message is aggregates
     only. Entries with no genuine failures are skipped; failing counts every
-    failing entry."""
-    rows = [r for r in (census.get("by_envelope") or []) if isinstance(r, dict) and r.get("genuine_failures")]
+    failing entry. The failures are what the formal exceptions left
+    (census_excepted counts the rest), and they decide which entries are the
+    worst."""
+    rows = []
+    for r in _rows(census.get("by_envelope")):
+        failing, label = _left(r) if isinstance(r, dict) else (0, None)
+        if failing:
+            rows.append(dict(r, genuine_failures=failing, likely=label))
+    rows.sort(key=lambda r: -r["genuine_failures"])  # stable: on a tie the census's own order stands
     if not rows:
         folded = {}
-        for r in census.get("by_sender") or []:
-            if not isinstance(r, dict) or not r.get("genuine_failures"):
+        for r in _rows(census.get("by_sender")):
+            failing, label = _left(r) if isinstance(r, dict) else (0, None)
+            if not failing:
                 continue
             dom = str(r.get("domain") or str(r.get("sender") or "").rpartition("@")[2] or "?").lower()
             env = str(r.get("envelope_domain") or "").lower()
             f = folded.setdefault((dom, env), {"domain": dom, "envelope_domain": env, "genuine_failures": 0,
-                                              "likely": r.get("likely") or "unknown"})
-            f["genuine_failures"] += int(r["genuine_failures"])
+                                              "likely": label})
+            f["genuine_failures"] += failing
         rows = sorted(folded.values(), key=lambda r: (-r["genuine_failures"], r["domain"]))
     out = []
     for r in rows[:n]:
@@ -120,6 +151,16 @@ def census_top(census, n=CENSUS_TOP):
             name = "%s via %s" % (r["domain"], r["envelope_domain"])
         out.append("%s x%d (%s)" % (name, int(r["genuine_failures"]), r.get("likely") or "unknown"))
     return out, len(rows)
+
+
+def census_excepted(census):
+    """How many of a census's genuine failures the formal exceptions cover (0 when it does not count them)."""
+    rows = _rows(census.get("by_sender")) or _rows(census.get("by_envelope"))
+    return sum(min(_whole(r.get("excepted")), _whole(r.get("genuine_failures"))) for r in rows if isinstance(r, dict))
+
+
+def _excepted_tail(n):
+    return "; %d formally excepted in audit.toml" % n if n else ""
 
 
 def _more(shown, total):
@@ -219,8 +260,12 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     census = maillog.get("census")
     if isinstance(census, dict):
         top, failing = census_top(census)
+        gone = census_excepted(census)
         if top:
-            lines.append("- top failing senders (census): " + ", ".join(top) + _more(len(top), failing))
+            lines.append("- top failing senders (census): " + ", ".join(top) + _more(len(top), failing)
+                         + _excepted_tail(gone))
+        elif gone:
+            lines.append("- top failing senders (census): none left%s" % _excepted_tail(gone))
     rua = report.get("rua") or {}
     tot = rua.get("totals") or {}
     if tot:
@@ -278,9 +323,13 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
                 lines.append("- genuine failures vs last run: %+d" % dl["genuine_failures"])
             if dl.get("delivered_despite_fail"):
                 lines.append("- delivered despite failing vs last run: %+d" % dl["delivered_despite_fail"])
-            top, failing = census_top({"by_sender": dl.get("new_senders") or []})
+            new = {"by_sender": dl.get("new_senders") or []}
+            top, failing = census_top(new)
+            gone = census_excepted(new)
             if top:
-                lines.append("- *new failing senders*: " + ", ".join(top) + _more(len(top), failing))
+                lines.append("- *new failing senders*: " + ", ".join(top) + _more(len(top), failing) + _excepted_tail(gone))
+            elif gone:
+                lines.append("- new failing senders: none left%s" % _excepted_tail(gone))
             for note in dl.get("notes") or []:
                 lines.append("- note: %s" % note)
         elif previous:
