@@ -149,8 +149,18 @@ day one:
 
 - `domains`: leave empty to audit every verified domain in the tenant, or list
   them. `mailflow = true` adds every subdomain seen sending in the last 30 days.
-- `known` and `vendor_domains`: your vendors' domains and IP prefixes, so the
-  unknown-sender check and the heuristic labels start informed.
+- `known`: your vendors' IP prefixes and domains. The unknown-sender check in
+  the aggregate reports runs only on the IP prefixes: with them, every source
+  outside them and every DKIM signing domain that is neither yours nor listed
+  is reported once it has volume. Domains alone only narrow the
+  signing-domain list and inform the aggregate reports' heuristic labels, and
+  the report says the per-IP check did not run.
+- `vendor_domains`: your sending platforms' envelope domains, so the heuristic
+  labels in the mail log and in the aggregate reports start informed. Like the
+  domains in `known` they narrow the signing-domain list, but they never
+  switch the unknown-sender check on. Domains only: an IP prefix here never
+  matches anything (a run that reads aggregate reports warns about it); IP
+  prefixes go in `known`.
 - `rua_address`: the `mailto:` the plan writes into new DMARC records.
 - `keep = 12`: how many dated runs stay under `audit-out/history/`.
 - `[notify] enabled`: whether the Slack summary posts when a webhook is set.
@@ -427,10 +437,12 @@ would leave the machine.
   are still in the report; only the comparison is withheld, and it returns
   from the next run of a similar shape.
 - **One of your own platforms shows as `unknown` in the aggregate reports**,
-  with "SPF passes for ..., which looks like the forwarding hop": if that
-  platform sends for you, list its domain among the vendors in `audit.toml`
-  (or `--known`) and, as long as nothing in the reports marks forwarding, the
-  stream reads as a broken DKIM key at your own sender.
+  with "SPF passes for ..., which looks like the forwarding hop": if the
+  domains that signal names send for you, list every one of them among the
+  vendors in `audit.toml` (`vendor_domains`, or `--known`). The stream
+  relabels only once all of them are listed, and the hint under the signal
+  names any still missing; then, as long as nothing in the reports marks
+  forwarding, it reads as a broken DKIM key at your own sender.
 
 ## Methodology and background
 

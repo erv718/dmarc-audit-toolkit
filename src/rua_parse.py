@@ -12,7 +12,9 @@ What it answers
   - which DKIM selectors are actually signing, per signing domain: the
     evidence AGENTS.md rule 8 demands before any key is deleted
     (--retiring-selector NAME shows the count for one key)
-  - which sources are not in your inventory (--known: domains and IP prefixes)
+  - which sources are not in your inventory (--known: its IP prefixes run the
+    per-IP check, its domains narrow the signing-domain list and inform the
+    labels)
   - which sources fail with real volume, with a heuristic likely label
   - who passes on SPF alone (breaks on forwarding, so DKIM before p=reject)
   - whether receivers saw the policy you think you published (--expect-policy)
@@ -755,7 +757,14 @@ def retiring_selectors(agg, names):
 
 def unknown_senders(agg, nets, domains):
     """Source IPs outside the known prefixes and DKIM signing domains outside
-    the known domains. The domains the reports are about count as known."""
+    the known domains. The domains the reports are about count as known.
+
+    An ip entry's pass and fail are DMARC results, one per message; a
+    dkim_domain entry's are signature results (verified or not), and one
+    message can carry several signatures, so the two kinds never add up.
+    With no prefixes listed every source IP is an entry: the per-IP check
+    did not run (filters.known.ip_check), so those are a source list, not a
+    verdict."""
     own = set(agg["domains"]) | set(domains)
     out = []
     for ip, s in agg["sources"].items():
@@ -818,9 +827,13 @@ def likely_label(s, domains, known_domains=()):
                 return "likely_misconfigured", signals
             signals.append(f"SPF passes for {', '.join(doms) or '?'}, which looks like the forwarding hop")
             if own_key:
+                # the relabel needs every domain SPF passes for listed: the hint names the ones still missing
                 missing = [d for d in doms if not _under(d, known_domains or ())]
-                signals.append(f"or our own platform with a broken DKIM key: if {', '.join(missing)} sends for us, list it "
-                               "under --known or the settings' vendors and this stream reads as likely_misconfigured")
+                many = len(missing) > 1
+                names = ", ".join(missing[:-1]) + " and " + missing[-1] if many else missing[0]
+                signals.append(f"or our own platform with a broken DKIM key: if {names} {'send' if many else 'sends'} "
+                               f"for us, list {'them' if many else 'it'} under --known or the settings' vendors and "
+                               "this stream reads as likely_misconfigured")
         signals.append("not a sender misconfiguration if the original passed at the first hop; check tenant logs")
         return "unknown", signals
     if s["misaligned_dkim"]:
@@ -939,24 +952,47 @@ def build_findings(agg, derived, opts, skipped=0, warnings=()):
             "investigation, it is not a verdict",
             verified=False)
 
-    if opts["known_given"]:
+    if opts["ip_check"]:
         unknown = [u for u in derived["unknown_senders"] if u["count"] >= min_volume]
-        if unknown:
-            passing = sum(u["pass"] for u in unknown)
-            failing = sum(u["fail"] for u in unknown)
-            add("OUTSIDE-002", "major",
-                f"{len(unknown)} unknown sender(s) with volume, not in --known: {passing} msgs passing, {failing} failing",
-                _sample(unknown, lambda u: f"{u['kind']} {u['value']} x{u['count']} ({u['pass']} pass) "
-                                           f"from {', '.join((u.get('header_from') or u.get('source_ips') or ['?'])[:3])}"),
+        # a message has one source IP, so the ip entries count each message once with its DMARC result; a
+        # signing domain's counts are signature results on those same messages: a clause of their own
+        ips = [u for u in unknown if u["kind"] == "ip"]
+        doms = [u for u in unknown if u["kind"] == "dkim_domain"]
+        parts = []
+        if ips:
+            parts.append(f"{len(ips)} unknown sender(s) with volume, not in --known: "
+                         f"{sum(u['pass'] for u in ips)} msgs passing, {sum(u['fail'] for u in ips)} failing")
+        if doms:
+            parts.append(f"{len(doms)} signing domain(s)" + ("" if ips else " with volume,") + " not in --known: "
+                         f"{sum(u['pass'] for u in doms)} signatures verified, {sum(u['fail'] for u in doms)} not")
+        if parts:
+            evidence = (_sample(ips, lambda u: f"ip {u['value']} x{u['count']} ({u['pass']} pass) "
+                                               f"from {', '.join((u.get('header_from') or ['?'])[:3])}"),
+                        _sample(doms, lambda u: f"dkim_domain {u['value']} x{u['count']} ({u['pass']} verified) "
+                                                f"from {', '.join((u.get('source_ips') or ['?'])[:3])}", 3))
+            add("OUTSIDE-002", "major", "; ".join(parts), "; ".join(e for e in evidence if e),
                 "a passing unknown is a vendor missing from the inventory or an account you did not "
                 "authorise: find the owner, then add it to --known; a failing unknown is either a spoof "
-                "(leave it failing) or a sender that needs DKIM")
+                "(leave it failing) or a sender that needs DKIM"
+                + ("; a signing domain not in the list is a platform signing as itself: find the owner, then "
+                   "add it to --known" if doms else ""))
     elif agg["sources"]:
-        add("OUTSIDE-009", "info",
-            "no --known list: unknown-sender check not run, every source is listed as unknown",
-            f"{len(agg['sources'])} source IPs seen",
-            "pass --known with your vendors' domains and IP prefixes (comma list or file) to narrow the list",
-            verified=False)
+        # the per-IP check needs prefixes: with none listed every source is an entry, so the check did not run
+        if opts["known_given"]:
+            add("OUTSIDE-009", "info",
+                "known list has no IP prefixes: per-IP unknown-sender check not run, every source is listed as unknown",
+                f"{len(agg['sources'])} source IPs seen; known domains: {', '.join(opts['known_domains']) or 'none'}",
+                "pass --known with your vendors' domains and IP prefixes (comma list or file) to run it; "
+                "domains alone only narrow the signing-domain list and inform the labels",
+                verified=False)
+        else:
+            add("OUTSIDE-009", "info",
+                "no --known list: unknown-sender check not run, every source is listed as unknown",
+                f"{len(agg['sources'])} source IPs seen"
+                + (f"; the vendor domains ({', '.join(opts['known_domains'])}) only narrow the "
+                   "signing-domain list and inform the labels" if opts["known_domains"] else ""),
+                "pass --known with your vendors' domains and IP prefixes (comma list or file) to narrow the list",
+                verified=False)
 
     spf_only = derived["spf_only_senders"]
     if spf_only:
@@ -1040,7 +1076,7 @@ def exit_code(findings):
 
 # ------------------------------------------------------------------ doc
 
-def _source_doc(ip, s, total, nets, known_given, names):
+def _source_doc(ip, s, total, nets, ip_check, names):
     return {
         "source_ip": ip, "count": s["count"], "share": round(s["count"] / (total or 1), 4),
         "pass": s["pass"], "fail": s["fail"], "pass_rate": round(s["pass"] / s["count"], 4) if s["count"] else 0.0,
@@ -1056,7 +1092,7 @@ def _source_doc(ip, s, total, nets, known_given, names):
         "reporters": sorted(s["reporters"]),
         "as_reported": sorted(s["as_reported"]),
         "first_seen": _day(s["begin"]), "last_seen": _day(s["end"]),
-        "known": ip_known(ip, nets) if known_given else None,
+        "known": ip_known(ip, nets) if ip_check else None,
         "rdns": names.get(ip),
     }
 
@@ -1083,9 +1119,10 @@ def build_doc(files, reports, agg, derived, findings, opts, skipped, warnings, n
         "filters": {"since": opts["since"], "until": opts["until"], "min_volume": opts["min_volume"],
                     "fail_threshold": opts["fail_threshold"], "expect_policy": opts["expect_policy"],
                     "retiring_selectors": opts["retiring"], "rdns": opts["rdns"],
-                    "known": {"given": opts["known_given"], "networks": [str(n) for n in opts["nets"]],
-                              "domains": opts["known_domains"],
-                              "note": "the domains the reports are about count as known signing domains"}},
+                    "known": {"given": opts["known_given"], "ip_check": opts["ip_check"],
+                              "networks": [str(n) for n in opts["nets"]], "domains": opts["known_domains"],
+                              "note": "the domains the reports are about count as known signing domains; "
+                                      "ip_check: the per-IP check ran, which needs IP prefixes in --known"}},
         "totals": {
             "reports": agg["reports"], "records": agg["records"], "messages": total,
             "pass": agg["pass"], "fail": agg["fail"],
@@ -1100,7 +1137,7 @@ def build_doc(files, reports, agg, derived, findings, opts, skipped, warnings, n
             "count_note": "count_defaulted records had no usable <count> and were counted as 1 message each; "
                           "records_rejected had a negative <count> and are not in any total",
         },
-        "by_source_ip": [_source_doc(ip, s, total, opts["nets"], opts["known_given"], names) for ip, s in by_ip],
+        "by_source_ip": [_source_doc(ip, s, total, opts["nets"], opts["ip_check"], names) for ip, s in by_ip],
         "by_header_from": [{"domain": d, "apex": org_domain(d) if not d.startswith("(") else None,
                             "is_subdomain": not d.startswith("(") and org_domain(d) != d,
                             "count": f["count"], "pass": f["pass"], "fail": f["fail"],
@@ -1232,9 +1269,12 @@ def print_report(doc, agg, top=20):
 
     unk = doc["unknown_senders"]
     kn = flt["known"]
-    if kn["given"]:
+    if kn["ip_check"]:
         what = ", ".join(kn["networks"] + kn["domains"])
         print(f"\nunknown senders ({len(unk)}; not in --known {what}; reported domains count as known signers):")
+    elif kn["given"]:
+        print(f"\nunknown senders ({len(unk)}; --known names no IP prefixes, so the per-IP check did not run and "
+              "every source is listed - add your vendors' IP prefixes to narrow):")
     else:
         print(f"\nunknown senders ({len(unk)}; no --known list, so every source is unknown - pass --known to narrow):")
     print(f"  {'count':>7} {'pass':>7} {'fail':>7}  {'kind':<12} value" if unk else "  none")
@@ -1246,6 +1286,12 @@ def print_report(doc, agg, top=20):
     line = _more(unk, top)
     if line:
         print(line)
+    if any(u["kind"] == "dkim_domain" for u in unk[:top]):
+        # without the per-IP check every source is an ip row; with it, a signer sending from inside the
+        # known prefixes has no ip row, so its messages are counted only here, as signatures
+        print("  dkim_domain rows count signatures (pass = verified), not messages; "
+              + ("a signer's messages appear in an ip row only when they came from outside the known prefixes"
+                 if kn["ip_check"] else "the ip rows already count those messages"))
 
     streams = doc["failing_streams"]
     print(f"\nfailing streams ({len(streams)}; >= {flt['min_volume']} msgs and pass rate < {flt['fail_threshold']:.2f}; "
@@ -1305,10 +1351,13 @@ def in_window(rep, since, until):
 def analyse(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, until=None,
             expect_policy=None, retiring=(), use_rdns=False, top=20, vendors=()):
     """Everything main does short of printing: the --json document.
-    vendors: sending platforms from the settings, known senders like --known's
-    domains for the labels and the DKIM-domain side of the unknown-sender list;
-    only --known switches on the IP allow-list check, since vendors name no
-    networks.
+    The per-IP half of the unknown-sender check runs only on the IP prefixes
+    in --known (filters.known.ip_check): domains, from --known or from
+    vendors, only narrow the signing-domain side of the list and inform the
+    labels, so a domain-only list and the vendors behave alike.
+    vendors: sending platforms from the settings (vendor_domains), named by
+    domain; an IP prefix among them is ignored with a warning, since it could
+    never match a domain (prefixes go in --known).
 
     Raises RuaInputError on input problems (missing path, no report files,
     nothing parsable, bad --since/--until or --known); main() prints that as
@@ -1328,9 +1377,22 @@ def analyse(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, un
     reports = [r for r in reports if in_window(r, lo, hi)]
 
     nets, known_domains = parse_known(known)
-    if vendors:
-        known_domains = sorted(set(known_domains or ()) | {str(v).strip().lower().rstrip(".") for v in vendors
-                                                           if str(v).strip()})
+    platforms = []
+    for v in vendors or ():
+        name = str(v).strip().lower().rstrip(".")
+        if not name:
+            continue
+        try:
+            ipaddress.ip_network(name, strict=False)
+        except ValueError:
+            platforms.append(name)
+            continue
+        msg = (f"vendor domain {name} is an IP prefix, not a domain: ignored; vendor domains name sending "
+               "platforms for the labels, IP prefixes go in the known list (--known) for the per-IP check")
+        print(f"warning: {msg}", file=sys.stderr)
+        warnings.append(msg)
+    if platforms:
+        known_domains = sorted(set(known_domains or ()) | set(platforms))
     names = [s.strip().lower() for arg in (retiring or []) for s in arg.split(",") if s.strip()]
     agg = aggregate(reports)
     derived = {
@@ -1344,7 +1406,7 @@ def analyse(paths, known=None, min_volume=20, fail_threshold=0.5, since=None, un
     opts = {"paths": list(paths), "since": since, "until": until, "min_volume": min_volume,
             "fail_threshold": fail_threshold, "expect_policy": expect_policy, "retiring": names,
             "rdns": use_rdns, "nets": nets, "known_domains": known_domains, "known_given": bool(known),
-            "parsed_total": parsed_total}
+            "ip_check": bool(nets), "parsed_total": parsed_total}
 
     ptr = {}
     if use_rdns:  # only the IPs the report shows, so a big set does not turn into minutes of waiting
@@ -1364,7 +1426,9 @@ def main():
     ap.add_argument("paths", nargs="+", help="report files or directories (recursed); relative to the repo root")
     ap.add_argument("--known", metavar="LIST_OR_FILE",
                     help="known domains and IP prefixes, comma-separated or one per line in a file; "
-                         "the domains the reports are about are always treated as known signers")
+                         "the per-IP unknown-sender check runs only on the IP prefixes, the domains narrow the "
+                         "signing-domain list and inform the labels; the domains the reports are about are "
+                         "always treated as known signers")
     ap.add_argument("--min-volume", type=int, default=20, metavar="N",
                     help="messages a source needs before it counts as a stream (default 20)")
     ap.add_argument("--fail-threshold", type=float, default=0.5, metavar="RATE",

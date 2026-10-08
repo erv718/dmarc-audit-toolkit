@@ -94,6 +94,21 @@ def sender_label(u):
     return str(u)
 
 
+def ip_check_ran(rua):
+    """Did the outside view's per-IP unknown-sender check run? Only then are
+    rua.unknown_senders the sources outside the known IP prefixes; without
+    prefixes the list holds every source by construction (OUTSIDE-009). A
+    report from before rua.filters.known.ip_check ran it when it listed
+    networks."""
+    if not isinstance(rua, dict):
+        return False
+    flt = rua.get("filters") if isinstance(rua.get("filters"), dict) else {}
+    known = flt.get("known") if isinstance(flt.get("known"), dict) else {}
+    if "ip_check" in known:
+        return known["ip_check"] is True
+    return bool(known.get("given") and known.get("networks"))
+
+
 def census_top(census, n=CENSUS_TOP):
     """(labels, failing) for a census dict: the n worst entries as short labels
     made of domains only - envelope domains with their genuine failures, and
@@ -229,7 +244,7 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
                      % (tot.get("messages", 0), 100 * float(tot.get("pass_rate", 0) or 0),
                         disp.get("reject", 0), disp.get("quarantine", 0)))
         unk = rua.get("unknown_senders") or []
-        if unk:
+        if unk and ip_check_ran(rua):  # without the check the list names every source, the tenant's own too
             cut = rua.get("truncated") if isinstance(rua.get("truncated"), dict) else {}
             try:  # the table may be capped to its busiest rows: the count is the total, not the rows kept
                 total = int((cut.get("unknown_senders") or {}).get("total") or len(unk))
