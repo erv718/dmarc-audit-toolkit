@@ -1,22 +1,31 @@
-// Mail that FAILED DMARC (no copy passed) and was delivered anyway, and WHAT
-// let it through. These are your local overrides - allow rules, exception
-// lists, trusted forwarders, Microsoft's implicit authentication. They mask
-// failures that external receivers will not forgive, which is why a domain
-// can look healthy internally and still be junked by Gmail.
-// Deduplicated at the src/dedupe.py grain: (Message-ID, recipient), over
-// Inbound and Intra-org legs. A message is counted only when NO copy passed
-// and at least one copy was Delivered. The override columns come from the
-// delivered leg:
+// Mail that FAILED DMARC (no copy passed) and reached a mailbox anyway, and
+// WHAT let it through. These are your local overrides - allow rules,
+// exception lists, trusted forwarders, Microsoft's implicit authentication.
+// They mask failures that external receivers will not forgive, which is why
+// a domain can look healthy internally and still be junked by Gmail.
+// Counted the way src/dedupe.py counts delivered-despite-fail and
+// queries/maillog_totals.kql counts delivered_despite_fail, so msgs adds up to
+// the report's count for the domain: one logical message is a (Message-ID,
+// recipient) pair over Inbound and Intra-org legs, counted when a leg failed
+// DMARC, none passed, and a copy reached a mailbox - Delivered or
+// DeliveredToDeletedFolder, to the inbox, junk or deleted items (a copy
+// marked Delivered on-premises or to an external address did not).
+// The override columns come from one delivered leg, picked the way dedupe.py
+// picks the leg it names: a failing leg that records an override first, then
+// any delivered leg that records one, then any delivered leg. They are read
+// through column_ifexists, so a tenant whose schema lacks one sees it empty:
 //   org_action  = OrgLevelAction   - what an org-level policy or rule did
 //   org_policy  = OrgLevelPolicy   - which policy or transport rule that was
-//   user_action = UserLevelAction  - a user safe-sender or mailbox rule
+//   user_action = UserLevelAction  - what a user-level policy did
+//   user_policy = UserLevelPolicy  - which one (a user's safe sender list, say)
 //   compauth    = composite authentication verdict on that leg; "pass" or
 //                 "softpass" with DMARC fail means implicit authentication
 //                 carried it, "none" means the override alone did
-// Empty override columns with delivered > 0 mean the platform delivered a
-// failing message with no recorded override - a p=none policy does exactly
-// that, and is the baseline you are trying to move away from.
-// Columns: msgs = logical messages, senders = distinct From addresses,
+// Empty override columns mean the platform delivered a failing message with
+// no recorded override - a p=none policy does exactly that, and is the
+// baseline you are trying to move away from.
+// Columns: env = envelope (MAIL FROM) domain, the five columns above,
+// msgs = logical messages, senders = distinct From addresses,
 // recipients = distinct mailboxes, sample_sender = one From address to trace.
 let sender_domain = "example.com";      // apex under enforcement
 EmailEvents
@@ -27,21 +36,36 @@ EmailEvents
 | extend auth = parse_json(AuthenticationDetails)
 | extend dmarc = tostring(auth.DMARC), ca = tostring(auth.CompAuth)
 | extend rcpt = tolower(RecipientEmailAddress)
-| extend on_delivered = DeliveryAction == "Delivered"
-| summarize anypass     = max(iff(dmarc =~ "pass", 1, 0)),
-            anyfail     = max(iff(dmarc =~ "fail", 1, 0)),
-            delivered   = max(iff(on_delivered, 1, 0)),
-            env         = min(SenderMailFromDomain),
-            addr        = min(SenderFromAddress),
-            org_action  = max(iff(on_delivered, tostring(OrgLevelAction), "")),
-            org_policy  = max(iff(on_delivered, tostring(OrgLevelPolicy), "")),
-            user_action = max(iff(on_delivered, tostring(UserLevelAction), "")),
-            compauth    = max(iff(on_delivered, ca, ""))
+| extend loc = tolower(tostring(DeliveryLocation))           // dedupe.py's "reached a mailbox": delivered, to the inbox, junk or deleted items
+| extend on_mailbox = (tostring(DeliveryAction) in~ ("Delivered", "DeliveredToDeletedFolder"))
+                      and (indexof(loc, "inbox") >= 0 or indexof(loc, "junk") >= 0 or indexof(loc, "deleted") >= 0)
+| extend org_action  = tostring(column_ifexists("OrgLevelAction", "")),
+         org_policy  = tostring(column_ifexists("OrgLevelPolicy", "")),
+         user_action = tostring(column_ifexists("UserLevelAction", "")),
+         user_policy = tostring(column_ifexists("UserLevelPolicy", ""))
+| extend overridden = isnotempty(org_policy) or isnotempty(user_policy)
+| extend leg_rank = case(on_mailbox and dmarc =~ "fail" and overridden, 3,   // the leg dedupe.py names first
+                         on_mailbox and overridden,                     2,
+                         on_mailbox,                                    1,
+                                                                        0)
+| extend leg = strcat(leg_rank, "\t", org_action, "\t", org_policy, "\t", user_action, "\t", user_policy, "\t", ca)
+| summarize anypass   = max(iff(dmarc =~ "pass", 1, 0)),
+            anyfail   = max(iff(dmarc =~ "fail", 1, 0)),
+            delivered = max(iff(on_mailbox, 1, 0)),
+            env       = min(SenderMailFromDomain),
+            addr      = min(SenderFromAddress),
+            best_leg  = max(leg)                             // the best-ranked leg: its five values belong together
   by InternetMessageId, rcpt
 | where anyfail > 0 and anypass == 0 and delivered == 1
+| extend picked = split(best_leg, "\t")
+| extend org_action  = tostring(picked[1]),
+         org_policy  = tostring(picked[2]),
+         user_action = tostring(picked[3]),
+         user_policy = tostring(picked[4]),
+         compauth    = tostring(picked[5])
 | summarize msgs = count(),
             senders = dcount(addr),
             recipients = dcount(rcpt),
             sample_sender = any(addr)
-  by env, org_action, org_policy, user_action, compauth
+  by env, org_action, org_policy, user_action, user_policy, compauth
 | order by msgs desc

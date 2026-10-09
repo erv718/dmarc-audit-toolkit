@@ -411,7 +411,8 @@ def test_mail_log_findings_fill_their_domain_into_the_query_and_quote_the_report
                  "that let each delivered one in",
                  "the report's own rows hold 10 of the failures and 4 of the deliveries (org: Exchange transport rule "
                  "(Allow) x4), " + FLOOR,
-                 "a little above the full-window 15 of maillog_totals",
+                 "counted the way the report counts them (a copy that reached the inbox, junk or deleted items, at the "
+                 "(Message-ID, recipient) grain), so its msgs column adds up to the full-window 15 of maillog_totals",
                  "the report's top ones are ceo@corp.example x6, billing@corp.example x4",
                  "unaudited subdomain news.corp.example come to about total 40 and genuine_failures 40",
                  "the report's own rows count 3 and 3, " + FLOOR,
@@ -433,7 +434,7 @@ def test_mail_log_findings_fill_their_domain_into_the_query_and_quote_the_report
     t = texts(corp)
     assert "total column adds up to 45, passing to 35 and genuine_failures to 10" in t and "expect more" in t
     assert "delivered_despite_fail adds up to 4, and delivered_by names the override" in t
-    assert "a little above the report's 4, which counts copies that reached the inbox" in t
+    assert "so its msgs column adds up to the report's 4; " in t and "a little above" not in t
     assert "unaudited subdomain news.corp.example add up to total 3 and genuine_failures 3" in t
     hr = verify.maillog_steps(report, "hr.corp.example")
     assert 'let sender_domain = "hr.corp.example";' in hr[0]["code"] and "adds up to 4, passing to 4" in hr[0]["text"]

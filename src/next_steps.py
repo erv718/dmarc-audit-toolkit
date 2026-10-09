@@ -170,6 +170,12 @@ PREREQ_REWORDS = (
     (re.compile(r"^one change to (\S+) a week: this row and the other rows? for it \(([^)]+)\) each rewrite "),
      lambda m: "the other change to %s (plan %s) waits for another week, since both rewrite today's record"
      % (m.group(1), m.group(2))),
+    (re.compile(r"^the external-destination record exists: receivers send (\S+)'s aggregate data to (\S+) only when "
+                r"(\S+) publishes (\S+) TXT"),
+     lambda m: "%s publishes %s, so receivers send %s's aggregate reports to %s"
+     % (m.group(3), m.group(4), m.group(1), m.group(2))),
+    (re.compile(r"^look up (_dmarc\.\S+) first: publish only if it has no record"),
+     lambda m: "a lookup shows %s has no record yet" % m.group(1)),
 )
 GLOSSARY = OrderedDict([
     ("DMARC", "the published rule that tells receiving mail systems what to do with mail that claims "
@@ -1235,6 +1241,8 @@ def step_label(change):
         if is_spf:
             parts = value.split()
             return "change the SPF ending to %s" % (parts[-1] if parts else "~all")
+        if "rua" in why.lower() and cur.get("rua"):  # it reports already, just not to the toolkit
+            return "add the toolkit's report address to rua"
         if "rua" in why.lower():
             return "add rua reporting to the DMARC record"
         return first
@@ -1265,10 +1273,10 @@ def step_label(change):
 def table_step(change):
     """A plan change as the per-domain table's Next step cell: a domain the
     run measured sending nothing reads 'no mail measured: quarantine now';
-    any other change, its step_label."""
-    if change.get("kind") == "no_mail":
-        return "no mail measured: quarantine now"
-    return step_label(change)
+    any other change, its step_label. A record for a name whose own _dmarc
+    lookup failed says it waits on a lookup."""
+    step = "no mail measured: quarantine now" if change.get("kind") == "no_mail" else step_label(change)
+    return step + (" (once a lookup shows it has no record of its own)" if looks_first(change) else "")
 
 
 def reword_prereq(text):
@@ -1278,6 +1286,16 @@ def reword_prereq(text):
         if m:
             return plain(fn(m))
     return plain(text)
+
+
+LOOKUP_FIRST = re.compile(r"^look up _dmarc\.\S+ first:")
+
+
+def looks_first(change):
+    """True when a record waits on a lookup of the name's own _dmarc record
+    (plan.lookup_first): nobody saw whether it has one, and a second record
+    would leave it with no policy at all."""
+    return any(LOOKUP_FIRST.match(p) for p in prereqs_of(change))
 
 
 def prereqs_of(change):
@@ -2198,7 +2216,7 @@ def build_actions(report, plan, view, owners):
         if prio == 1 and c.get("kind") in ("new", "modify"):
             items.append({"kind": "p1record", "keys": keys, "ref": c.get("id"), "domain": dom,
                           "hostname": c.get("hostname"), "hook": dom, "action": step_label(c),
-                          "is_dmarc": str(c.get("hostname") or "").startswith("_dmarc.")})
+                          "is_dmarc": str(c.get("hostname") or "").startswith("_dmarc."), "lookup": looks_first(c)})
         else:
             action = plain(step_label(c))
             why = plain(str(c.get("human_summary") or c.get("why") or "").strip())  # plan.py's plain words first
@@ -2380,8 +2398,14 @@ def build_actions(report, plan, view, owners):
         if p1:
             ids = [i["ref"] for i in p1 if i["ref"]]
             what = "monitoring" if all(i["is_dmarc"] for i in p1) else "monitoring and hygiene"
+            # a record for a name whose own _dmarc record nobody saw waits on a lookup: a second record breaks it
+            looks = [i["ref"] or i["domain"] for i in p1 if i.get("lookup")]
             lines.append({"hook": "%d zero-risk %s %s" % (len(p1), what, _plural(len(p1), "record")),
-                          "action": "ready to publish", "ref": ("plan " + id_range(ids)) if ids else None,
+                          "action": "ready to publish" + (", of which %d (%s) %s a lookup first: the name may have a "
+                                                          "record of its own already" % (
+                                                              len(looks), ", ".join(looks),
+                                                              "needs" if len(looks) == 1 else "need") if looks else ""),
+                          "ref": ("plan " + id_range(ids)) if ids else None,
                           "kind": "p1summary", "domains": [i["domain"] for i in p1]})
         for i in rest:
             lines.append({"hook": i["hook"], "action": i["action"], "ref": i["ref"], "kind": i["kind"],
@@ -2418,12 +2442,20 @@ def build_ask(plan, org, nxt, policy):
         ids = [c.get("id") for c in p1 if c.get("id")]
         text = ("approval to publish the %d zero-risk %s (plan %s) in the next DNS change window"
                 % (len(p1), _plural(len(p1), "record"), id_range(ids)))
-        # a park row the plan verified unused needs no check; the others say which checks are open
+        # a park row the plan verified unused needs no check; the others say which checks are open. A record for a
+        # name whose own _dmarc record nobody saw waits on a lookup of it
         park = sum(1 for c in p1 if c.get("kind") == "park"
                    and not any(str(p).startswith("verified unused") for p in prereqs_of(c)))
+        looks = sum(1 for c in p1 if looks_first(c))
+        said = []
         if park:
-            text += ", of which %d %s the domain's unused check first" % (
-                park, "is a park row that needs" if park == 1 else "are park rows that need")
+            said.append("%d %s the domain's unused check first" % (
+                park, "is a park row that needs" if park == 1 else "are park rows that need"))
+        if looks:
+            said.append("%d %s a lookup of the name's own _dmarc record first (publish only if it has none)" % (
+                looks, "needs" if looks == 1 else "need"))
+        if said:
+            text += ", of which " + " and ".join(said)
         parts.append(text)
     if quiet:
         ids = [c.get("id") for c in quiet if c.get("id")]

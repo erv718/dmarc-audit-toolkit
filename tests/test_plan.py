@@ -94,7 +94,9 @@ def test_duplicate_records_are_holds_not_changes():
     p = plan.build_plan(rep)
     assert not [c for c in p["changes"] if c["domain"] == "dup.example" and c["kind"] in ("new", "modify")]
     reasons = " ".join(h["reason"] for h in p["holds"])
-    assert "two DMARC records" in reasons and "more than one SPF record" in reasons
+    # SPF-007 is an include dns_audit could not resolve, never a second SPF record
+    assert "two DMARC records" in reasons and "an SPF include could not be resolved" in reasons
+    assert "more than one SPF record" not in reasons
 
 
 def test_spf_neutral_terminator_becomes_softfail():

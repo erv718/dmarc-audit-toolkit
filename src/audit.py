@@ -2716,7 +2716,9 @@ def main():
                     help="output directory for report.md, report.json, plan.md, plan.json (default audit-out/)")
     ap.add_argument("--no-plan", action="store_true", help="do not write the rollout plan (plan.md, plan.json)")
     ap.add_argument("--rua-address", metavar="MAILTO",
-                    help="reporting address the plan puts in new DMARC records (default: the one your records already use)")
+                    help="the run's report address: the plan puts it in new DMARC records and appends it to a record's "
+                         "rua that lacks it (default: new records take the rua your records already use, and nothing "
+                         "is appended)")
     ap.add_argument("--inventory", metavar="JSON", help="inventory.json from discover.py, for the zone host per domain")
     ap.add_argument("--offline", action="store_true",
                     help="no live DNS or network work; analyse only the files given")
@@ -2888,6 +2890,8 @@ def main():
             pm, pj = plan_mod.write(plan_mod.build_plan(report, inventory, args.rua_address), args.out)
             print(f"wrote {pm}")
             print(f"wrote {pj}")
+            if plan_mod.address_note(args.rua_address):
+                print("note: plan: " + plan_mod.address_note(args.rua_address), file=sys.stderr)
         except ValueError as err:
             print(f"note: no plan written ({err})", file=sys.stderr)
     sys.exit(report["exit_code"])

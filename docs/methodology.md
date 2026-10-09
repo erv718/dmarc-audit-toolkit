@@ -102,8 +102,9 @@ record of its own first, then the apex's `sp=` moves to quarantine, even
 while the apex itself is still at quarantine. The plan names the sending
 subdomains still without a record, audited or not - including one whose
 mail fails in a way the heuristic cannot pin on spoofing, and an audited
-one whose mail out was not measured. The move to reject and the `sp=` step
-rewrite the same record: one a week.
+one whose mail out was not measured. Whether a subdomain has a record is a
+DNS lookup, never what an old aggregate report says was published there. The
+move to reject and the `sp=` step rewrite the same record: one a week.
 
 The weekly run answers that question for you. `src/audit.py` gives the
 verdict per domain, and `next_steps.md` carries it in the "Per domain" table

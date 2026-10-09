@@ -19,6 +19,7 @@ import audit
 import collect
 import dedupe
 import discover
+import dns_audit
 import graph_client
 import next_steps
 import notify
@@ -457,8 +458,11 @@ def test_g2_the_plan_calls_a_domain_unused_only_when_every_check_was_made():
     notes, p = park_notes(parked_report(covered), {"old.example.com": zeros(), "parked.example": zeros()})
     assert notes["old.example.com"] == [VERIFIED]
     assert len([c for c in p["changes"] if c["domain"] == "old.example.com" and c["kind"] == "park"]) == 2
-    # parked.example has no DMARC record, so no report can cover it: measured silent, still not verified
-    assert notes["parked.example"] == ["verify unused first: no passing volume in aggregate reports, no owner objects"]
+    # parked.example has no DMARC record, so no report can cover it: measured silent, still not verified (its new
+    # record reports to another organization's mailbox, so that row also names the external-destination record)
+    assert notes["parked.example"] == [
+        plan_mod.external_destination("parked.example", "mailto:reports@example.com"),
+        "verify unused first: no passing volume in aggregate reports, no owner objects"]
     # the status document's ask counts only the park rows still waiting on a check: parked.example's two
     ask = next_steps.build_ask(p, "example.com", None, None)
     assert "of which 2 are park rows that need the domain's unused check first" in ask
@@ -1011,6 +1015,9 @@ def test_collect_measures_mail_flow_once_per_run_and_counts_a_cut_orgs_whole_win
     monkeypatch.setattr(discover, "zone_for", lambda domain, resolver=None: {
         "zone": discover.org_domain(domain), "ns": [], "zone_host": "not checked", "ns_path": "skipped"})
     monkeypatch.setattr(audit, "run_dns", live_dns)
+    # the _dmarc lookup collect.py makes for quiet.corp.example, an unaudited name passing in the full window
+    monkeypatch.setattr(dns_audit, "resolve_ex", lambda resolver, name, rtype: (
+        [], {"path": "stub", "ttl": None, "status": "absent"}))
     monkeypatch.setattr(collect, "ROW_CAP", 300)
     monkeypatch.setattr(collect, "SLICE_TARGET", 270)
     out = tmp_path / "out"
@@ -1044,7 +1051,11 @@ def test_collect_measures_mail_flow_once_per_run_and_counts_a_cut_orgs_whole_win
     assert report["mailflow"]["days"] == 30 and report["mailflow"]["domains"] == flows
     open_checks = "verify unused first: no passing volume in aggregate reports, no owner objects"
     parks = [c for c in files["plan.json"]["changes"] if c["domain"] == "parked.example" and c["kind"] == "park"]
-    assert len(parks) == 2 and all(c["prerequisites"] == [open_checks] for c in parks)
+    assert len(parks) == 2 and all(c["prerequisites"][0] == open_checks for c in parks)
+    # the new DMARC record reports to another organization's mailbox: it also waits on the external-destination record
+    assert {c["hostname"]: c["prerequisites"][1:] for c in parks} == {
+        "parked.example": [],
+        "_dmarc.parked.example": [plan_mod.external_destination("parked.example", "mailto:reports@example.com")]}
     for c in parks:  # todo.md's "Do now" says what each park row waits on, as plan.md does
         row = "- %s parked.example: TXT at `%s` = `%s`" % (c["id"], c["hostname"], c["value"])
         assert text["todo.md"].split(row, 1)[1].split("\n")[1] == "  - before applying: " + open_checks
@@ -1081,7 +1092,7 @@ def test_collect_measures_mail_flow_once_per_run_and_counts_a_cut_orgs_whole_win
     assert files["report.json"]["mailflow"]["days"] == 30
     assert files["report.json"]["maillog"]["window_totals"]["hours"] == 168
     parks = [c for c in files["plan.json"]["changes"] if c["domain"] == "parked.example" and c["kind"] == "park"]
-    assert parks and all(c["prerequisites"] == [open_checks] for c in parks)
+    assert parks and all(c["prerequisites"][0] == open_checks for c in parks)
     assert "| nothing sent or received in 30 days (tenant) |" in text["next_steps.md"]
 
     files, text = run(0)  # nothing cut: no totals query, no totals
@@ -1095,7 +1106,7 @@ def test_collect_measures_mail_flow_once_per_run_and_counts_a_cut_orgs_whole_win
     assert "mail flow not measured: HTTP 429 on hunting: too many requests" in files["run.json"]["degraded"]
     assert "| `parked.example` | no DMARC record | " in text["next_steps.md"]
     parks = [c for c in files["plan.json"]["changes"] if c["domain"] == "parked.example" and c["kind"] == "park"]
-    assert parks and all(c["prerequisites"] == [UNVERIFIED] for c in parks)
+    assert parks and all(c["prerequisites"][0] == UNVERIFIED for c in parks)
     assert "| not measured |" in text["next_steps.md"] and "- parked.example: not measured" in text["report.md"]
 
     # an answer with no results at all is no measurement: every name stays not measured, never "nothing sent"

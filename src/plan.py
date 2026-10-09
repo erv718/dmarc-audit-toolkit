@@ -10,10 +10,26 @@ The rules are the methodology, encoded (docs/methodology.md):
 
   monitoring first     no DMARC record, or a subdomain inheriting nothing:
                        publish p=none with rua before anything else. A record
-                       without rua gets rua added. Two records at one name
-                       get collapsed - after an ownership check.
+                       without rua gets rua added; a record whose rua lacks
+                       the run's report address (--rua: collect.py's
+                       --rua-address, else its report mailbox) gets it
+                       appended after the addresses already there, nothing
+                       else changed: a zero-risk row of its own, never gated
+                       on the reports it starts (a gated step on the record
+                       waits a week for it), or inside the quarantine-now
+                       row that rewrites the record anyway. Appended after
+                       two addresses or more, it may get partial reports
+                       (receivers need send to two only): the row says so.
+                       A record that gains an address in another
+                       organization, a new record too, waits on the
+                       external-destination record that address's domain
+                       must publish. Two records at one name get collapsed
+                       - after an ownership check.
   SPF hygiene          no terminator or +all/?all becomes ~all; over the
-                       lookup limit is a fix-first; at the limit is a freeze.
+                       lookup limit is a fix-first; at the limit is a freeze;
+                       an include that does not resolve (the count is a lower
+                       bound) holds any new sender until it resolves - looked
+                       up again first, since the failure may be the run's own.
   parked domains       no mail in, no mail out, nothing signing: v=spf1 -all
                        and p=reject, once "unused" is verified. Verified
                        means the tenant measured no mail out and none in
@@ -52,6 +68,13 @@ The rules are the methodology, encoded (docs/methodology.md):
                        was not measured - needs a _dmarc record of its own
                        before sp=quarantine; the plan proposes the missing
                        monitoring records and holds the step naming them.
+                       Only DNS says a name has a record of its own: an
+                       audited name's lookup, and for an unaudited one the
+                       lookup collect.py made (report.dns_extra) - never the
+                       policy an aggregate report says it saw. A name nobody
+                       looked up, or whose lookup failed (an audited one's
+                       too: DMARC-007), is named as not checked and its
+                       record waits on a lookup first.
   evidence holds       a mail log or aggregate reports showing a legitimate
                        sender still failing holds that domain's next
                        enforcement step, and says why - unless the gate
@@ -73,6 +96,9 @@ rollback so the human can apply and revert it.
 
   python src/plan.py audit-out/report.json --out audit-out
   python src/plan.py report.json --inventory exports/inventory.json --rua mailto:reports@example.com
+
+Without --rua, new records take the rua most existing records use, and no
+record gets an address appended: the run has no report address of its own.
 """
 
 import argparse
@@ -124,6 +150,58 @@ def with_rua(record, rua):
         idx = next((i for i, p in enumerate(out) if p.lower().startswith("ruf=")), len(out))
         out.insert(idx, "rua=" + rua)
     return "; ".join(out) + ";"
+
+
+def _bare(address):
+    """One rua address as the plan compares it: lower-cased, without mailto: and without a !size limit."""
+    a = str(address or "").strip()
+    a = a[len("mailto:"):] if a.lower().startswith("mailto:") else a
+    return a.split("!", 1)[0].strip().lower()
+
+
+def rua_addresses(record):
+    """The addresses a record's rua= sends to, lower-cased, without mailto: and without a !size limit."""
+    return [a for a in (_bare(part) for part in rua_of(record).split(",")) if a]
+
+
+def has_address(record, uri):
+    """True when the record's rua= already sends to the address of uri, whatever its case or size limit."""
+    return _bare(uri) in rua_addresses(record)
+
+
+REPORT_ADDRESS = re.compile(r"^(?:mailto:)?([^@\s,;!]+@[^@\s,;!]+)(![0-9]+[kmgt]?)?$", re.I)
+
+
+def report_uri(address):
+    """'mailto:name@example.com' for one report address given with or without
+    mailto: (a !size limit kept), else None: a list of addresses, or none."""
+    m = REPORT_ADDRESS.match(str(address or "").strip())
+    return "mailto:" + m.group(1) + (m.group(2) or "") if m else None
+
+
+def address_note(rua):
+    """What a run says when its report address cannot be appended to a
+    record's rua (a list of addresses, say); None when it can or there is
+    none."""
+    if not rua or report_uri(rua):
+        return None
+    return ("the report address %s is not one mailto: address: new records carry it as given, and no record gets it "
+            "appended to its rua (give one address to have it appended)" % rua)
+
+
+def add_rua(record, address):
+    """The same record with address appended to its rua= list, after the
+    addresses already there; every other character as it was. The rua= tag
+    edited is the one dmarc_tags reads (the last, should a record carry two).
+    A record with no rua tag gets one (with_rua)."""
+    found = list(re.finditer(r"(?:^|;)\s*rua\s*=([^;]*)", record or "", re.I))
+    if not found:
+        return with_rua(record, address)
+    m = found[-1]
+    value = m.group(1)
+    kept = value.rstrip()
+    sep = "" if not kept.strip() or kept.endswith(",") else ","
+    return record[:m.start(1)] + kept + sep + address + value[len(kept):] + record[m.end(1):]
 
 
 def set_tag(record, key, value):
@@ -188,6 +266,55 @@ def org_domain(name):
     if len(labels) > 2 and ".".join(labels[-2:]) in two:
         return ".".join(labels[-3:])
     return ".".join(labels[-2:]) if len(labels) >= 2 else name
+
+
+def external_destination(domain, address):
+    """The prerequisite a record needs when its rua sends to an address in
+    another organization (RFC 7489 7.1): receivers deliver the record's
+    aggregate data there only when the address's domain publishes the
+    external-destination record for it. None for an address in the record's
+    own organization, and for anything that is not an address (the
+    placeholder)."""
+    bare = _bare(address)
+    host = bare.rpartition("@")[2].rstrip(".")
+    if "@" not in bare or not re.match(r"^[a-z0-9_-]+(\.[a-z0-9_-]+)+$", host):
+        return None
+    if org_domain(host) == org_domain(domain):
+        return None
+    return ('the external-destination record exists: receivers send %s\'s aggregate data to %s only when %s publishes '
+            '%s._report._dmarc.%s TXT "v=DMARC1" (or a wildcard *._report._dmarc.%s); without it they drop the new '
+            'address' % (domain, bare, host, domain, host, host))
+
+
+def destinations(domain, value, current):
+    """The external-destination prerequisites of a DMARC record a row
+    publishes: one for every rua address it adds to the current record (each
+    one, for a name with no record) that lies in another organization."""
+    before = set(rua_addresses(current)) if str(current or "").lower().startswith("v=dmarc1") else set()
+    out = []
+    for a in rua_addresses(value):
+        text = None if a in before else external_destination(domain, a)
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def rua_order(current, address):
+    """The prerequisite of a row that appends address to a record whose rua=
+    already sends to two addresses or more: receivers need send to the first
+    two only (RFC 7489 6.2), so the one appended after them may get nothing
+    from some. None for a record with fewer."""
+    n = len(rua_addresses(current))
+    if n < 2:
+        return None
+    return ("decide the order of the rua addresses: receivers need send to the first two only (RFC 7489 6.2) and the "
+            "record already lists %d, so %s, appended after them, may get no data from some receivers - list it among "
+            "the first two (drop or move another), or accept partial data" % (n, _bare(address)))
+
+
+def lookup_first(name):
+    """The prerequisite of a record for a name whose own _dmarc record this run could not see."""
+    return "look up _dmarc.%s first: publish only if it has no record" % name
 
 
 # --------------------------------------------------------------------------
@@ -501,7 +628,7 @@ SAID_UNCLEAR = "failing in the mail log that may be our own system (the labels c
 SAID_EXCEPTED = "failing in the mail log from a sender formally excepted in audit.toml"
 
 
-def sending_names(report, inventory_rows=None):
+def sending_names(report, inventory_rows=None, volume=None):
     """{name: [what shows it sending]} for every From domain this run saw
     sending, or possibly sending, audited or not: mail out in the tenant's
     mail flow (report.mailflow: an audited name's row or inventory row, and
@@ -515,13 +642,17 @@ def sending_names(report, inventory_rows=None):
     looks like our own system, when the labels cannot tell spoof from our
     own system (unknown), or when a formal exception covers it (an explained
     sender of ours), in the mail log or in the reports; only a failure that
-    looks like spoofing is not. Each entry is a short phrase with the count."""
+    looks like spoofing is not. Each entry is a short phrase with the count.
+    volume, a dict, receives each name's largest count among them (0 when
+    none carries one): how busy it is."""
     out = {}
 
-    def saw(name, text):
+    def saw(name, text, n=0):
         name = _dns_name(name)
         if name and text not in out.setdefault(name, []):
             out[name].append(text)
+        if name and volume is not None:
+            volume[name] = max(volume.get(name, 0), n or 0)
 
     mf = report.get("mailflow") if isinstance(report.get("mailflow"), dict) else {}
     flows = dict(mf.get("unaudited")) if isinstance(mf.get("unaudited"), dict) else {}
@@ -532,7 +663,7 @@ def sending_names(report, inventory_rows=None):
     for name, flow in flows.items():
         n = _measured(flow.get("outbound")) if isinstance(flow, dict) else None
         if n:
-            saw(name, "%d out in the tenant's mail flow" % n)
+            saw(name, "%d out in the tenant's mail flow" % n, n)
     ml = report.get("maillog") if isinstance(report.get("maillog"), dict) else {}
     by_dom = ml.get("by_domain") if isinstance(ml.get("by_domain"), dict) else {}
 
@@ -547,10 +678,10 @@ def sending_names(report, inventory_rows=None):
         if isinstance(c, dict):
             n = (_measured(c.get("passing_messages")) or 0) + (_measured(c.get("internal_messages")) or 0)
             if n:
-                saw(name, "%d in the mail log that did not fail" % n)
+                saw(name, "%d in the mail log that did not fail" % n, n)
             for n, said in zip(failures(c), (SAID_OWN, SAID_UNCLEAR, SAID_EXCEPTED)):
                 if n:
-                    saw(name, "%d %s" % (n, said))
+                    saw(name, "%d %s" % (n, said), n)
     census = ml.get("census") if isinstance(ml.get("census"), dict) else {}
     tally, failing = {}, {}
     for r in _rows(census.get("by_sender")):
@@ -568,11 +699,11 @@ def sending_names(report, inventory_rows=None):
         k.append(_measured(r.get("excepted")) or 0)
         failing[name] = [a + b for a, b in zip(failing.get(name, [0, 0, 0]), k)]
     for name, n in tally.items():
-        saw(name, "%d in the mail log that did not fail" % n)
+        saw(name, "%d in the mail log that did not fail" % n, n)
     for name, ks in failing.items():
         for n, said in zip(ks, (SAID_OWN, SAID_UNCLEAR, SAID_EXCEPTED)):
             if n:
-                saw(name, "%d %s" % (n, said))
+                saw(name, "%d %s" % (n, said), n)
     if not _rows(census.get("by_sender")):
         for name, c in by_dom.items():
             st = c.get("subdomains_total") if isinstance(c, dict) else None
@@ -591,42 +722,89 @@ def sending_names(report, inventory_rows=None):
         for name, c in (by if isinstance(by, dict) else {}).items():
             n = _measured(c.get("passing")) if isinstance(c, dict) else None
             if n:
-                saw(name, "about %d passing over the full window (advanced hunting)" % n)
+                saw(name, "about %d passing over the full window (advanced hunting)" % n, n)
     rua = report.get("rua") if isinstance(report.get("rua"), dict) else {}
     for h in _rows(rua.get("by_header_from")):
         n = _measured(h.get("pass")) if isinstance(h, dict) else None
         if n:
-            saw(h.get("domain"), "%d passing in the aggregate reports" % n)
+            saw(h.get("domain"), "%d passing in the aggregate reports" % n, n)
     for f in _rows(rua.get("failing_streams")):
         if not isinstance(f, dict) or f.get("likely") not in OWN_LABELS + (UNCLEAR_LABEL,):
             continue
         said = ("from what looks like our own system" if f.get("likely") in OWN_LABELS
                 else "that may be our own system (the labels cannot tell)")
         for h in _rows(f.get("header_from")):
-            saw(h, "%s failing in the aggregate reports %s" % (_measured(f.get("fail")) or "some", said))
+            saw(h, "%s failing in the aggregate reports %s" % (_measured(f.get("fail")) or "some", said),
+                _measured(f.get("fail")))
     return out
+
+
+def unaudited_senders(report, inventory_rows=None):
+    """[(name, volume)] for the names below an audited domain that the
+    sending rule finds (sending_names) and the run does not audit, the
+    busiest first (volume: the largest count any source shows for it). Only
+    DNS says whether such a name has a DMARC record of its own: collect.py
+    looks these up (report.dns_extra) before the plan reads them."""
+    dns = report.get("dns") if isinstance(report.get("dns"), dict) else {}
+    audited = {_name(d) for d in dns}
+    volume = {}
+    names = sending_names(report, inventory_rows, volume)
+    below = [n for n in names if n not in audited and any(n.endswith("." + a) for a in audited if a)]
+    return sorted(((n, volume.get(n, 0)) for n in below), key=lambda kv: (-kv[1], kv[0]))
+
+
+EXTRA_STATUSES = ("found", "absent", "error")
+
+
+def dns_extra(report):
+    """{name: answer} from report.dns_extra: the _dmarc lookups collect.py
+    made for the unaudited subdomains that send ({"dmarc": the record or
+    None, "status": found | absent | error, "source": the _dmarc name where
+    found}). An entry of the wrong shape reads as no lookup at all."""
+    extra = report.get("dns_extra") if isinstance(report.get("dns_extra"), dict) else {}
+    return {name: x for name, x in ((_dns_name(k), v) for k, v in extra.items())
+            if name and isinstance(x, dict) and x.get("status") in EXTRA_STATUSES}
+
+
+def has_own_record(name, answer):
+    """True when a dns_extra answer shows a DMARC record at the name's own _dmarc name."""
+    return answer.get("status") == "found" and _name(answer.get("source")) == "_dmarc." + name
+
+
+def own_lookup_failed(dns_doc):
+    """True when an audited name's own _dmarc lookup failed: every lookup
+    (DMARC-006), or its own while a parent's record answered (DMARC-007, the
+    audit assumed it inherits). A record of its own may be there all the
+    same."""
+    ids = {f.get("id") for f in _rows((dns_doc or {}).get("findings")) if isinstance(f, dict)}
+    return (dns_doc or {}).get("dmarc_status") == "error" or bool(ids & {"DMARC-006", "DMARC-007"})
 
 
 def subdomain_context(report, inventory_rows, dns_docs):
     """What the plan knows about the names below each audited domain:
-    senders (sending_names), own (the names with a DMARC record of their own:
-    an audited name's, from DNS, or a name the aggregate reports saw a policy
-    published at), audited, and unmeasured (the audited names whose mail out
-    this run did not measure: no mail flow for them, whatever else the run
-    read - the mail log carries no outbound leg, and mail to receivers that
-    send no reports shows nowhere else - so they may send, and count as if
-    they did)."""
+    senders (sending_names), own (the names with a DMARC record of their own,
+    as DNS shows it: an audited name's lookup, and for an unaudited one the
+    lookup collect.py made, report.dns_extra - the policy an aggregate report
+    says it saw is no proof: those reports can be months old), checked (the
+    names whose own record DNS answered for: an audited name unless its own
+    _dmarc lookup failed - DMARC-006, or DMARC-007, where the audit assumed
+    it inherits - and an unaudited one whose lookup found a record or none),
+    extra (the dns_extra answers), audited, and unmeasured (the audited
+    names whose mail out this run did not measure: no mail flow for them,
+    whatever else the run read - the mail log carries no outbound leg, and
+    mail to receivers that send no reports shows nowhere else - so they may
+    send, and count as if they did)."""
     audited = {_name(d) for d in dns_docs}
     own = {_name(d) for d, doc in dns_docs.items()
            if isinstance(doc, dict) and doc.get("dmarc") and not doc.get("inherited")}
-    rua = report.get("rua") if isinstance(report.get("rua"), dict) else {}
-    check = rua.get("policy_check") if isinstance(rua.get("policy_check"), dict) else {}
-    seen = {_name(s.get("domain")) for s in _rows(check.get("seen")) if isinstance(s, dict)}
-    own |= {d for d in seen if d and d not in audited}  # DNS decides for an audited name
+    extra = {n: x for n, x in dns_extra(report).items() if n not in audited}  # DNS decides for an audited name
+    own |= {n for n, x in extra.items() if has_own_record(n, x)}
+    blind = {_name(d) for d, doc in dns_docs.items() if isinstance(doc, dict) and own_lookup_failed(doc)}
+    checked = (audited - blind) | {n for n, x in extra.items() if has_own_record(n, x) or x["status"] == "absent"}
     unmeasured = {d for d in audited
                   if _measured(mailflow_of(report, (inventory_rows or {}).get(d), d).get("outbound")) is None}
-    return {"senders": sending_names(report, inventory_rows), "own": own, "audited": audited,
-            "unmeasured": unmeasured}
+    return {"senders": sending_names(report, inventory_rows), "own": own, "checked": checked, "extra": extra,
+            "audited": audited, "unmeasured": unmeasured}
 
 
 def missing_records(apex, ctx):
@@ -711,8 +889,14 @@ def evidence_for(report, domain):
 
 PREREQ_KINDS = ("dkim_proof", "list_proof", "spf_budget", "evidence", "verify_unused", "reports", "other")
 # first match wins, so the order matters: an evidence hold can mention DKIM and
-# a DKIM prerequisite can mention forwarding
+# a DKIM prerequisite can mention forwarding. A DNS check worded around the names
+# and addresses it quotes (a lookup first, an external-destination record, the
+# order of the rua addresses, the subdomains' own records, one change a week)
+# comes first: a name or an address in it never decides its kind
 PREREQ_RULES = (
+    ("other", re.compile(r"^(?:look up _dmarc\.\S+ first:|the external-destination record exists:|decide the order "
+                         r"of the rua addresses:|every subdomain that sends has its own _dmarc record\b|one change to "
+                         r"\S+ a week:)", re.I)),
     ("verify_unused", re.compile(r"verif(?:y|ied) unused", re.I)),
     ("spf_budget", re.compile(r"\blookups?\b", re.I)),
     ("other", re.compile(r"sender inventory", re.I)),
@@ -743,7 +927,28 @@ def _share(pct):
 
 
 def human_summary(change):
-    """One plain sentence about a change for a reader who does not read DNS."""
+    """One plain sentence about a change for a reader who does not read DNS;
+    a second when the change also appends the run's report address to the
+    record's rua (folded into a quarantine-now row that rewrites the record
+    anyway)."""
+    text = _summary(change)
+    value, current = str(change.get("value") or ""), str(change.get("current") or "")
+    if change.get("kind") not in ("modify", "new", "park") and current.lower().startswith("v=dmarc1") \
+            and rua_of(current) and value.lower().startswith("v=dmarc1"):
+        added = [a for a in rua_addresses(value) if a not in rua_addresses(current)]
+        if added:
+            text += (" The same change adds %s to the record's reporting addresses, so its aggregate reports start "
+                     "reaching the toolkit's archive%s." % (", ".join(added), _third(current)))
+    return text
+
+
+def _third(current):
+    """The caveat of an address appended after two or more (RFC 7489 6.2), for a plain sentence; '' otherwise."""
+    return (" - from every receiver only once it is among the record's first two addresses (see the check listed with "
+            "it)" if len(rua_addresses(current)) >= 2 else "")
+
+
+def _summary(change):
     domain = change.get("domain") or change.get("hostname") or "the domain"
     kind = change.get("kind")
     host = str(change.get("hostname") or "")
@@ -761,6 +966,9 @@ def human_summary(change):
         return ("Tell receivers to refuse anything claiming to come from %s, which sends no mail; the reporting "
                 "address still shows every attempt." % domain)
     if kind == "new":
+        if current.lower().startswith("not checked"):  # nobody saw whether it has one: a second record breaks it
+            return ("Publish a monitoring-only DMARC record for %s once a lookup shows it has none of its own, so its "
+                    "reports start flowing; no effect on delivery." % domain)
         return "Publish a monitoring-only DMARC record for %s so its reports start flowing; no effect on delivery." % domain
     if kind == "no_mail":
         return ("Move %s straight to quarantine instead of the weekly ramp, once the checks listed with it are "
@@ -772,6 +980,10 @@ def human_summary(change):
             parts = value.split()
             return ("Change the end of the %s SPF record to %s so mail from unlisted servers is treated as suspicious "
                     "instead of ignored; listed senders are unaffected." % (domain, parts[-1] if parts else "~all"))
+        if old.get("rua"):  # it reports already, just not to the toolkit
+            return ("Add the toolkit's report address to the %s DMARC record, after the addresses it already reports "
+                    "to, so its aggregate reports start reaching the toolkit's archive%s; no effect on delivery."
+                    % (domain, _third(current)))
         return ("Add a reporting address to the %s DMARC record so receivers start telling us what fails; "
                 "no effect on delivery." % domain)
     if kind == "todo":
@@ -825,10 +1037,12 @@ def next_step_for(plan, domain):
 # --------------------------------------------------------------------------
 # the rules
 
-def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domains, subs=None):
+def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domains, subs=None, report_addr=None):
     """Changes and next steps for one domain. Returns (changes, holds).
     subs: subdomain_context() for the run (build_plan passes it): what the
-    run knows about the names below this domain, audited or not."""
+    run knows about the names below this domain, audited or not.
+    report_addr: the run's report address (a mailto: URI), which the
+    domain's own record must carry in its rua; None when the run has none."""
     changes, holds = [], []
     ids = finding_ids(dns_doc)
     dmarc = dns_doc.get("dmarc")
@@ -854,15 +1068,31 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     hostname = "_dmarc." + domain
     subdomains = sorted(d for d in all_domains if d != domain and d.endswith("." + domain))
     subs = subs if subs is not None else subdomain_context(report, {}, report.get("dns") or {})
-    # the names below this domain that send (or that nothing measured) and have no record of their own
+    # the names below this domain that send (or that nothing measured) and have no record of their own; one whose
+    # own record nobody saw (no lookup, or one that failed - an audited name's too) is named as not checked
     sending_subs, unmeasured_subs = missing_records(domain, subs)
     missing = sending_subs + unmeasured_subs
-    missing_text = _listed(sending_subs + ["%s (not measured)" % n for n in unmeasured_subs]) if missing else ""
+    unchecked = [n for n in missing if n not in subs.get("checked", ())]
+
+    def marked(n):
+        said = (["not measured"] if n in unmeasured_subs else []) + (["not checked"] if n in unchecked else [])
+        return "%s (%s)" % (n, ", ".join(said)) if said else n
+    missing_text = _listed([marked(n) for n in missing]) if missing else ""
+    look_first = "; a name marked not checked may have a record already: look it up first" if unchecked else ""
+    # this domain's own _dmarc lookup failed (DMARC-007: the audit assumed it inherits): a record proposed for it
+    # waits on a lookup, as for an unaudited name nobody checked - a second record would leave it with no policy
+    blind = own_lookup_failed(dns_doc)
+    unseen = "not checked (its lookup failed in this run)" if blind else "none"
+    first = [lookup_first(domain)] if blind else []
     pct = int(tags.get("pct", "100") or 100) if tags.get("pct", "100").isdigit() else 100
     sp_tag = (tags.get("sp") or "").strip().lower() or None
 
     def add(kind, priority, record, host, value, current, rollback, why, prereqs=(), fids=(), name=None):
         d = name or domain
+        prereqs = list(prereqs)
+        if host == "_dmarc." + d and str(value).lower().startswith("v=dmarc1"):
+            # a rua address the record gains in another organization: receivers send there only once it agrees
+            prereqs += [p for p in destinations(d, value, current) if p not in prereqs]
         c = {"domain": d, "zone": zone, "zone_host": zone_host, "kind": kind,
              "priority": priority, "record": record, "hostname": host, "value": value,
              "ttl": ttl, "current": current, "rollback": rollback, "why": why,
@@ -874,16 +1104,28 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     def monitor_unaudited():
         """p=none records for the subdomains below this domain that send and
         are not audited (no row of their own covers them): the record that
-        shields each from this domain's sp= change. Their DNS was not checked."""
+        shields each from this domain's sp= change. A name whose own _dmarc
+        lookup (report.dns_extra) showed none gets it outright; one nobody
+        looked up, or whose lookup failed, gets it with a lookup first: a
+        second record would leave it with no policy at all."""
         for n in sending_subs:
             if n in subs["audited"]:
                 continue  # an audited subdomain's own row proposes its record
+            seen = "; ".join(subs["senders"].get(n) or ["?"])
+            if n not in unchecked:  # DNS answered with no record at its own name
+                add("new", 1, "TXT", "_dmarc." + n, "v=DMARC1; p=none; rua=%s;" % rua_addr, "none", "delete the record",
+                    "sending subdomain without a record of its own: an explicit record shields it from the apex's sp= "
+                    "change on %s (seen sending: %s); DNS shows no record at _dmarc.%s" % (domain, seen, n), (), (),
+                    name=n)
+                continue
+            failed = (subs.get("extra", {}).get(n) or {}).get("status") == "error"
             add("new", 1, "TXT", "_dmarc." + n, "v=DMARC1; p=none; rua=%s;" % rua_addr,
-                "not checked (not an audited domain)", "delete the record",
-                "sending subdomain without a record of its own: an explicit record shields it from the apex's sp= "
-                "change on %s (seen sending: %s)" % (domain, "; ".join(subs["senders"].get(n) or ["?"])),
-                ["_dmarc.%s has no record yet - it is not audited, so this run did not look (add it to audit.toml's "
-                 "domains or to EXTRA_DOMAINS so the next run checks it)" % n], (), name=n)
+                "not checked (%s)" % ("its lookup failed in this run" if failed else "not an audited domain"),
+                "delete the record",
+                "sending subdomain whose own record this run %s: an explicit record shields it from the apex's sp= "
+                "change on %s if it has none (seen sending: %s)" % ("could not look up" if failed else "did not look up",
+                                                                     domain, seen),
+                [lookup_first(n)], (), name=n)
 
     # Not verified: do not plan against a guess.
     if dns_doc.get("dmarc_status") == "error" or spf_status == "error":
@@ -979,20 +1221,27 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     if "DMARC-005" in ids:
         holds.append({"domain": domain, "reason": "two DMARC records at %s - receivers apply no policy and send no reports; find out who published the second record before collapsing to one" % hostname})
     elif needs_record:
+        fids = ids & {"DMARC-001", "DMARC-002", "DMARC-007"}
         if parked_candidate:
-            add("park", 1, "TXT", hostname, "v=DMARC1; p=reject; rua=%s;" % rua_addr, "none",
+            add("park", 1, "TXT", hostname, "v=DMARC1; p=reject; rua=%s;" % rua_addr, unseen,
                 "delete the record", "parked domain: nothing sends as it, so reject spoofing outright and keep rua to see attempts",
-                [parked_note], ids & {"DMARC-001", "DMARC-002"})
+                first + [parked_note], fids)
         elif quiet:
             fast = True
-            add("no_mail", 1, "TXT", hostname, quiet_value(None), "none", "delete the record", quiet_why(),
-                quiet_prereqs, ids & {"DMARC-001", "DMARC-002"})
+            add("no_mail", 1, "TXT", hostname, quiet_value(None), unseen, "delete the record", quiet_why(),
+                first + quiet_prereqs, fids)
         else:
-            why = ("subdomain without a record of its own: it inherits policy none from %s; an explicit record starts its "
-                   "own reporting and shields it from the apex's sp= change" % dns_doc.get("dmarc_source")
-                   if inherited else "no DMARC record: no policy and no reporting - monitoring starts here")
-            add("new", 1, "TXT", hostname, "v=DMARC1; p=none; rua=%s;" % rua_addr, "none", "delete the record", why, (),
-                ids & {"DMARC-001", "DMARC-002"})
+            if blind:
+                why = ("subdomain whose own _dmarc lookup failed in this run (DMARC-007): if it has no record of its "
+                       "own, it inherits policy none from %s, and an explicit record starts its own reporting and "
+                       "shields it from the apex's sp= change" % dns_doc.get("dmarc_source"))
+            elif inherited:
+                why = ("subdomain without a record of its own: it inherits policy none from %s; an explicit record "
+                       "starts its own reporting and shields it from the apex's sp= change" % dns_doc.get("dmarc_source"))
+            else:
+                why = "no DMARC record: no policy and no reporting - monitoring starts here"
+            add("new", 1, "TXT", hostname, "v=DMARC1; p=none; rua=%s;" % rua_addr, unseen, "delete the record", why,
+                first, fids)
     elif quiet and not inherited and (policy == "none" or (policy == "quarantine" and pct < 100)):
         fast = True
         add("no_mail", 1, "TXT", hostname, quiet_value(dmarc), dmarc, "publish the current string verbatim", quiet_why(),
@@ -1004,9 +1253,17 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
         monitor_unaudited()
 
     # --- SPF hygiene --------------------------------------------------------
+    # dns_audit's SPF ids: 001 no record, 002 the lookup failed (held above), 003 a weak terminator, 004 over the
+    # 10-lookup limit, 005 at it, 006 one under it, 007 an include that did not resolve (the count a lower bound).
+    # None of them is two v=spf1 records: dns_audit reads the first one it finds, so no hold says that. SPF-007 is
+    # an include no resolver path answered for in this run (one with no SPF record reads NO SPF RECORD instead), so
+    # the failure may be the run's own: the include is looked up again before anyone removes it
     if "SPF-007" in ids:
-        holds.append({"domain": domain, "reason": "more than one SPF record at %s - receivers return permerror; collapse to one after checking who published each" % domain})
-    elif "SPF-001" in ids or not spf:
+        holds.append({"domain": domain, "reason": "an SPF include could not be resolved, so the lookup count is a lower "
+                                                  "bound: look the include up through two resolvers (verify.md) or "
+                                                  "re-run; fix or remove it only if it fails there too, and add no "
+                                                  "sender until it resolves"})
+    if "SPF-001" in ids or not spf:
         if parked_candidate:
             add("park", 1, "TXT", domain, "v=spf1 -all", "none", "delete the record",
                 "parked domain: no sender is authorized, every SPF check fails", [parked_note], {"SPF-001"})
@@ -1063,7 +1320,8 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
         monitor_unaudited()
         if missing:
             holds.append({"domain": domain, "reason": "subdomains that send have no record of their own: %s - publish "
-                          "their monitoring records (above) before sp= moves to quarantine" % missing_text})
+                          "their monitoring records (above) before sp= moves to quarantine%s"
+                          % (missing_text, look_first)})
             pre = ["every subdomain that sends has its own _dmarc record: %s %s none yet (the monitoring records "
                    "above)" % (missing_text, "has" if len(missing) == 1 else "have")]
         else:
@@ -1105,7 +1363,7 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
             if sp_tag is None and missing:  # no sp=: the subdomains without a record follow p= to reject
                 holds.append({"domain": domain, "reason": "subdomains that send have no record of their own and follow "
                               "p= (the record has no sp=): %s - moving to reject would reject their failing mail too; "
-                              "give each its own record, or add sp=, before that move" % missing_text})
+                              "give each its own record, or add sp=, before that move%s" % (missing_text, look_first)})
             if quiet:  # no sender to prove with DKIM: reports that keep showing nothing passing are the evidence
                 # the checks the quarantine-now row carried stay open: a week at quarantine settles none of them
                 week = ("a week at p=quarantine with the aggregate reports still showing nothing passing as %s" % domain
@@ -1134,6 +1392,32 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
                     ["reject stable for 30 days", "every sender DKIM-signed and aligned (SPF -all breaks SPF-only senders on forwarding)"])
     if "SPF-005" in ids:
         holds.append({"domain": domain, "reason": "SPF is at the 10-lookup limit: no new include for any reason; new senders authenticate with DKIM"})
+
+    # --- the run's report address in the record's rua ------------------------------------------------------
+    # a record that reports only to a vendor or a mailbox of its own hides its outside view from the toolkit; the
+    # address joins the ones already there, and nothing else changes. The zero-risk change that starts those reports
+    # is never gated on the evidence they bring: it is a priority-1 row of its own, and a gated step that rewrites
+    # the record from today's value names it as the other change this week (alternatives), to be proposed again
+    # from the new value. Only a priority-1 row that rewrites the record anyway (quarantine now) carries it instead:
+    # one change to the record
+    if (report_addr and dmarc and not inherited and "DMARC-005" not in ids and "rua" in tags
+            and not has_address(dmarc, report_addr)):
+        order = [p for p in [rua_order(dmarc, report_addr)] if p]
+        same = [c for c in changes if c["hostname"] == hostname and c["current"] == dmarc and c["priority"] == 1]
+        for c in same:
+            if has_address(c["value"], report_addr):
+                continue  # the row fills an empty rua with it already
+            c["value"] = add_rua(c["value"], report_addr)
+            c["why"] += ("; the same change adds %s to rua, after the addresses already there, so the aggregate "
+                         "reports reach the toolkit's archive (one change to this record a week)" % report_addr)
+            c["prerequisites"] += [p for p in order + destinations(domain, c["value"], c["current"])
+                                   if p not in c["prerequisites"]]
+            c["prerequisite_items"] = prereq_items(c["prerequisites"])
+            c["human_summary"] = human_summary(c)
+        if not same:
+            add("modify", 1, "TXT", hostname, add_rua(dmarc, report_addr), dmarc, "publish the current string verbatim",
+                "the run's report address is missing from the record's rua: %s goes after the addresses already there, "
+                "so the aggregate reports reach the toolkit's archive; nothing else changes" % report_addr, order)
     return changes, holds
 
 
@@ -1157,18 +1441,26 @@ def alternatives(changes):
 
 
 def build_plan(report, inventory=None, rua=None, ttl=DEFAULT_TTL):
+    """The plan for a report. rua: the run's report address (collect.py's
+    --rua-address, else the mailbox it reads the reports from): new records
+    carry it (with mailto: added when it came without), and a record whose
+    rua lacks it gets it appended - when it is one address (address_note
+    says why not otherwise). Without it, new records take the rua most
+    existing records use and nothing is appended."""
     dns_docs = report.get("dns") or {}
     if not dns_docs:
         raise ValueError("the report has no DNS section (run audit.py without --offline, or with domains)")
     inv_rows = {}
     for row in (inventory or {}).get("domains", []) if isinstance(inventory, dict) else (inventory or []):
         inv_rows[row["domain"]] = row
-    rua_addr = rua or derive_rua(dns_docs) or RUA_PLACEHOLDER
+    report_addr = report_uri(rua)  # a derived address is no report address: nothing is appended without one
+    rua_addr = report_addr or rua or derive_rua(dns_docs) or RUA_PLACEHOLDER
     all_domains = sorted(dns_docs)
     subs = subdomain_context(report, inv_rows, dns_docs)
     changes, holds, proposed = [], [], set()
     for domain in all_domains:
-        c, h = plan_domain(domain, dns_docs[domain], report, inv_rows.get(domain), rua_addr, ttl, all_domains, subs)
+        c, h = plan_domain(domain, dns_docs[domain], report, inv_rows.get(domain), rua_addr, ttl, all_domains, subs,
+                           report_addr)
         for change in c:  # an unaudited subdomain's record, proposed by two audited parents, is one row
             if change["domain"] != domain:
                 if change["hostname"] in proposed:
@@ -1183,8 +1475,8 @@ def build_plan(report, inventory=None, rua=None, ttl=DEFAULT_TTL):
     by_host = collections.OrderedDict()
     for c in changes:
         by_host.setdefault(c["zone_host"], []).append(c)
-    return {"rua": rua_addr, "rua_is_placeholder": rua_addr == RUA_PLACEHOLDER, "ttl": ttl,
-            "domains": all_domains, "changes": changes, "holds": holds,
+    return {"rua": rua_addr, "rua_is_placeholder": rua_addr == RUA_PLACEHOLDER, "report_address": report_addr,
+            "ttl": ttl, "domains": all_domains, "changes": changes, "holds": holds,
             "by_zone_host": {k: [c["id"] for c in v] for k, v in by_host.items()},
             "source_report": report.get("generated_utc")}
 
@@ -1253,9 +1545,10 @@ def render_md(plan):
     L.append("## How to use this")
     L.append("")
     L.append("Apply priority 1 as one change per zone host: its monitoring and hygiene rows touch no mail anyone "
-             "legitimately sends today, and every new record starts reporting. A no-mail-measured row is "
-             "different: it quarantines a domain the run measured sending nothing, so it waits on the checks "
-             "listed with it. Re-run the audit after reports have flowed "
+             "legitimately sends today, and every new record starts reporting; a row that lists a check before "
+             "applying (a lookup first, an external-destination record, the order of the rua addresses) waits on "
+             "it. A no-mail-measured row is different: it quarantines a domain the run measured sending nothing, so "
+             "it waits on the checks listed with it. Re-run the audit after reports have flowed "
              "for a week; the enforcement steps re-appear only when their prerequisites are met, and the "
              "plan regenerates from the new report. One ratchet per domain per week, and one change per "
              "record: rows that rewrite the same record say so.")
@@ -1275,7 +1568,8 @@ def main():
     ap = argparse.ArgumentParser(description="Turn an audit report into the DNS records to publish next.")
     ap.add_argument("report", help="report.json from src/audit.py")
     ap.add_argument("--inventory", help="inventory.json from src/discover.py (zone host per domain)")
-    ap.add_argument("--rua", help="reporting address for new records, e.g. mailto:reports@example.com")
+    ap.add_argument("--rua", help="the run's report address, e.g. mailto:reports@example.com: new records carry it, "
+                                  "and a record whose rua lacks it gets it appended")
     ap.add_argument("--ttl", type=int, default=DEFAULT_TTL)
     ap.add_argument("--out", metavar="DIR", help="write plan.md and plan.json here (default: print plan.md)")
     ap.add_argument("--json", action="store_true", help="print plan.json instead of plan.md")

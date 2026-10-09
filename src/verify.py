@@ -78,8 +78,9 @@ NAME_RX = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+)+$")
 QUERIES = {
     "genuine_failures": (7, "genuine failures by envelope domain and From address, deduplicated at "
                             "(Message-ID, recipient), last 7 days"),
-    "delivered_despite_failure": (30, "failing mail delivered anyway, grouped by envelope domain and the override on the "
-                                      "delivered copy (org_action, org_policy, user_action, compauth), last 30 days"),
+    "delivered_despite_failure": (30, "failing mail that reached a mailbox anyway, deduplicated at (Message-ID, "
+                                      "recipient), grouped by envelope domain and the override on the delivered copy "
+                                      "(org_action, org_policy, user_action, user_policy, compauth), last 30 days"),
     "sender_census": (30, "every envelope domain sending as the domain: total, passing, genuine_failures, last 30 days"),
     "subdomain_health": (30, "every subdomain under the domain: total and genuine_failures, last 30 days"),
     "dkim_alignment": (30, "passing senders under the domain by bucket: dkim_aligned, spf_and_dkim, spf_only, last 30 days"),
@@ -98,6 +99,8 @@ RUA_TOP = 20  # rows per table rua_parse.py prints unless --top says more
 IP_RX = re.compile(r"[0-9A-Fa-f:.]+")
 # the same question over DNS-over-HTTPS, the way dns_audit.py asks it when port 53 fails
 DOH = "(Invoke-RestMethod -Uri 'https://dns.google/resolve?name=%s&type=%s').Answer.data"
+# the external-destination record a prerequisite names (plan.external_destination): <record domain>._report._dmarc.<host>
+DESTINATION_RX = re.compile(r"([a-z0-9_.-]+\._report\._dmarc\.([a-z0-9_.-]+)) TXT")
 LOOKUP_SHOW = {"TXT": "ForEach-Object { $_.Strings -join '' }",
                "CNAME": "ForEach-Object { $_.NameHost }",
                "MX": "ForEach-Object { '{0} {1}' -f $_.Preference, $_.NameExchange }"}
@@ -530,11 +533,11 @@ def maillog_steps(report, domain):
     if full_ddf or ddf:
         steps.append(kql_step("delivered_despite_failure", domain,
                               "it groups the same failures by envelope domain and by the override on the delivered "
-                              "copy; its msgs column counts copies Exchange marked Delivered wherever they landed, so it "
-                              "can run a little above %s, which counts copies that reached the inbox, junk or deleted "
-                              "items%s." % ("the full-window %d of maillog_totals" % full_ddf if wt is not None else
-                                            "the report's %d" % ddf,
-                                            "" if wt is not None else "; " + window_note(report, domain, 30))))
+                              "copy, counted the way the report counts them (a copy that reached the inbox, junk or "
+                              "deleted items, at the (Message-ID, recipient) grain), so its msgs column adds up to %s%s."
+                              % ("the full-window %d of maillog_totals" % full_ddf if wt is not None else
+                                 "the report's %d" % ddf,
+                                 "" if wt is not None else "; " + window_note(report, domain, 30))))
     tops = [(str(t.get("sender") or "?"), _n(t.get("genuine_failures")) or 0)
             for t in _l(c.get("top_senders")) if isinstance(t, dict)][:3]
     if gf and tops:
@@ -1607,6 +1610,15 @@ def prerequisite_steps(change, report):
                                                                "mail log could not call spoofing, or did not keep; "
                                                                "%s." % window_note(report, domain, 30))])
             continue
+        m = DESTINATION_RX.search(text)
+        if m and _ok(m.group(1)):
+            # a rua address in another organization: receivers send to it only when its domain says they may
+            once("destination", [step("dns", "Look up %s: an answer starting with v=DMARC1 - published at that name, "
+                                             "or by a wildcard *._report._dmarc.%s - means receivers send the record's "
+                                             "aggregate data to the new address; no answer means they drop it, so have "
+                                             "%s publish it first." % (m.group(1), m.group(2), m.group(2)),
+                                      lookup(m.group(1), https=True))])
+            continue
         if kind == "verify_unused":
             once("unused", unused_steps(report, domain))
         elif kind == "dkim_proof":
@@ -1656,12 +1668,20 @@ def prerequisite_steps(change, report):
                                                                  "30 days is a sender you know, and the SPF record "
                                                                  "names each one that sends on SPF.")])
         elif "_dmarc record" in text and _ok(domain):
-            # the sending subdomains the prerequisite names (audited or not), then the audited ones
-            named = re.findall(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)+", text.lower()) + _names_in_order(report, [], [])
+            # the sending subdomains the prerequisite names (audited or not), the unaudited ones whose own record DNS
+            # showed in this run (report.dns_extra: the plan counts them as covered), then the audited ones
+            seen = sorted(n for n, x in plan_mod.dns_extra(report).items()
+                          if n.endswith("." + domain) and plan_mod.has_own_record(n, x))
+            named = re.findall(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)+", text.lower()) + seen + _names_in_order(report, [], [])
             subs = [s for s in dict.fromkeys(named) if s.endswith("." + domain) and _ok("_dmarc." + s)][:6]
+            have = [s for s in subs if s in seen]
             if subs:
                 once("own_records", [step("dns", "Look up the subdomains' own records: each answers with a v=DMARC1 "
-                                                 "string of its own once its monitoring record is published.",
+                                                 "string of its own once its monitoring record is published%s." % (
+                                                     "; %s %s already: DNS showed %s in this run" % (
+                                                         audit._names(have), "answers" if len(have) == 1 else "answer",
+                                                         "its own record" if len(have) == 1 else "their own records")
+                                                     if have else ""),
                                           lookup(["_dmarc." + s for s in subs]))])
     # a row that rests on no mail being sent as the domain: a parked one proves it unused (no MX either), a
     # no-mail-measured one proves nothing is sent as it - it may receive mail, so its MX proves nothing
@@ -1691,14 +1711,19 @@ def change_steps(change, report):
     # not audit ('not checked (not an audited domain)'), which is unknown, never a record to expect or restore
     absent = current.strip().lower() in ("none", "")
     unknown = rtype == "TXT" and not absent and not current.strip().lower().startswith("v=")
+    # a name whose own _dmarc lookup failed: an unaudited one collect.py looked up (report.dns_extra), or an audited
+    # one the audit assumed inherits (DMARC-007)
+    name = host[len("_dmarc."):]
+    failed = dmarc and (_d(plan_mod.dns_extra(report).get(name)).get("status") == "error"
+                        or plan_mod.own_lookup_failed(_d(_d(report.get("dns")).get(name))))
     steps = []
     if _ok(host) and rtype == "TXT":
         if absent:
             before = "Before: look up %s: no answer starts with %s today (current: none)." % (host, head)
         elif unknown:
-            before = ("Before: look up %s: no answer should start with %s - the run did not look (plan.json says: %s); if "
+            before = ("Before: look up %s: no answer should start with %s - %s (plan.json says: %s); if "
                       "one does, do not publish: %s." % (
-                          host, head, current,
+                          host, head, "the run's own lookup of it failed" if failed else "the run did not look", current,
                           "%s already has a record of its own, and a second v=DMARC1 record would leave it with no policy "
                           "at all" % host[len("_dmarc."):] if dmarc else
                           "a second v=spf1 record makes every SPF check of the name fail (permerror), so change the "
@@ -1837,9 +1862,13 @@ def policy_step(report, domain):
 HOLD_IDS = {"DMARC-005": re.compile(r"two DMARC records"), "SPF-005": re.compile(r"10-lookup limit"),
             "DMARC-006": re.compile(r"could not be verified"), "SPF-002": re.compile(r"could not be verified"),
             "SPF-007": re.compile(r"SPF record|could not be resolved|lower bound")}
-# a hold worded for another finding than the one the audit raised: what the check there shows instead
+# a hold an older plan worded for another finding than the one the audit raised (plan.py now holds SPF-007 as the
+# unresolved include it is): what the check there shows instead
 HOLD_NOTES = {"SPF-007": ": SPF-007 is an include the audit could not resolve, not a second record, and the TXT lookup "
                          "there shows how many strings start with v=spf1"}
+# what collect.py's lookup of an unaudited name's own _dmarc record saw (report.dns_extra), by status
+EXTRA_SAW = {"found": "DNS showed a record of its own there", "absent": "DNS showed no record there",
+             "error": "the lookup failed, so the plan asks for it to be looked up first"}
 
 
 def _steps_md(L, steps):
@@ -1896,6 +1925,7 @@ def build(report, plan=None):
     # the names the run audits; any other name has a section only because the plan names it
     audited = {_name(d) for d in _l(inp.get("domains"))} | {_name(d) for d in gates} | {
         _name(d) for d in _d(report.get("dns"))}
+    extra = plan_mod.dns_extra(report)  # the unaudited names whose own _dmarc record collect.py looked up
 
     L = ["# Verify it yourself", ""]
     when = _stamp(report.get("generated_utc"))
@@ -1960,13 +1990,22 @@ def build(report, plan=None):
                     local[str(f.get("id"))] = "Findings below"
                 L += ["- %s - check: %s" % (r, reason_checks(r, d, report, local)) for r in reasons]
                 L.append("")
+        elif d not in audited and d in extra:
+            L.append("Not audited in this run: %s is not on the domain list, so no gate judged it and the run looked up "
+                     "only its _dmarc record, for the plan's subdomain rule: %s; it has a section because the plan names "
+                     "it." % (d, EXTRA_SAW[extra[d]["status"]]))
+            L.append("")
         elif d not in audited:
             L.append("Not audited in this run: %s is not on the domain list, so its DNS was not looked up and no gate "
                      "judged it; it has a section because the plan names it." % d)
             L.append("")
         L.append("### Findings")
         L.append("")
-        if not mine.get(d) and d not in audited:
+        if not mine.get(d) and d not in audited and d in extra:
+            L.append("None, and none looked for: %s is not audited, so this run looked up nothing but its _dmarc record "
+                     "(add it to the domain list and the next run checks the rest)." % d)
+            L.append("")
+        elif not mine.get(d) and d not in audited:
             L.append("None, and none looked for: %s is not audited, so this run did not look up its DNS (add it to the "
                      "domain list and the next run checks it)." % d)
             L.append("")

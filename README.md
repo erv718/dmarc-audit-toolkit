@@ -174,7 +174,13 @@ day one:
   domains in `known` they narrow the signing-domain list, but they never
   switch the unknown-sender check on. Domains only: an IP prefix here never
   matches anything (every run warns about it); IP prefixes go in `known`.
-- `rua_address`: the `mailto:` the plan writes into new DMARC records.
+- `rua_address`: the run's report address, the `mailto:` the plan writes into
+  new DMARC records and appends to an existing record's `rua` that lacks it
+  (after the addresses already there, nothing else changed). One address,
+  with or without a `!10m` size limit: a list goes into new records as given,
+  is never appended, and the run says so. Without it, `collect.py` uses the
+  report mailbox (`RUA_MAILBOX`); with neither, new records take the `rua`
+  most existing records use and nothing is appended.
 - `keep = 12`: how many dated runs stay under `audit-out/history/`.
 - `[notify] enabled`: whether the Slack summary posts when a webhook is set.
 
@@ -301,16 +307,25 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
 - **Monitoring first.** Every domain and subdomain gets `p=none` with a `rua`
   address before anything else, unless the run measured it sending nothing
   (below); parked domains get `v=spf1 -all` and `p=reject` once "unused" is
-  verified. Every run with the app registration measures each domain's mail
-  flow over 30 days (whatever `--days` says). A parked candidate (no MX, no
-  sender in SPF, no DKIM selector) reads as verified unused only when the
-  tenant saw no mail from it, out or in, in those 30 days and the run's
-  aggregate reports, which cover its DMARC record, count no passing mail as
-  it; otherwise its prerequisite names the checks still open (mail a third
-  party sends as the domain straight to outside recipients never passes
-  through the tenant, so only the reports show it). Passing mail as it in
-  those reports means the domain sends: it gets a monitoring record, not a
-  park.
+  verified. A record whose `rua` reports only elsewhere (a vendor, a mailbox
+  of its own) gets the run's report address appended, so its outside view
+  reaches the toolkit: in a zero-risk row of its own, never gated on the
+  evidence it starts (an enforcement step on the same record waits a week
+  for it), or inside the quarantine-now row that rewrites the record anyway.
+  Appended after two addresses or more, it may get partial data (receivers
+  need send to the first two only), and the row says so. A record that
+  gains an address in another organization, a new one too, waits on the
+  `_report._dmarc` record that address's domain must publish before
+  receivers send there. Every run with the app registration measures each
+  domain's mail flow over 30 days (whatever `--days` says). A parked
+  candidate (no MX, no sender in SPF, no DKIM selector) reads as verified
+  unused only when the tenant saw no mail from it, out or in, in those 30
+  days and the run's aggregate reports, which cover its DMARC record, count
+  no passing mail as it; otherwise its prerequisite names the checks still
+  open (mail a third party sends as the domain straight to outside
+  recipients never passes through the tenant, so only the reports show it).
+  Passing mail as it in those reports means the domain sends: it gets a
+  monitoring record, not a park.
 - **One ratchet per domain per week**: `p=none` to `p=quarantine; pct=25`, to
   `pct=100`, to `p=reject`, then SPF `-all`. A step appears only when the
   earlier ones are done and a week of reports has flowed.
@@ -345,8 +360,15 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   measured - has a `_dmarc` record of its own. It proposes the missing
   monitoring records itself and holds the step, naming them, until they
   exist; with no aggregate report covering the apex's record it says what
-  only those would show. At quarantine the move to reject and the `sp=` step
-  both rewrite the apex's record, so each row names the other: one a week.
+  only those would show. Only DNS says a subdomain has a record:
+  `collect.py` looks up the `_dmarc` record of every unaudited one it sees
+  sending (the busiest 50 a run); the policy an aggregate report says it saw
+  proves nothing, since those reports can be months old. A name nobody
+  looked up, or whose lookup failed (an audited one's too, DMARC-007), is
+  named as not checked, and its record waits on a lookup: a second record
+  would leave it with no policy at all. At quarantine the move to reject and
+  the `sp=` step both rewrite the apex's record, so each row names the
+  other: one a week.
 - **Deduplicated failure gate.** A legitimate sender still failing holds the
   next step and the hold says who. Spoofs that receivers already reject do not
   hold anything: enforcement is what stops them. Each domain is judged on its

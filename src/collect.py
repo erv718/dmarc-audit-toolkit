@@ -27,7 +27,12 @@ What it does, in order, and what it skips when it cannot:
      the command line is the report's headline domain (gate.headline) - the
      inventory itself is sorted, so the audit is told what was typed first
   6. write the rollout plan (the exact records to publish next) and todo.md,
-     the one prioritised list built from the report and the plan
+     the one prioritised list built from the report and the plan. First the
+     _dmarc record of every unaudited subdomain seen sending is looked up in
+     DNS (report.dns_extra; at most 50, the busiest first, none with
+     --offline): only DNS says such a name has a record of its own. The
+     plan's report address is --rua-address, else the report mailbox: new
+     records carry it, and a record whose rua lacks it gets it appended
   7. keep a dated history and the running metrics, so the next run can say
      what changed
   8. write the stakeholder document, next_steps.md and next_steps.json, from
@@ -79,6 +84,7 @@ import audit
 import config as config_mod
 import console
 import discover
+import dns_audit
 import graph_client
 import next_steps
 import notify
@@ -132,6 +138,7 @@ SLICE_TARGET = 90000  # rows planned per call: headroom under the cap for mail t
 ROW_BUDGET = 250000  # rows kept per domain before older hours are skipped (0 = no limit)
 RUA_MAX = 10000  # report-mailbox messages read per run; a run that stops resumes next time
 ARCHIVE_DAYS = 30  # the report archive window: a first run, or a stale saved position, starts here
+EXTRA_DNS_MAX = 50  # unaudited sending subdomains whose own _dmarc record one run looks up, the busiest first
 
 
 def _ago(hours):
@@ -495,6 +502,58 @@ def pull_window_totals(tok, orgs, days=30):
     if not counted:
         return None, notes
     return {"hours": days * 24, "orgs": counted}, notes
+
+
+def own_dmarc(name, resolver):
+    """The DMARC record at _dmarc.<name> itself, never a parent's: one TXT
+    lookup by dns_audit's resolver path (port 53 first, DNS over HTTPS as
+    the cross-check of a negative answer and the fallback when port 53
+    fails). {"dmarc": the first v=DMARC1 string or None, "status": found |
+    absent | error, "source": the _dmarc name when found, else None,
+    "path": the resolver path that answered}, plus "err" when it failed."""
+    host = "_dmarc." + name
+    try:
+        recs, meta = dns_audit.resolve_ex(resolver, host, "TXT")
+    except Exception as err:  # a lookup that raises is a lookup that failed, never the end of the run
+        recs, meta = [], {"path": None, "status": "error", "err": type(err).__name__}
+    txts = [str(t) for t in recs or [] if str(t).lower().startswith("v=dmarc1")]
+    status = "found" if txts else ("error" if meta.get("status") == "error" else "absent")
+    out = {"dmarc": txts[0] if txts else None, "status": status, "source": host if txts else None,
+           "path": meta.get("path")}
+    if status == "error" and meta.get("err"):
+        out["err"] = meta["err"]
+    return out
+
+
+def lookup_unaudited(report, inventory_rows, resolver, cap=None):
+    """report.dns_extra: the own _dmarc record of every unaudited subdomain
+    the plan's sending rule finds (plan.unaudited_senders), looked up in DNS
+    - only DNS says such a name has a record of its own; an aggregate report
+    names the policy a receiver saw, maybe months ago. At most cap names
+    (EXTRA_DNS_MAX), the busiest first: the plan asks for a lookup first for
+    the rest, and for one whose lookup failed. Returns (dns_extra, notes)."""
+    cap = EXTRA_DNS_MAX if cap is None else cap
+    names = [n for n, _ in plan_mod.unaudited_senders(report, inventory_rows)]
+    extra = {n: own_dmarc(n, resolver) for n in names[:cap]}
+    notes = []
+    if extra:
+        by = {s: [n for n in extra if extra[n]["status"] == s] for s in ("found", "absent", "error")}
+        parts = []
+        if by["found"]:
+            parts.append("%s %s" % (plan_mod._listed(by["found"]), "has a record of its own" if len(by["found"]) == 1
+                                    else "have records of their own"))
+        if by["absent"]:
+            parts.append("%s %s none" % (plan_mod._listed(by["absent"]), "has" if len(by["absent"]) == 1 else "have"))
+        if by["error"]:
+            parts.append("the lookup failed for %s, so the plan asks for a lookup first" % plan_mod._listed(by["error"]))
+        notes.append("DNS: _dmarc looked up for %d unaudited sending subdomain%s: %s"
+                     % (len(extra), "" if len(extra) == 1 else "s", "; ".join(parts)))
+    skipped = names[cap:]
+    if skipped:
+        notes.append("DNS: %d more unaudited sending subdomain%s not looked up (at most %d a run, the busiest first): "
+                     "%s - the plan asks for a lookup first for each"
+                     % (len(skipped), "" if len(skipped) == 1 else "s", cap, plan_mod._listed(skipped)))
+    return extra, notes
 
 
 def previous_run(history_dir, current_stamp):
@@ -866,7 +925,9 @@ def main():
     ap.add_argument("--known", metavar="LIST_OR_FILE", help="known sender domains and IP prefixes")
     ap.add_argument("--selectors", help="extra DKIM selectors to probe, comma separated")
     ap.add_argument("--resolver", default="8.8.8.8")
-    ap.add_argument("--rua-address", metavar="MAILTO", help="reporting address the plan puts in new records")
+    ap.add_argument("--rua-address", metavar="MAILTO",
+                    help="the run's report address: the plan puts it in new records and appends it to a record's rua "
+                         "that lacks it (default: the report mailbox, --rua-mailbox or RUA_MAILBOX)")
     ap.add_argument("--owners", metavar="CSV",
                     help="who fixes what, for next_steps.md (default: <repo root>/%s when it exists; "
                          "see samples/owners.csv.example)" % next_steps.DEFAULT_OWNERS)
@@ -1071,6 +1132,13 @@ def main():
         die(str(err))
     if isinstance(report.get("inputs"), dict):
         report["inputs"]["run"] = stamp  # which run wrote it, for a reader that finds report.json on its own
+    # the unaudited subdomains that send: whether each has a DMARC record of its own is a question for DNS, asked
+    # before the plan reads it (never with --offline; a run whose DNS did not run has nothing to plan anyway)
+    if report.get("dns") and not args.offline:
+        report["dns_extra"], xnotes = lookup_unaudited(report, {r["domain"]: r for r in inventory},
+                                                       audit.make_resolver(args.resolver))
+        for n in xnotes:
+            note(n)
     # full-window totals the audit set aside: fewer than the rows kept, so not the whole window
     for org, why in sorted(((report.get("maillog") or {}).get("window_totals_rejected") or {}).items()):
         n = "mail log: full-window totals for %s set aside, not shown: the answer holds %s" % (org, why)
@@ -1106,13 +1174,17 @@ def main():
              "before it were never read (fetch_rua.py --since %s fills them in)"
              % (covered, since, args.report_days, since))
 
-    # 6. plan
+    # 6. plan; its report address is --rua-address, else the mailbox the reports are read from: new records carry
+    # it, and a record whose rua lacks it gets it appended (with neither, nothing is appended; with a list of
+    # addresses, nothing either, and a note says so)
     plan, plan_doc = {"changes": [], "holds": []}, None  # plan_doc: only a plan that was written
     if report.get("dns"):
         try:
-            plan = plan_mod.build_plan(report, {"domains": inventory}, args.rua_address)
+            plan = plan_mod.build_plan(report, {"domains": inventory}, args.rua_address or plan_mod.report_uri(mailbox))
             plan_mod.write(plan, run_dir)
             plan_doc = plan
+            if plan_mod.address_note(args.rua_address):
+                note("plan: " + plan_mod.address_note(args.rua_address))
         except ValueError as err:
             note("no plan written: %s" % err)
     else:

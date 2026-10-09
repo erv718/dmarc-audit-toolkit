@@ -26,7 +26,9 @@ known = ["vendor.example", "192.0.2.0/24"]
 vendor_domains = ["vendor.example"]
 # DKIM selectors to probe in addition to the common list.
 selectors = ["s1", "mail"]
-# Reporting address the plan writes into new DMARC records.
+# The run's report address: the plan writes it into new DMARC records and appends it to an
+# existing record's rua that lacks it. One address (a list is never appended). Without it,
+# collect.py uses the report mailbox (RUA_MAILBOX).
 rua_address = "mailto:dmarc-reports@example.com"
 # Where runs are written, and how many dated runs to keep (older ones are deleted).
 out = "audit-out"

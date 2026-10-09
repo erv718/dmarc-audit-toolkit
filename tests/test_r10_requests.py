@@ -106,6 +106,11 @@ def flow(out=0, inn=0):
     return {"messages": out + inn, "outbound": out, "inbound": inn, "last_seen": None}
 
 
+def no_record(*names):
+    """report.dns_extra as collect.py writes it when DNS shows no record at these names' own _dmarc."""
+    return {n: {"dmarc": None, "status": "absent", "source": None, "path": "port53-udp"} for n in names}
+
+
 TENANT = ["corp.example", "mail.corp.example", "hr.corp.example", "old.corp.example", "legacy.corp.example",
           "brand.example", "spoofed.example"]
 EXTRA = ["parked.example"]  # a registrar-only domain, from EXTRA_DOMAINS
@@ -169,6 +174,8 @@ def live_tenant(tmp_path):
     }
     rep["gate"] = audit.gate_verdict(rep["dns"], rep["rua"], rep["maillog"], names, None, {},
                                      rep["inputs"]["domain_sources"])
+    # collect.py looks up the unaudited sending subdomains' own records: DNS shows none at the three
+    rep["dns_extra"] = no_record("m.corp.example", "t.corp.example", "e.corp.example")
     return rep
 
 
@@ -271,14 +278,18 @@ def empty_hunting(tok, kql, ts=None):
 
 def stub_tenant(monkeypatch, tenant):
     """collect.main's network seams, stubbed; sockets refused. graph_client.creds is the real one: it loads
-    the env file the test writes (into a private copy of the environment)."""
+    the env file the test writes (into a private copy of the environment). The _dmarc lookups collect.py makes
+    for the unaudited sending subdomains answer with no record."""
     import socket
+    import dns_audit
 
     def refuse(*a, **k):
         raise OSError("no network in this test")
     monkeypatch.setattr(socket.socket, "connect", refuse)
     monkeypatch.setattr(socket, "create_connection", refuse)
     monkeypatch.setattr(socket, "getaddrinfo", refuse)
+    monkeypatch.setattr(dns_audit, "resolve_ex", lambda resolver, name, rtype: (
+        [], {"path": "stub", "ttl": None, "status": "absent"}))
     monkeypatch.setattr(os, "environ", clean_env())  # what the env file loads stays in this test
     monkeypatch.setattr(collect.graph_client, "hunting", empty_hunting)
     monkeypatch.setattr(collect.graph_client, "TokenSource", lambda cred, **k: (lambda refresh=False: "tok"))
@@ -362,7 +373,9 @@ def test_r2_a_domain_that_sends_nothing_goes_straight_to_quarantine(tmp_path):
     assert brand["prerequisites"] == [
         "no sender that mails less often than monthly (statements, renewals) uses this domain",
         "no third party sends as brand.example straight to outside recipients: no aggregate report in this run "
-        "covers it, and only those would show such mail"]
+        "covers it, and only those would show such mail",
+        # its new record reports to corp.example's mailbox, in another organization (RFC 7489 7.1)
+        plan_mod.external_destination("brand.example", RUA)]
     # the plain words say what was measured and that the checks come first, never that nobody can be caught
     assert brand["human_summary"].startswith("Move brand.example straight to quarantine instead of the weekly ramp, "
                                              "once the checks listed with it are confirmed: this run measured no mail "
@@ -545,6 +558,7 @@ def test_r2_quarantine_drops_the_pct_and_reject_follows_without_a_dkim_proof():
 def test_r2_a_quiet_apex_keeps_its_sending_subdomains_where_they_are():
     rep = quiet_report()
     rep["rua"]["by_header_from"].append({"domain": "news.brand.example", "count": 70, "pass": 70, "fail": 0})
+    rep["dns_extra"] = no_record("news.brand.example")  # collect.py's lookup: DNS shows none at its own name
     p = plan_of(rep)
     row = one(p["changes"], "no_mail")
     assert row["value"] == "v=DMARC1; p=quarantine; sp=none; rua=%s;" % RUA
@@ -719,9 +733,10 @@ def test_r2_a_quiet_domain_with_no_record_leads_the_document_with_quarantine_now
     assert doc["one_liner"].startswith("brand.example has no DMARC policy this run could determine.")
     assert doc["one_liner"].endswith(
         "The next safe step is to move straight to p=quarantine (no mail measured), ready when no sender that mails "
-        "less often than monthly (statements, renewals) uses this domain; and no third party sends as brand.example "
+        "less often than monthly (statements, renewals) uses this domain; no third party sends as brand.example "
         "straight to outside recipients: no aggregate report in this run covers it, and only those would show such "
-        "mail.")
+        "mail; and reports.example publishes brand.example._report._dmarc.reports.example, so receivers send "
+        "brand.example's aggregate reports to agg@reports.example.")
     assert doc["ask"] == ("The ask this week: approval to move 1 domain that sends no mail straight to quarantine "
                           "(plan P-01) once the checks listed with it are confirmed.")
     for text in [doc["one_liner"], doc["ask"]] + [q["question"] for q in doc["open_questions"]]:
@@ -755,7 +770,7 @@ def test_r3_the_sp_step_at_quarantine_names_every_sending_subdomain_without_a_re
         assert row["priority"] == 1 and row["value"] == "v=DMARC1; p=none; rua=%s;" % RUA
         assert row["why"].startswith("sending subdomain without a record of its own: an explicit record shields it "
                                      "from the apex's sp= change on corp.example (seen sending: ")
-        assert seen in row["why"] and row["current"] == "not checked (not an audited domain)"
+        assert seen in row["why"] and row["current"] == "none"  # DNS shows none (report.dns_extra)
     assert one(by["mail.corp.example"], "new")["why"].startswith("subdomain without a record of its own:")
     md = plan_mod.render_md(p)
     assert "| 4 | enforcement step: quarantine the subdomains without a record of their own |" in md
@@ -772,8 +787,9 @@ def test_r3_once_the_records_exist_the_step_is_ready(tmp_path):
     rep["dns"]["mail.corp.example"] = dns_doc("mail.corp.example", dmarc="v=DMARC1; p=none; rua=%s;" % RUA,
                                               dmarc_source="_dmarc.mail.corp.example", effective_policy="none",
                                               dmarc_status="found", mx=[], findings=fid("DMARC-002"))
-    rep["rua"]["policy_check"]["seen"] += [{"domain": d, "p": "none", "sp": None, "reports": 2}
-                                           for d in ("m.corp.example", "t.corp.example", "e.corp.example")]
+    # DNS shows the three unaudited senders' own records (what the aggregate reports say they saw proves nothing)
+    rep["dns_extra"] = {d: {"dmarc": "v=DMARC1; p=none; rua=%s;" % RUA, "status": "found", "source": "_dmarc." + d,
+                            "path": "port53-udp"} for d in ("m.corp.example", "t.corp.example", "e.corp.example")}
     p = plan_of(rep)
     sp = next(c for c in rows_by(p)["corp.example"] if c["priority"] == 4)
     reject = next(c for c in rows_by(p)["corp.example"] if c["priority"] == 3)
@@ -844,6 +860,7 @@ def test_r3_a_subdomain_whose_failures_may_be_ours_counts_as_sending(tmp_path):
            .add("scan@z.corp.example", "Scan #", dmarc="fail", times=2, env="printer.invalid"))
     rep = audited(tmp_path / "log", docs, log, flows={"corp.example": flow(500, 20), "b.corp.example": flow()},
                   exceptions=[EXCEPTION])
+    rep["dns_extra"] = no_record("x.corp.example", "y.corp.example", "z.corp.example")  # collect.py's lookups
     p = plan_of(rep)
     assert {"domain": "corp.example", "reason": "subdomains that send have no record of their own: x.corp.example "
             "and z.corp.example - publish their monitoring records (above) before sp= moves to quarantine"} in p["holds"]
