@@ -50,6 +50,7 @@ in .env.
 Outputs under --out (default audit-out/):
   history/<UTC stamp>/   report.md report.json plan.md plan.json next_steps.md next_steps.json
                          todo.md inventory.json domains.txt summary.txt run.json
+                         verify.md and queries/ (how to check every finding and plan row yourself)
   latest/                the newest run, same files
   metrics.json           one entry per run (policy, gate, findings, failure counts, pass rate)
   metrics.md             the last runs as a table
@@ -81,6 +82,7 @@ import next_steps
 import notify
 import plan as plan_mod
 import run_hunting
+import verify
 import verify_setup
 
 try:
@@ -100,7 +102,7 @@ AGGREGATE_SOURCE = "Advanced Hunting aggregate"
 MAILFLOW_DAYS = 30
 TOTALS_COLUMNS = ("fromdom", "logical_messages", "passing", "genuine_failures", "delivered_despite_fail")
 RUN_FILES = ("report.md", "report.json", "plan.md", "plan.json", "next_steps.md", "next_steps.json", "todo.md",
-             "inventory.json", "domains.txt", "summary.txt", "run.json", "setup.json", "maillog.csv")
+             "inventory.json", "domains.txt", "summary.txt", "run.json", "setup.json", "maillog.csv", "verify.md")
 PRIORITY_WORD = {1: "now, zero delivery risk", 2: "before enforcement", 3: "enforcement step, gated",
                  4: "subdomain policy, gated", 5: "final hardening, gated"}
 
@@ -679,7 +681,8 @@ def render_todo(report, plan, caveats=()):
     holds = plan.get("holds") or []
     L = ["# To-do", "",
          "Built from report.json and plan.json of %s. Work top to bottom. Nothing here has been applied; "
-         "every DNS row is a proposal for a human to review." % (report.get("generated_utc") or "this run"), ""]
+         "every DNS row is a proposal for a human to review." % (report.get("generated_utc") or "this run"), "",
+         "verify.md, next to this file, says how to check every finding and every plan row yourself.", ""]
 
     L.append("## Where each domain stands")
     L.append("")
@@ -1109,6 +1112,10 @@ def main():
 
     # 8. the stakeholder document (entries already holds this run; next_steps skips it for the trend)
     steps = write_next_steps(run_dir, report, plan_doc, entries, owners, owners_path, prev_report, prev_dir, note)
+    try:  # how to check every finding and plan row by hand, from the files above: it never fails the run
+        verify.write(report, plan_doc, run_dir)
+    except Exception as err:
+        note("no verify.md written (%s: %s)" % (type(err).__name__, err))
 
     latest = out / "latest"
     latest.mkdir(parents=True, exist_ok=True)
@@ -1118,6 +1125,19 @@ def main():
         src = run_dir / name
         if src.exists():
             shutil.copy2(src, latest / name)
+    try:  # verify.md's filled queries, this run's only; a folder that cannot be cleared (a shell open in it, a
+        # read-only file) is a note, never the end of the run: run.json, summary.txt and the post still follow
+        shutil.rmtree(latest / "queries", ignore_errors=True)
+        if (run_dir / "queries").is_dir():
+            shutil.copytree(run_dir / "queries", latest / "queries", dirs_exist_ok=True)
+        fresh = {p.name for p in (run_dir / "queries").iterdir()} if (run_dir / "queries").is_dir() else set()
+        stale = sorted(p.name for p in (latest / "queries").iterdir() if p.name not in fresh) \
+            if (latest / "queries").is_dir() else []
+        if stale:
+            note("latest/queries keeps %d file(s) an earlier run wrote that could not be removed (%s); this run's "
+                 "queries are the ones verify.md lists" % (len(stale), ", ".join(stale[:3])))
+    except OSError as err:
+        note("latest/queries not refreshed (%s): this run's queries are in %s" % (err, run_dir / "queries"))
     history = sorted(p for p in (out / "history").iterdir() if p.is_dir())
     for old in history[:-args.keep] if args.keep > 0 else []:
         shutil.rmtree(old, ignore_errors=True)
