@@ -25,7 +25,9 @@ def report(policy="quarantine", verdict="no_go", findings=(), failures=21, pass_
 
 
 def test_summary_covers_gate_findings_maillog_and_outside_view():
-    text = notify.summarize(report(findings=("DMARC-003",)))
+    rep = report(findings=("DMARC-003",))
+    rep["rua"]["filters"] = {"known": {"given": True, "ip_check": True, "networks": ["192.0.2.0/24"]}}
+    text = notify.summarize(rep)
     assert "`example.com`: p=quarantine, gate *no_go*, next: p=reject" in text
     assert "findings: 1 (major 1)" in text
     assert "21 genuine failures (33 rows would say so)" in text

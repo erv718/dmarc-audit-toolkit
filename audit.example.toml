@@ -12,9 +12,13 @@ mailflow = true
 # Mail-log window in days (30 is the API maximum) and the aggregate-report window.
 days = 30
 report_days = 30
-# Senders you recognise: vendor domains and IP prefixes, for the unknown-sender check.
+# Senders you recognise: your vendors' IP prefixes and domains. The aggregate-report
+# unknown-sender check runs only on the IP prefixes; domains alone only narrow its
+# signing-domain list and inform the aggregate-report labels, and the per-IP check does not run.
 known = ["vendor.example", "192.0.2.0/24"]
-# Envelope domains that belong to your vendors, for the mail-log heuristic labels.
+# Envelope domains of your sending platforms, domains only (IP prefixes go in known), for
+# the heuristic labels in the mail log and in the aggregate reports. Like known's domains
+# they narrow the signing-domain list, but they never switch the unknown-sender check on.
 vendor_domains = ["vendor.example"]
 # DKIM selectors to probe in addition to the common list.
 selectors = ["s1", "mail"]
