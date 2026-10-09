@@ -2079,8 +2079,18 @@ def _display_source(source):
     return source
 
 
-def _md_findings(findings, limit=None):
-    """Findings grouped so one problem seen in several files is one entry."""
+def _verify_line(finding, report):
+    """The first check verify.md gives for a finding, or None: report.md must render even when verify.py cannot."""
+    try:
+        import verify
+        return verify.first_check(finding, report)
+    except Exception:
+        return None
+
+
+def _md_findings(findings, limit=None, report=None):
+    """Findings grouped so one problem seen in several files is one entry;
+    with the report, each says how to check it (its first verify.md step)."""
     groups = {}
     for f in (findings[:limit] if limit else findings):
         groups.setdefault((f["id"], f["severity"], f["title"], f["action"]), []).append(f)
@@ -2100,6 +2110,10 @@ def _md_findings(findings, limit=None):
         lines.append(f"  - action: {action}")
         if items[0].get("note"):
             lines.append(f"  - note: {items[0]['note']}")
+        check = _verify_line(items[0], report) if report is not None else None
+        if check:
+            lines.append(f"  - verify: {check} " + ("(all steps: verify.md)" if len(items) == 1 else
+                                                    "(the first source's; every source's steps: verify.md)"))
     return lines or ["- none"]
 
 
@@ -2647,7 +2661,11 @@ def render_md(report):
     L.append(f"## Findings ({s['findings']}, worst: {s['worst'] or 'none'}; "
              f"by area: {_plain(s.get('by_area') or {})})")
     L.append("")
-    L += _md_findings(report["findings"])
+    if report["findings"]:
+        L.append("Each verify line is the finding's first check; verify.md has every step (collect.py writes it next to "
+                 "this file, python src/verify.py report.json --out DIR for any report).")
+        L.append("")
+    L += _md_findings(report["findings"], report=report)
     L.append("")
 
     vi = report.get("verified_vs_inferred")

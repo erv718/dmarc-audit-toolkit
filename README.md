@@ -269,6 +269,21 @@ Read them in this order, all under `audit-out/latest/`:
 4. **`plan.md`**: the rollout plan as a DNS change ticket wants it: record,
    hostname, value, TTL, current value and rollback, grouped by the DNS host
    of each zone. You apply the rows; the tool never touches DNS.
+5. **`verify.md`**: how to check every finding and every plan row yourself,
+   without trusting the tool. Per domain: the DNS lookup (PowerShell's
+   `Resolve-DnsName`, and `nslookup` on any system) with the answer the
+   audit saw; the Advanced Hunting query to paste into your own Defender
+   portal, saved under `queries/` next to it (a shipped query with only its
+   `let sender_domain` line set), with the figure the report counted (for an
+   organization the row budget cut, the full-window figure collect.py
+   counted, with the report's own as the floor beside it); the
+   command that recounts the files the run read; the admin page and the
+   read-only cmdlet behind each tenant finding; and for each plan row what
+   the lookup shows before, what to publish, what it shows after the TTL,
+   how to roll back, and the proof each prerequisite asks for. `report.md`
+   shows each finding's first check on its verify line;
+   `python src/verify.py report.json --plan plan.json --out DIR` writes it
+   for any report.
 
 **Who owns what.** `next_steps.md` groups actions by owner, and the owners
 come from `owners.csv` in the repo root: one row per sender address, domain

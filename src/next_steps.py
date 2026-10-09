@@ -2648,6 +2648,9 @@ def render_md(doc):
     L.append("")
     L.append(doc["sources"]["audience_line"])
     L.append("")
+    L.append("To check any number or record here yourself, follow verify.md next to this file: the lookup, query or "
+             "command for every finding and every plan row, with the value to expect.")
+    L.append("")
     L.append("**%s**" % doc["one_liner"])
     L.append("")
     window = (doc["stand"].get("window") or {}).get("text") or "this run's window"
