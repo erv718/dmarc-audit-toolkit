@@ -5,10 +5,18 @@ What it does, in order, and what it skips when it cannot:
 
   1. verify the app registration (skipped with no credentials or --offline)
   2. discover the domains: command line, --file, the tenant's own list,
-     and with --mailflow every subdomain seen sending in 30 days
+     and with --mailflow every subdomain seen sending in 30 days; with a
+     token, one aggregate query measures every audited name's mail flow
+     over the last 30 days (sent from inside, received from outside, last
+     seen) on every run, the organizational domains included - the plan's
+     evidence that a domain is unused, and the per-domain "sends" line in
+     the report. --days narrows the mail log, never this 30-day count
   3. pull the raw mail log for each organizational domain through advanced
      hunting; a domain that lands on the 100,000-row API cap is pulled in
-     window slices (skipped with no credentials; --maillog uses a file instead)
+     window slices (skipped with no credentials; --maillog uses a file instead).
+     An organization the row budget or the API cap cut keeps only its newest
+     hours, a floor: queries/maillog_totals.kql then counts its whole window
+     in advanced hunting (maillog.window_totals), beside the floor
   4. pull new aggregate reports from the report mailbox (RUA_MAILBOX in .env;
      --rua uses saved files instead)
   5. run the audit: DNS posture, deduplicated mail log, outside view, headers;
@@ -82,7 +90,15 @@ except ImportError:  # pragma: no cover
 
 ROOT = Path(__file__).resolve().parent.parent
 QUERY = ROOT / "queries" / "raw_maillog.kql"
+TOTALS_QUERY = ROOT / "queries" / "maillog_totals.kql"
 PLACEHOLDER = 'let sender_domain = "example.com";'
+# where the per-domain mail flow and the full-window totals of a cut organization come from: counts the
+# hunting service computes itself, as opposed to the deduplicated rows collect.py pulls
+AGGREGATE_SOURCE = "Advanced Hunting aggregate"
+# the mail flow is always counted over 30 days, whatever --days says: one cheap aggregate, and the plan calls a
+# domain unused only over 30 silent days (--mailflow's new subdomains are the ones seen in those 30 days too)
+MAILFLOW_DAYS = 30
+TOTALS_COLUMNS = ("fromdom", "logical_messages", "passing", "genuine_failures", "delivered_despite_fail")
 RUN_FILES = ("report.md", "report.json", "plan.md", "plan.json", "next_steps.md", "next_steps.json", "todo.md",
              "inventory.json", "domains.txt", "summary.txt", "run.json", "setup.json", "maillog.csv")
 PRIORITY_WORD = {1: "now, zero delivery risk", 2: "before enforcement", 3: "enforcement step, gated",
@@ -383,6 +399,100 @@ def pull_maillog(tok, org_domains, out_csv, days=30, max_rows=ROW_BUDGET, volume
     return str(out_csv), notes
 
 
+def _tally(value):
+    """A count in a hunting answer as the mail-flow answer reads one (a whole
+    number >= 0, a long may come as text), 0 for a null (an empty join
+    side), None for anything else."""
+    return 0 if value is None else discover._count(value)
+
+
+def totals_by_domain(result, org):
+    """maillog_totals.kql's answer for one organization as {From domain:
+    {"logical_messages", "passing", "genuine_failures",
+    "delivered_despite_fail", "delivered_by"}}, for the names under org. The
+    query answers one row per From domain and override: the failure counts
+    add up, logical_messages and passing repeat on each row, and
+    delivered_by ({reason: messages}) gathers the delivered failures that
+    name their override. None when the answer is not those totals (no
+    results list, rows without its columns, a count that is not a whole
+    number); {} when it holds no row under org."""
+    results = result.get("results") if isinstance(result, dict) else None
+    if not isinstance(results, list) or any(not isinstance(r, dict) for r in results):
+        return None
+    schema = result.get("schema")  # the column names, else the first row's keys (run_hunting.columns' rule)
+    names = {c.get("name") for c in schema if isinstance(c, dict)} if isinstance(schema, list) else set()
+    if results and not set(TOTALS_COLUMNS) <= (names or set(results[0])):
+        return None
+    out = {}
+    for r in results:
+        dom = str(r.get("fromdom") or "").strip().lower().rstrip(".")
+        if not (dom == org or dom.endswith("." + org)):
+            continue
+        n = {k: _tally(r.get(k)) for k in TOTALS_COLUMNS[1:]}
+        if None in n.values():
+            return None
+        d = out.setdefault(dom, {"logical_messages": 0, "passing": 0, "genuine_failures": 0,
+                                 "delivered_despite_fail": 0, "delivered_by": {}})
+        d["logical_messages"] = max(d["logical_messages"], n["logical_messages"])
+        d["passing"] = max(d["passing"], n["passing"])
+        d["genuine_failures"] += n["genuine_failures"]
+        d["delivered_despite_fail"] += n["delivered_despite_fail"]
+        reason = str(r.get("delivered_by") or "").strip()
+        if reason and n["delivered_despite_fail"]:
+            d["delivered_by"][reason] = d["delivered_by"].get(reason, 0) + n["delivered_despite_fail"]
+    for d in out.values():
+        d["delivered_by"] = dict(sorted(d["delivered_by"].items(), key=lambda kv: (-kv[1], kv[0])))
+    return dict(sorted(out.items()))
+
+
+def pull_window_totals(tok, orgs, days=30):
+    """queries/maillog_totals.kql for each organization whose pull the row
+    budget or the API cap cut (pull_maillog's cuts), with a Timespan over
+    the full window: per From domain under it, the totals at dedupe.py's
+    grain, counted by the hunting service itself. The rows kept, and every
+    count the gate, the census and the plan build from them, stay a floor;
+    these say how far below the whole window that floor sits. Returns
+    ({"hours": window hours, "orgs": {org: {"by_domain": ..., "source":
+    AGGREGATE_SOURCE}}}, notes), or (None, notes) when no organization was
+    counted; an organization whose query fails leaves a note and no entry,
+    and so does one whose answer counts no mail under it at all: it was cut
+    because it has more rows than the budget keeps, so an empty answer is a
+    failed one (audit.build_report also sets aside totals below the rows
+    kept)."""
+    notes, counted = [], {}
+    if not orgs:
+        return None, notes
+    try:
+        template = TOTALS_QUERY.read_text(encoding="utf-8-sig")
+    except OSError as err:
+        return None, ["mail log: full-window totals not counted: cannot read %s (%s)"
+                      % (TOTALS_QUERY.name, err.strerror or err)]
+    for org in sorted(orgs):
+        try:
+            res = graph_client.hunting(tok, kql_for_domain(template, org, days * 24), _timespan(days * 24))
+        except (graph_client.GraphError, ValueError) as err:
+            notes.append("mail log: full-window totals for %s not counted: %s" % (org, err))
+            continue
+        by_domain = totals_by_domain(res, org)
+        if by_domain is None:
+            notes.append("mail log: full-window totals for %s not counted: the answer is not the totals %s asks for"
+                         % (org, TOTALS_QUERY.name))
+            continue
+        if not by_domain:
+            notes.append("mail log: full-window totals for %s not counted: the answer holds no mail under it, yet its "
+                         "rows were cut for holding too many" % org)
+            continue
+        counted[org] = {"by_domain": by_domain, "source": AGGREGATE_SOURCE}
+        sums = {k: sum(c[k] for c in by_domain.values())
+                for k in ("logical_messages", "genuine_failures", "delivered_despite_fail")}
+        notes.append("mail log: full-window totals for %s over the last %d days, counted in Advanced Hunting: about %d "
+                     "logical messages, %d genuine failures, %d delivered despite failing (the rows kept stay a floor)"
+                     % (org, days, sums["logical_messages"], sums["genuine_failures"], sums["delivered_despite_fail"]))
+    if not counted:
+        return None, notes
+    return {"hours": days * 24, "orgs": counted}, notes
+
+
 def previous_run(history_dir, current_stamp):
     if not history_dir.exists():
         return None
@@ -589,8 +699,13 @@ def render_todo(report, plan, caveats=()):
     L.append("## 2. Do now (plan priority 1, zero delivery risk)")
     L.append("")
     rows = [c for c in changes if c.get("priority") == 1]
-    L += ["- %s %s: %s at `%s` = `%s` (current: `%s`) - %s"
-          % (c["id"], c["domain"], c["record"], c["hostname"], c["value"], c["current"], c["why"]) for c in rows] or ["- none"]
+    items = []
+    for c in rows:
+        items.append("- %s %s: %s at `%s` = `%s` (current: `%s`) - %s"
+                     % (c["id"], c["domain"], c["record"], c["hostname"], c["value"], c["current"], c["why"]))
+        # a park row waits on its unused check, a task row on its inventory: said here, not only in plan.md
+        items += ["  - before applying: %s" % pre for pre in c.get("prerequisites") or []]
+    L += items or ["- none"]
     L.append("")
 
     L.append("## 3. Fix senders (DKIM first)")
@@ -719,7 +834,8 @@ def main():
     ap.add_argument("--no-graph", action="store_true", help="never touch the tenant: no domain list, no mail log, no mailbox")
     ap.add_argument("--mailflow", action="store_true", help="add subdomains seen sending in the last 30 days")
     ap.add_argument("--offline", action="store_true", help="no DNS and no tenant; audit the given files only")
-    ap.add_argument("--days", type=int, default=30, help="mail-log window in days (max 30)")
+    ap.add_argument("--days", type=int, default=30,
+                    help="mail-log window in days (max 30); the mail flow is always counted over 30 days")
     ap.add_argument("--max-rows", type=int, default=ROW_BUDGET, metavar="N",
                     help="mail-log rows kept per domain before older hours are skipped "
                          "(0 = no limit, default %d)" % ROW_BUDGET)
@@ -822,11 +938,15 @@ def main():
             tok = None
             degrade("token failed, tenant steps skipped: %s" % err)
 
-    # 2. domains
+    # 2. domains, and with a token the mail flow of every one of them: one aggregate query, this token
+    days = min(args.days, 30)  # the mail-log window, which the full-window totals share
     inventory, dnotes = discover.discover(args.domains, args.file, use_graph=bool(tok), mailflow=bool(tok) and args.mailflow,
-                                          resolver_addr=args.resolver, env_file=args.env_file, ns_lookup=not args.offline)
+                                          resolver_addr=args.resolver, env_file=args.env_file, ns_lookup=not args.offline,
+                                          tok=tok, days=MAILFLOW_DAYS)
     for n in dnotes:
         note(n)
+        if n.startswith("mail flow not measured"):
+            degraded.append(n)
     if not inventory:
         die("nothing to audit: give domains, --file, or credentials with Domain.Read.All")
     domains = [r["domain"] for r in inventory]
@@ -850,15 +970,22 @@ def main():
     maillog, auth_column = args.maillog, args.auth_column
     volumes = {}  # internal mail per org domain, from the sizing calls: the headline signal
     cuts = {}  # the orgs whose pull the row budget or the API cap cut: the report records them for the delta
+    window_totals = None  # what the hunting service counts for those orgs over the full window
     if tok and not maillog:
-        maillog, mnotes = pull_maillog(tok, orgs, run_dir / "maillog.csv", min(args.days, 30), args.max_rows,
-                                       volumes, cuts)
+        maillog, mnotes = pull_maillog(tok, orgs, run_dir / "maillog.csv", days, args.max_rows, volumes, cuts)
         for n in mnotes:
             note(n)
             if "not pulled" in n or "that hour is truncated" in n:
                 degraded.append(n)
         if maillog and not auth_column:
             auth_column = "DMARC"
+        # a cut org's rows reach back only a few hours: its whole window is counted server side instead
+        if maillog and cuts:
+            window_totals, tnotes = pull_window_totals(tok, cuts, days)
+            for n in tnotes:
+                note(n)
+                if " not counted" in n:
+                    degraded.append(n)
 
     # 4. aggregate reports
     rua_paths = list(args.rua)
@@ -903,6 +1030,12 @@ def main():
         extra["volume"] = volumes  # only a complete set ranks: a missing org would lose by default
     if accepts(audit.build_report, "maillog_cuts"):
         extra["maillog_cuts"] = cuts  # read before the delta is built: a cut org's counts are never compared
+    if window_totals and accepts(audit.build_report, "window_totals"):
+        extra["window_totals"] = window_totals
+    if tok and accepts(audit.build_report, "mailflow"):
+        # every audited name, measured (counts, zeros for nothing seen) or not (None: the query failed)
+        extra["mailflow"] = {"days": MAILFLOW_DAYS, "source": AGGREGATE_SOURCE,
+                             "domains": {r["domain"]: r.get("mailflow") for r in inventory}}
     try:
         report = audit.build_report(
             domains=domains, domain_sources=domain_sources, rua_paths=rua_paths, maillog=maillog,
@@ -914,6 +1047,11 @@ def main():
         die(str(err))
     if isinstance(report.get("inputs"), dict):
         report["inputs"]["run"] = stamp  # which run wrote it, for a reader that finds report.json on its own
+    # full-window totals the audit set aside: fewer than the rows kept, so not the whole window
+    for org, why in sorted(((report.get("maillog") or {}).get("window_totals_rejected") or {}).items()):
+        n = "mail log: full-window totals for %s set aside, not shown: the answer holds %s" % (org, why)
+        note(n)
+        degraded.append(n)
     head = (report.get("gate") or {}).get("headline_domain")
     if head in domains:  # the headline first: a --file domains.txt re-run types it first, and so keeps it
         (run_dir / "domains.txt").write_text("\n".join([head] + [d for d in domains if d != head]) + "\n",

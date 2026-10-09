@@ -66,7 +66,11 @@ tenant default domain, else the shortest audited apex - the label says
 which. A sender
 census (maillog.census, from
 dedupe.census) and, with --previous, a delta against an earlier report.json
-(report.delta) round the report out.
+(report.delta) round the report out. collect.py adds what it measured in
+advanced hunting itself: each audited domain's mail flow (report.mailflow)
+and, for an organization whose rows its row budget or the API cap cut to the
+newest hours, the totals over the whole window (maillog.window_totals),
+which sit beside the floor and change no verdict.
 
 Outputs: report.md (human) and report.json (machine) in the output directory
 (default audit-out/), plus plan.md and plan.json when the run has a DNS
@@ -1503,6 +1507,20 @@ def verified_vs_inferred(report):
             verified.append(f"mail log attributed per sender domain (maillog.by_domain): {len(with_rows)} of "
                             f"{len(named)} audited domain(s) have rows, "
                             f"{(bd.get(OTHER) or {}).get('logical_messages', 0)} message(s) under {OTHER}")
+        wt = _dict(report["maillog"].get("window_totals"))
+        for org, info in sorted(_dict(wt.get("orgs")).items()):
+            tot = _window_sums(_dict(info).get("by_domain"))
+            verified.append(f"full-window totals for {org}, counted in advanced hunting over "
+                            f"{_hours_text(_window_hours(wt))} (maillog.window_totals): "
+                            f"{tot['genuine_failures']} genuine failures, {tot['delivered_despite_fail']} delivered "
+                            "despite failing; its logical messages and passing are Kusto estimates")
+    mf = report.get("mailflow")
+    measured = {d: c for d, c in _dict(_dict(mf).get("domains")).items() if isinstance(c, dict)}
+    if measured:
+        busy = sum(1 for c in measured.values() if dedupe._whole(c.get("messages")))
+        verified.append(f"mail flow per audited domain from one advanced hunting aggregate over "
+                        f"{_last_days_text(_dict(mf).get('days'))} (report.mailflow): {busy} of {len(measured)} "
+                        "sent or received mail")
     if report["headers"]:
         verified.append(f"{len(report['headers']['messages'])} message header file(s) parsed")
         if report["headers"]["ar_note"]:
@@ -1610,7 +1628,7 @@ def _spans_comparable(now_hours, prev_hours):
 def _count(value):
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # an infinity read from JSON is no count either
         return None
 
 
@@ -1866,6 +1884,40 @@ def build_delta(report, previous):
             "rua": rua, "notes": notes}
 
 
+# A whole window holds at least the rows kept from it. Its logical messages are a Kusto estimate (dcount, a
+# percent or two either way), so they may sit a little under an exact floor that covers nearly the whole
+# window (an API-cap cut); and a pair whose legs straddle the hour the cut fell on can read as a failure in
+# the rows kept and as a relay echo over the whole window - a few, never many.
+FLOOR_ESTIMATE_SHARE = 0.9
+FLOOR_FAILURE_SLACK = 3
+
+
+def window_totals_below_floor(window_totals, verdicts):
+    """{org: why} for each organization whose full-window totals
+    (collect.py's maillog_totals.kql answer) count less than the rows kept
+    from that window: fewer logical messages than the deduplicated verdicts
+    of its From domains, beyond the estimate's error, or fewer genuine
+    failures, beyond a few that straddle the cut. Such an answer cannot be
+    the whole window, so it is set aside rather than shown beside the floor."""
+    out = {}
+    for org, info in sorted(_dict(_dict(window_totals).get("orgs")).items()):
+        org = _norm_name(org)
+        kept_lm = kept_gf = 0
+        for v in verdicts or ():
+            d = _norm_name(v.get("domain")) if isinstance(v, dict) else ""
+            if d and (d == org or d.endswith("." + org)):
+                kept_lm += 1
+                kept_gf += 1 if v.get("genuine_failure") else 0
+        full = _window_sums(_dict(info).get("by_domain"))
+        if full["logical_messages"] < kept_lm * FLOOR_ESTIMATE_SHARE:
+            out[org] = ("about %d logical messages over the whole window, fewer than the %d in the rows kept"
+                        % (full["logical_messages"], kept_lm))
+        elif full["genuine_failures"] + max(FLOOR_FAILURE_SLACK, kept_gf // 100) < kept_gf:
+            out[org] = ("%d genuine failures over the whole window, fewer than the %d in the rows kept"
+                        % (full["genuine_failures"], kept_gf))
+    return out
+
+
 def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offline=False,
                  resolver_addr="8.8.8.8", selectors=(), known=None, sender_domain=None,
                  auth_column=None, vendor_domains=(), authserv_id=None, strict=False,
@@ -1873,7 +1925,7 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                  expect_policy=None, retiring=(), columns=None, domain_file=None,
                  rules_json=None, bypasses_json=None, groups_json=None, domain_sources=None,
                  previous_report=None, headline=None, volume=None, exceptions=None, keep_verdicts=False,
-                 max_sources=REPORT_SOURCES, maillog_cuts=None):
+                 max_sources=REPORT_SOURCES, maillog_cuts=None, window_totals=None, mailflow=None):
     """The whole audit as one document. Raises UsageError on input problems.
     max_sources: the aggregate reports' source tables keep this many of their
     busiest rows in the document (0 = all), the totals in rua.truncated.
@@ -1885,6 +1937,19 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
     maillog_cuts: {org domain: cut info} for the orgs whose mail-log pull
     collect.py cut (collect.pull_maillog fills it; {} when it cut none),
     kept as maillog.cuts for the delta and the next run's (see maillog_cuts()).
+    window_totals: what collect.py counted in advanced hunting over the full
+    window for those cut organizations ({"hours", "orgs": {org: {"by_domain":
+    {From domain: logical_messages, passing, genuine_failures,
+    delivered_despite_fail, delivered_by}, "source"}}}), kept as
+    maillog.window_totals beside the floor; the gate, the census, the labels
+    and the plan keep using the deduplicated rows. An organization whose
+    totals count less than its rows kept is left out of them and named in
+    maillog.window_totals_rejected ({org: why}; see
+    window_totals_below_floor). mailflow: each audited
+    name's mail flow as collect.py measured it ({"days", "source",
+    "domains": {name: {"messages", "outbound", "inbound", "last_seen"}, or
+    None when not measured}}), kept as report.mailflow (None when the run
+    did not measure it).
     headline: an optional explicit headline override; without it the headline
     is a typed domain (cli, then --file), else the org family carrying the
     most mail, else the tenant default domain - see headline_domain.
@@ -1951,7 +2016,16 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
         "rua": rua_doc,
         "maillog": maillog_doc,
         "headers": headers_doc,
+        "mailflow": dict(mailflow) if isinstance(mailflow, dict) else None,
     }
+    if maillog_doc and isinstance(window_totals, dict) and isinstance(window_totals.get("orgs"), dict):
+        # the cut organizations' whole window, counted server side; an answer below the rows kept is set aside
+        below = window_totals_below_floor(window_totals, maillog_doc.get("verdicts"))
+        kept = {org: info for org, info in window_totals["orgs"].items() if _norm_name(org) not in below}
+        if kept:
+            maillog_doc["window_totals"] = dict(window_totals, orgs=kept)
+        if below:
+            maillog_doc["window_totals_rejected"] = below
     report.update(tenant_docs)
     report["gate"] = gate_verdict(dns_reports, rua_doc, maillog_doc, domains, headers_doc, tenant_docs,
                                   domain_sources, headline, volume, exceptions, marked=True)
@@ -2150,6 +2224,116 @@ def _md_by_domain(L, bd):
                  "attached to no gate")
     else:
         L.append(f"- {OTHER}: no rows from sender domains outside the audited list")
+
+
+def _days_text(days):
+    n = None if isinstance(days, bool) else _count(days)
+    return "%d day%s" % (n, "" if n == 1 else "s") if n is not None and n > 0 else "the window"
+
+
+def _last_days_text(days):
+    """'the last 30 days', or 'the window' when the days are no number."""
+    text = _days_text(days)
+    return text if text == "the window" else "the last " + text
+
+
+def mailflow_text(counts, days=None):
+    """One audited name's mail flow as the report and the status document
+    say it: 'sends: 12 out, 3 in (30 days, tenant)' - out left from inside
+    the tenant, in came from outside with that From domain - or 'nothing
+    sent or received in 30 days (tenant)', or 'not measured' (no counts:
+    the run had no token, or the query failed)."""
+    if not isinstance(counts, dict):
+        return "not measured"
+    out, inn = dedupe._whole(counts.get("outbound")), dedupe._whole(counts.get("inbound"))
+    if not (out or inn or dedupe._whole(counts.get("messages"))):
+        return "nothing sent or received in %s (tenant)" % _days_text(days)
+    return "sends: %d out, %d in (%s, tenant)" % (out, inn, _days_text(days))
+
+
+MAILFLOW_NOTE = ("Mail flow is what the tenant itself carried with the domain as the From domain: out left from "
+                 "inside the tenant (Outbound or Intra-org), in arrived from outside (a vendor sending as the domain, "
+                 "or a spoof). The counts are advanced hunting estimates (dcount): zero means none, larger numbers are "
+                 "close, not exact. Mail a third party sends as the domain straight to outside recipients never passes "
+                 "through the tenant: only the aggregate reports show it.")
+
+
+def _md_mailflow(L, report):
+    """Each audited domain's mail flow (report.mailflow), or why there is none."""
+    mf = report.get("mailflow")
+    names = [_norm_name(d) for d in (report.get("inputs") or {}).get("domains") or []]
+    names = [d for d in dict.fromkeys(names + [_norm_name(d) for d in _dict(_dict(mf).get("domains"))]) if d]
+    L.append("## Mail flow per domain (tenant)")
+    L.append("")
+    if not isinstance(mf, dict):
+        L.append("- not measured in this run: collect.py measures every audited domain's mail flow with one "
+                 "advanced hunting query on each run that has the app registration's token")
+    else:
+        doms = _dict(mf.get("domains"))
+        for d in names:
+            counts = doms.get(d)
+            seen = (f"; last seen {str(counts['last_seen'])[:16].replace('T', ' ')}"
+                    if isinstance(counts, dict) and counts.get("last_seen") else "")
+            L.append(f"- {d}: {mailflow_text(counts, mf.get('days'))}{seen}")
+    L.append("")
+    L.append(MAILFLOW_NOTE)
+    L.append("")
+
+
+def _window_hours(window_totals):
+    """The hours maillog.window_totals covers: a whole number above 0, else None (the window, unnamed)."""
+    raw = _dict(window_totals).get("hours")
+    hours = None if isinstance(raw, bool) else _count(raw)
+    return hours if hours is not None and hours > 0 else None
+
+
+def _window_sums(by_domain):
+    """The full-window totals of one organization, added up over its From domains."""
+    out = {"logical_messages": 0, "passing": 0, "genuine_failures": 0, "delivered_despite_fail": 0}
+    by = Counter()
+    for c in _dict(by_domain).values():
+        c = _dict(c)
+        for k in out:
+            out[k] += dedupe._whole(c.get(k))
+        for reason, n in _dict(c.get("delivered_by")).items():
+            by[reason] += dedupe._whole(n)
+    out["delivered_by"] = dict(by)
+    return out
+
+
+def _totals_line(c):
+    by = dedupe.delivered_by_text(c.get("delivered_by"), c["delivered_despite_fail"])
+    return (f"about {c['logical_messages']} logical messages, about {c['passing']} passing, "
+            f"{c['genuine_failures']} genuine failures, {c['delivered_despite_fail']} delivered despite failing"
+            + (f" (let in by {by})" if by else ""))
+
+
+def _md_window_totals(L, report):
+    """The full-window totals collect.py counted in advanced hunting for each
+    organization whose rows the row budget or the API cap cut, next to the
+    attribution built from the rows kept."""
+    ml = _dict(report.get("maillog"))
+    wt = _dict(ml.get("window_totals"))
+    orgs = _dict(wt.get("orgs"))
+    if not orgs:
+        return
+    cuts = maillog_cuts(report)
+    hours = _window_hours(wt)
+    L.append("")
+    L.append(f"Full-window totals for cut organizations (counted in advanced hunting over the whole "
+             f"{_hours_text(hours) if hours else 'window'}, at the same (Message-ID, recipient) grain): the counts above "
+             "keep only the rows the row budget or the API cap left, a floor. Logical messages and passing here are "
+             "Kusto estimates. The gate, the census, the labels and the plan keep using the deduplicated rows above.")
+    L.append("")
+    for org, info in sorted(orgs.items()):
+        bd = _dict(_dict(info).get("by_domain"))
+        kept = _cut_kept(cuts.get(org))
+        L.append(f"- {org}" + (f" ({kept} in the rows above)" if kept else "") + f": {_totals_line(_window_sums(bd))}")
+        rows = sorted(bd.items(), key=lambda kv: (-dedupe._whole(_dict(kv[1]).get("genuine_failures")), kv[0]))
+        for d, c in rows[:10]:
+            L.append(f"  - {d}: {_totals_line(_window_sums({d: c}))}")
+        if len(rows) > 10:
+            L.append(f"  - (+{len(rows) - 10} more in report.json)")
 
 
 def _md_census(L, cs):
@@ -2377,6 +2561,8 @@ def render_md(report):
                 L.append(f"  - {f['source_ip']}: {f['spf_only']} msgs as {', '.join(f['header_from'][:2])}")
         L.append("")
 
+    _md_mailflow(L, report)
+
     if report["maillog"]:
         c = report["maillog"]["counters"]
         L.append("## Mail log (deduplicated)")
@@ -2387,8 +2573,9 @@ def render_md(report):
                  f"{c['genuine_failures']} genuine after deduplication")
         L.append(f"- genuine failures (no passing copy): {c['genuine_failures']}; "
                  f"echo messages (fail + pass legs): {c['echo_messages']}")
-        L.append(f"- delivered despite fail: {c['delivered_despite_fail']}; "
-                 f"blocked despite pass: {c['blocked_despite_pass']}")
+        by = dedupe.delivered_by_text(c.get("delivered_despite_fail_by"), c["delivered_despite_fail"])
+        L.append(f"- delivered despite fail: {c['delivered_despite_fail']}" + (f" (let in by {by})" if by else "")
+                 + f"; blocked despite pass: {c['blocked_despite_pass']}")
         L.append("- likely split of failures (heuristic): "
                  + ", ".join(f"{n} {label}" for label, n in c["by_likely"].items()))
         al = report["maillog"].get("alignment") or c.get("alignment") or {}
@@ -2411,6 +2598,7 @@ def render_md(report):
                      + (" (auto-detected)" if report["maillog"].get("auth_column_detected") else ""))
         if report["maillog"].get("by_domain"):
             _md_by_domain(L, report["maillog"]["by_domain"])
+        _md_window_totals(L, report)
         L.append("")
         if report["maillog"].get("census"):
             _md_census(L, report["maillog"]["census"])

@@ -8,8 +8,10 @@
 # verified domain in the tenant, which needs Domain.Read.All.
 domains = ["example.com", "example.net"]
 # Also add every subdomain seen sending in the last 30 days (needs ThreatHunting.Read.All).
+# Every audited domain's own mail flow (the last 30 days) is measured on each run either way.
 mailflow = true
-# Mail-log window in days (30 is the API maximum) and the aggregate-report window.
+# Mail-log window in days (30 is the API maximum; the mail-flow count stays at 30) and the
+# aggregate-report window.
 days = 30
 report_days = 30
 # Senders you recognise: your vendors' IP prefixes and domains. The aggregate-report

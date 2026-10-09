@@ -1,0 +1,72 @@
+// Full-window totals for one organization's mail, counted where the data
+// lives. A busy apex can carry more legs in 30 days than src/collect.py's row
+// budget keeps, so the raw rows of that organization reach back only a few
+// hours and every count built from them is a floor. This query counts the
+// whole window server side instead; collect.py runs it for every
+// organization whose pull the row budget or the API cap cut and stores the
+// answer as report.json maillog.window_totals, beside the floor.
+// Same grain as src/dedupe.py: one logical message = (Message-ID, recipient),
+// over Inbound and Intra-org legs, per From domain under the organization.
+// The expensive part is kept small the way the portal query that covers 30
+// days does it: first the distinct Message-IDs that have a failing leg, then
+// the per-(Message-ID, recipient) summary for those only. Logical messages
+// and passing are counted over every pair with dcount, which Kusto estimates
+// (read them as "about"); the failure counts are exact.
+// Columns, one row per From domain and override:
+//   fromdom                = the From domain (the organization or a subdomain of it)
+//   logical_messages       = about how many (Message-ID, recipient) pairs
+//   passing                = about how many of them had a DMARC pass on some leg
+//   delivered_by           = what let a delivered failure in, from its delivered
+//                            failing leg: "org: <OrgLevelPolicy> (<OrgLevelAction>)",
+//                            else "user: <UserLevelPolicy> (<UserLevelAction>)",
+//                            else empty (no override recorded, or not delivered)
+//   genuine_failures       = pairs that failed on some leg and passed on none
+//   delivered_despite_fail = those of them delivered to a mailbox
+// A From domain with failures under two overrides has two rows, its
+// logical_messages and passing repeated on each; a From domain with no
+// failure has one row with empty failure columns. collect.py adds them up.
+let sender_domain = "example.com";      // the organization; its subdomains are included
+let window_start  = ago(30d);           // 30d is the retention maximum
+let window_end    = now();
+let base = EmailEvents
+| where Timestamp between (window_start .. window_end)
+| where EmailDirection in ("Inbound", "Intra-org")
+| where SenderFromDomain =~ sender_domain or SenderFromDomain endswith strcat(".", sender_domain)
+| where isnotempty(InternetMessageId)
+| extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC)
+| extend rcpt = tolower(RecipientEmailAddress), fromdom = tolower(SenderFromDomain);
+let totals = base
+| summarize logical_messages = dcount(strcat(InternetMessageId, "|", rcpt)),
+            passing          = dcountif(strcat(InternetMessageId, "|", rcpt), dmarc =~ "pass")
+  by fromdom;
+let failing_ids = base
+| where dmarc =~ "fail"
+| summarize by InternetMessageId;
+let failures = failing_ids                                   // smaller table on the left, the Kusto rule for join
+| join kind=inner base on InternetMessageId
+| extend loc = tolower(tostring(DeliveryLocation))           // dedupe.py's "reached a mailbox": delivered, to the inbox, junk or deleted items
+| extend on_mailbox = (tostring(DeliveryAction) in~ ("Delivered", "DeliveredToDeletedFolder"))
+                      and (indexof(loc, "inbox") >= 0 or indexof(loc, "junk") >= 0 or indexof(loc, "deleted") >= 0)
+| extend org_policy  = tostring(column_ifexists("OrgLevelPolicy", "")),
+         org_action  = tostring(column_ifexists("OrgLevelAction", "")),
+         user_policy = tostring(column_ifexists("UserLevelPolicy", "")),
+         user_action = tostring(column_ifexists("UserLevelAction", ""))
+| extend reason = case(isnotempty(org_policy),  strcat("org: ", org_policy, iff(isnotempty(org_action), strcat(" (", org_action, ")"), "")),
+                       isnotempty(user_policy), strcat("user: ", user_policy, iff(isnotempty(user_action), strcat(" (", user_action, ")"), "")),
+                                                "")
+| summarize anypass    = max(iff(dmarc =~ "pass", 1, 0)),
+            anyfail    = max(iff(dmarc =~ "fail", 1, 0)),
+            delivered  = max(iff(on_mailbox, 1, 0)),
+            by_failing = take_anyif(reason, on_mailbox and dmarc =~ "fail" and isnotempty(reason)),
+            by_other   = take_anyif(reason, on_mailbox and isnotempty(reason)),
+            fromdom    = min(fromdom)
+  by InternetMessageId, rcpt
+| where anyfail > 0 and anypass == 0
+| extend delivered_by = iff(delivered == 1, iff(isnotempty(by_failing), by_failing, by_other), "")
+| summarize genuine_failures       = count(),
+            delivered_despite_fail = countif(delivered == 1)
+  by fromdom, delivered_by;
+totals
+| join kind=leftouter failures on fromdom
+| project fromdom, logical_messages, passing, delivered_by, genuine_failures, delivered_despite_fail
+| order by fromdom asc

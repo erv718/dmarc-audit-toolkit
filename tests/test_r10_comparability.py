@@ -333,7 +333,10 @@ class Tenant:
         self.legs = legs
 
     def hunting(self, tok, kql, ts=None):
-        org = re.search(r'let sender_domain = "([^"]+)";', kql).group(1)
+        named = re.search(r'let sender_domain = "([^"]+)";', kql)
+        if not named:  # the mail-flow aggregate collect runs on every run with a token: nothing seen here
+            return {"schema": [], "results": []}
+        org = named.group(1)
         start = int(re.search(r"let window_start\s*=\s*ago\((\d+)h\);", kql).group(1))
         m = re.search(r"let window_end\s*=\s*ago\((\d+)h\);", kql)
         end = int(m.group(1)) if m else 0

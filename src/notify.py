@@ -4,7 +4,11 @@
 Reads report.json (and optionally the previous run's report.json and this
 run's plan.json) and writes one message: policy and gate per domain (with the
 domain's own genuine failures when the report attributes the mail log per
-domain, maillog.by_domain), the worst census entries (maillog.census), what
+domain, maillog.by_domain, and for a domain under an organization the row
+budget cut, the full-window totals collect.py counted in advanced hunting,
+maillog.window_totals, beside that floor), the mail log's counts (with the
+overrides that let mail in despite failing, when the log recorded them),
+the worst census entries (maillog.census), what
 changed since last time (new findings, resolved findings, newly identified
 senders, spoofing blocked, failure counts), the trend over the last runs,
 and how many plan rows are waiting. When the report carries its own delta
@@ -37,6 +41,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import dedupe  # the overrides that let a delivered failure in, in plain words
 import run_hunting
 
 WEBHOOK_KEYS = ("SLACK_WEBHOOK_URL", "TEAMS_WEBHOOK_URL")
@@ -256,6 +261,28 @@ def _names(items, cap=3):
     return ", ".join(items[:-1]) + " and " + items[-1]
 
 
+def full_window_line(window_totals, domain):
+    """'; over the full 30 days, counted in Advanced Hunting: 613 genuine
+    failures, 12 delivered despite failing' for an audited domain under an
+    organization whose rows the row budget or the API cap cut, from what
+    collect.py counted there (maillog.window_totals; a domain its answer left
+    out had none), else ''."""
+    wt = window_totals if isinstance(window_totals, dict) else {}
+    orgs = wt.get("orgs") if isinstance(wt.get("orgs"), dict) else {}
+    org = next((o for o in sorted(orgs, key=len, reverse=True)
+                if isinstance(o, str) and (domain == o or domain.endswith("." + o))), None)
+    info = orgs.get(org) if org else None
+    by = info.get("by_domain") if isinstance(info, dict) else None
+    if not isinstance(by, dict):
+        return ""
+    c = by.get(domain) if isinstance(by.get(domain), dict) else {}
+    hours = _whole(wt.get("hours"))
+    span = ("%d days" % (hours // 24)) if hours and hours % 24 == 0 else ("%d hours" % hours if hours else "window")
+    gf = _whole(c.get("genuine_failures"))
+    return "; over the full %s, counted in Advanced Hunting: %d genuine failure%s, %d delivered despite failing" % (
+        span, gf, "" if gf == 1 else "s", _whole(c.get("delivered_despite_fail")))
+
+
 def trend_word(values):
     """improving / worsening / flat from the first and last known value."""
     pts = [v for v in values if _number(v) is not None]
@@ -324,12 +351,17 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
         line = "- `%s`: p=%s, gate *%s*, next: %s" % (dom, g.get("current_policy") or "unknown", g.get("verdict", "?"),
                                                       g.get("next_step", "?"))
         own = by_dom.get(dom)
+        # a domain under an org the row budget cut: its own count is the floor the gate decides on, and the
+        # whole window, counted server side, goes beside it
+        full = full_window_line(maillog.get("window_totals"), dom)
         if isinstance(own, dict) and own.get("genuine_failures") is not None:
             line += " - %d genuine failures of its own" % own["genuine_failures"]
+            if full:
+                line += " in the rows kept (a floor; the gate, the census, the labels and the plan count these)"
             d = dl_dom.get(dom)
             if isinstance(d, dict) and d.get("genuine_failures") is not None:
                 line += " (%+d vs last run)" % d["genuine_failures"]
-        lines.append(line)
+        lines.append(line + full)
 
     summ = report.get("summary") or {}
     sev = summ.get("by_severity") or {}
@@ -338,9 +370,11 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
 
     ml = maillog.get("counters") or {}
     if ml:
-        lines.append("- mail log: %d genuine failures (%d rows would say so), %d delivered despite failing, spoof-like %d"
+        # what let the delivered ones in, when the log recorded the overrides; '' leaves the line as it was
+        by = dedupe.delivered_by_text(ml.get("delivered_despite_fail_by"), ml.get("delivered_despite_fail", 0))
+        lines.append("- mail log: %d genuine failures (%d rows would say so), %d delivered despite failing%s, spoof-like %d"
                      % (ml.get("genuine_failures", 0), ml.get("raw_failing_rows", 0), ml.get("delivered_despite_fail", 0),
-                        (ml.get("by_likely") or {}).get("likely_spoof", 0)))
+                        (" (let in by %s)" % by) if by else "", (ml.get("by_likely") or {}).get("likely_spoof", 0)))
     census = maillog.get("census")
     if isinstance(census, dict):
         top, failing = census_top(census)

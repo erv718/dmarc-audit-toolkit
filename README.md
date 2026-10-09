@@ -149,6 +149,9 @@ day one:
 
 - `domains`: leave empty to audit every verified domain in the tenant, or list
   them. `mailflow = true` adds every subdomain seen sending in the last 30 days.
+  Either way, every run that has the app registration measures each audited
+  domain's own mail flow over the last 30 days, the organizational domain
+  included.
 - `known`: your vendors' IP prefixes and domains. The unknown-sender check in
   the aggregate reports runs only on the IP prefixes: with them, every source
   outside them and every DKIM signing domain that is neither yours nor listed
@@ -192,12 +195,16 @@ logical messages            : 81
 The third line runs entirely from the bundled synthetic samples with no
 credentials and no network, which is the quickest way to see the outputs; the
 block under it is `dedupe.py`'s own report on those samples, the
-deduplication every run performs. A run verifies the registration, reads the domain list, pulls the raw mail log
-for each organizational domain (sized by the hour and pulled in complete
-windows, newest first, so a busy domain never comes back as a truncated day),
-pulls new aggregate reports from the report mailbox, audits DNS, runs the
-deduplication, writes the report, the status document, the to-do list and the
-plan, appends the history and metrics, and prints or posts the summary.
+deduplication every run performs. A run verifies the registration, reads the domain list, measures each
+audited domain's mail flow with one aggregate query (what the tenant sent as
+it and received with it as the From domain), pulls the raw mail log for each
+organizational domain (sized by the hour and pulled in complete windows,
+newest first, so a busy domain never comes back as a truncated day), counts
+the whole window in advanced hunting for an organization whose rows the row
+budget cut, pulls new aggregate reports from the report mailbox, audits DNS,
+runs the deduplication, writes the report, the status document, the to-do
+list and the plan, appends the history and metrics, and prints or posts the
+summary.
 
 Exit codes: 0 clean, 1 at least one major or blocking finding, 2 a usage or
 setup error. A brand-new rollout will exit 1 for weeks; that is the findings
@@ -212,8 +219,12 @@ Read them in this order, all under `audit-out/latest/`:
 1. **`next_steps.md`**: the document you send. Where the rollout stands in
    one sentence, deduplicated failure counts with the raw number alongside,
    what is failing by envelope domain and by sender, a per-domain table
-   (policy today, gate, next step), what happens next grouped by owner, the
-   ask for the week, the open questions, and a glossary. Written by
+   (policy today, gate, next step, and the mail flow the tenant measured -
+   "sends: N out, M in", "nothing sent or received", or "not measured"), what
+   happens next grouped by owner, the ask for the week, the open questions,
+   and a glossary. Mail delivered despite failing names the override that let
+   it in ("delivered because of an Exchange transport rule: find that rule
+   ...") when the mail log recorded it. Written by
    `src/next_steps.py` from the files below with no AI involved: every
    sentence is assembled from the run and every number is copied from it, so
    any tenant that runs the toolkit gets the same document from the same
@@ -226,7 +237,16 @@ Read them in this order, all under `audit-out/latest/`:
    `insufficient_data` when a zero would only mean "no data"), each finding
    with its severity, evidence and action, the mail log attributed to each
    audited domain (its own rows, with its unaudited subdomains counted
-   separately), and a "verified vs inferred" split so you always know what
+   separately), each domain's mail flow as the tenant measured it
+   (`mailflow`; mail a third party sends as your domain straight to outside
+   recipients never passes through the tenant, so only the aggregate reports
+   show it), the override behind each message delivered despite failing when
+   the mail log recorded one (`delivered_by` in the census,
+   `delivered_despite_fail_by` in the counters; the mail log `collect.py`
+   pulls carries the override columns), and for an organization
+   whose rows the row budget cut, its full-window totals counted in advanced
+   hunting (`maillog.window_totals`) beside the floor the gate still uses -
+   and a "verified vs inferred" split so you always know what
    was measured and what was reasoned. `report.json` is the same as data and
    stays readable at scale: the per-message verdicts are dropped once the
    gate and the census have used them (`maillog.verdicts_omitted` says how
@@ -252,7 +272,16 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
 
 - **Monitoring first.** Every domain and subdomain gets `p=none` with a `rua`
   address before anything else; parked domains get `v=spf1 -all` and
-  `p=reject` once "unused" is verified.
+  `p=reject` once "unused" is verified. Every run with the app registration
+  measures each domain's mail flow over 30 days (whatever `--days` says). A
+  parked candidate (no MX, no sender in SPF, no DKIM selector) reads as
+  verified unused only when the tenant saw no mail from it, out or in, in
+  those 30 days and the run's aggregate reports, which cover its DMARC
+  record, count no passing mail as it; otherwise its prerequisite names the
+  checks still open (mail a third party sends as the domain straight to
+  outside recipients never passes through the tenant, so only the reports
+  show it). Passing mail as it in those reports means the domain sends: it
+  gets a monitoring record, not a park.
 - **One ratchet per domain per week**: `p=none` to `p=quarantine; pct=25`, to
   `pct=100`, to `p=reject`, then the subdomain policy `sp=`, then SPF `-all`.
   A step appears only when the earlier ones are done and a week of reports has
@@ -306,9 +335,13 @@ weeks of local history even though the API still only shows 30 days, and
 
 **Slack, off by default.** Set `SLACK_WEBHOOK_URL` in `.env` and each run posts
 one message: policy and gate per domain, deduplicated failure counts next to
-the raw ones, the worst failing senders from the census, spoofing blocked by
+the raw ones (with the overrides that let failing mail in, when the mail log
+recorded them), the worst failing senders from the census, spoofing blocked by
 receivers, newly identified senders (new to the whole history, not just absent
 last week), the week-over-week deltas, and the trend over the last four runs.
+A domain under an organization whose rows the row budget cut shows its count
+from the rows kept as the floor it is, with its full-window totals counted in
+advanced hunting beside it.
 A delta is withheld, and the message says so, when two runs cannot bear the
 comparison. Failure counts are not compared when the row budget (or an hour
 at the API row cap) cut an organization's mail log in either run - the note
@@ -379,12 +412,12 @@ answer.
 | `src/next_steps.py` | `report.json` in, `next_steps.md` + `next_steps.json` out: the status document you send. One-line status, deduplicated counts with the raw number alongside, what is failing, a per-domain table, actions grouped by owner, the ask and the open questions. Reads `plan.json`, `metrics.json`, the previous run and `owners.csv` when they exist; deterministic, no AI. |
 | `src/plan.py` | `report.json` in, `plan.md` out: the exact records to publish, with current value, rollback, priority and prerequisites. |
 | `src/config.py` | Reads `audit.toml`: settings and the formal exceptions. Library only. |
-| `src/discover.py` | Finds the domains: command line, file, the tenant, subdomains seen in mail flow; records each zone's DNS host. |
+| `src/discover.py` | Finds the domains: command line, file, the tenant, subdomains seen in mail flow; records each zone's DNS host; with `collect.py`'s token, measures every domain's own mail flow in one aggregate query. |
 | `src/verify_setup.py` | Proves the app registration: token, roles (required, recommended, excess), domain list, a hunting query, the report mailbox, and that other mailboxes are denied. |
 | `src/graph_client.py` | Shared Microsoft Graph helper. Library only. |
 | `src/fetch_rua.py` | Pulls aggregate (rua) reports out of the report mailbox. The weekly job reads the last 30 days on a first run and only new reports after; run standalone it backfills the whole mailbox, up to `--max` messages per run, and `--since` starts anywhere. Attachments come back inline, about 20 per call. |
 | `src/notify.py` | The Slack summary: policy and gate per domain, the worst failing senders, what changed since last run, newly identified senders, trend. |
-| `src/dedupe.py` | Collapses mail-log rows into logical messages by (Message-ID, recipient); reports failed-but-delivered and passed-but-blocked separately; prints a census of the failing senders by envelope domain and by sender address; marks mail that stayed inside the tenant (a Direction column); with SPF and DKIM columns, buckets passing mail into DKIM-carried, SPF-and-DKIM and SPF-only. Dies loudly on a misspelled column instead of returning a silent zero. |
+| `src/dedupe.py` | Collapses mail-log rows into logical messages by (Message-ID, recipient); reports failed-but-delivered and passed-but-blocked separately, naming the override that let each failure in when the export carries the override columns; prints a census of the failing senders by envelope domain and by sender address; marks mail that stayed inside the tenant (a Direction column); with SPF and DKIM columns, buckets passing mail into DKIM-carried, SPF-and-DKIM and SPF-only. Dies loudly on a misspelled column instead of returning a silent zero. |
 | `src/spf_lookups.py` | Expands an SPF record and counts lookups against the limit of ten; a failed lookup is never reported as "no record". |
 | `src/dns_audit.py` | Multi-domain posture: SPF, DMARC with inheritance, DKIM selectors, MX, with evidence per lookup. |
 | `src/rua_parse.py` | Aggregate report XML (plain, gz, zip) into answers: selectors in use, unknown senders, failing streams, SPF-only senders. |
@@ -394,7 +427,7 @@ answer.
 | `src/mcp_server.py` | The tools above for any MCP client. |
 | `scripts/register_weekly_task.ps1` | Registers or removes the Windows scheduled task. |
 | `scripts/check_public.py` | Pre-push gate: deny terms, typographic dashes, and credential material never leave the repo. |
-| `queries/` | Eight advanced-hunting queries: deduplicated census and failures, subdomain health, override audit, echo-vs-loss twins, pre-reject DKIM alignment, impersonation, and the raw per-leg export that feeds `dedupe.py`. |
+| `queries/` | Nine advanced-hunting queries: deduplicated census and failures, subdomain health, override audit, echo-vs-loss twins, pre-reject DKIM alignment, impersonation, the raw per-leg export that feeds `dedupe.py` (with the override each leg recorded), and the full-window totals `collect.py` counts for an organization its row budget cut. |
 | `samples/` | Synthetic mail log, aggregate reports, annotated headers and `owners.csv.example`, so every tool can be tried offline. |
 | `docs/` | The methodology, the app registration walkthrough, the AI workflow guide, and the shape of the generated status document (`docs/templates/next-steps.md`). |
 
@@ -435,7 +468,15 @@ would leave the machine.
 - **The mail-log notes say the row budget was reached**: a busy domain has more
   rows in 30 days than `--max-rows` keeps (250,000 by default); the run kept
   the newest complete hours and the note says exactly how far back they reach.
-  Raise `--max-rows` to keep more.
+  The run then counts that organization's whole window in advanced hunting
+  itself (`queries/maillog_totals.kql`, the same deduplicated grain) and
+  reports it beside the floor (`maillog.window_totals`, report.md's
+  "Full-window totals for cut organizations", the genuine-failure line of
+  `next_steps.md`); the gate, the census, the labels and the plan still use
+  the rows kept. An answer that holds no mail for that organization, or
+  counts less than the rows kept, cannot be its whole window: the run sets
+  it aside with a note (a degraded step) and shows the floor alone. Raise
+  `--max-rows` to keep more.
 - **"needs Python 3.11 or newer"**: the settings file is TOML; upgrade Python
   or pass everything as flags.
 - **The delta or the trend says "not comparable"**: the row budget or the

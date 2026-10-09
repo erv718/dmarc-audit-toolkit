@@ -15,7 +15,12 @@ The rules are the methodology, encoded (docs/methodology.md):
   SPF hygiene          no terminator or +all/?all becomes ~all; over the
                        lookup limit is a fix-first; at the limit is a freeze.
   parked domains       no mail in, no mail out, nothing signing: v=spf1 -all
-                       and p=reject, once "unused" is verified.
+                       and p=reject, once "unused" is verified. Verified
+                       means the tenant measured no mail out and none in
+                       over 30 days and aggregate reports that cover the
+                       domain count no passing mail as it; otherwise the
+                       row names the checks still open. Passing mail as it
+                       in those reports means something sends: not parked.
   DKIM before reject   a domain that sends without a DKIM selector gets a
                        signing task before any enforcement step.
   one ratchet at a time
@@ -171,6 +176,104 @@ def _home(name, audited):
     if name in audited:
         return name
     return max((a for a in audited if name.endswith("." + a)), key=len, default=None)
+
+
+def mailflow_of(report, inventory_row, domain):
+    """The domain's measured mail flow ({"messages", "outbound", "inbound",
+    "last_seen"}), from its inventory row, else from the report collect.py
+    wrote (report.mailflow, measured on every run with a token); {} when
+    neither measured it."""
+    flow = (inventory_row or {}).get("mailflow")
+    if not isinstance(flow, dict):
+        mf = report.get("mailflow") if isinstance(report.get("mailflow"), dict) else {}
+        doms = mf.get("domains") if isinstance(mf.get("domains"), dict) else {}
+        flow = doms.get(domain)
+    return flow if isinstance(flow, dict) else {}
+
+
+# A parked candidate is verified unused only over a measurement this long (the methodology's 30 days).
+UNUSED_DAYS = 30
+
+
+def _measured(value):
+    """A count as measured: a whole number >= 0, else None. A damaged count
+    (text, a negative, a fraction) reads as not measured, never as zero."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    return None
+
+
+def mailflow_days(report):
+    """The days the measured mail flow covers: report.mailflow's (collect.py
+    counts 30), None when that says nothing usable, and 30 without
+    report.mailflow (discover.py --mailflow, the only other source of an
+    inventory row's counts, measures 30 days). A shorter measurement never
+    verifies a domain unused."""
+    mf = report.get("mailflow")
+    if isinstance(mf, dict):
+        return _measured(mf.get("days"))
+    return UNUSED_DAYS
+
+
+def _name(value):
+    return str(value or "").strip().lower().rstrip(".")
+
+
+def _rows(value):
+    """value when it is a list, else []: a damaged report section reads as an empty one."""
+    return value if isinstance(value, list) else []
+
+
+def aggregate_volume(report, domain, dns_doc):
+    """What this run's aggregate reports say about mail sent as the domain:
+    (covered, passing). covered: the run carries reports about the DMARC
+    record that applies to the domain (its own, or the one it inherits), or
+    reports that name it as the header From - so mail anyone sent as it to
+    a receiver that reports would be counted there. A domain with no DMARC
+    record is covered by no report. passing: the DMARC-passing messages
+    they count with it as the header From."""
+    rua = report.get("rua") if isinstance(report.get("rua"), dict) else {}
+    named, passing = False, 0
+    for h in _rows(rua.get("by_header_from")):
+        if isinstance(h, dict) and _name(h.get("domain")) == domain:
+            named = True
+            passing += _measured(h.get("pass")) or 0
+    totals = rua.get("totals") if isinstance(rua.get("totals"), dict) else {}
+    check = rua.get("policy_check") if isinstance(rua.get("policy_check"), dict) else {}
+    about = {_name(d) for d in _rows(totals.get("domains"))}  # the records the reports are about
+    about |= {_name(s.get("domain")) for s in _rows(check.get("seen")) if isinstance(s, dict)}
+    source = _name((dns_doc or {}).get("dmarc_source"))  # where the record that applies was found: _dmarc.<name>
+    record = source[len("_dmarc."):] if source.startswith("_dmarc.") else source
+    return named or bool(record and record in about), passing
+
+
+def unused_note(outbound, inbound, days, reports_cover):
+    """A park row's prerequisite. 'verified unused: ...' only when every
+    check it names was made: the tenant measured no mail out and none in
+    over at least UNUSED_DAYS, and aggregate reports that cover the domain
+    count no passing mail as it. Otherwise 'verify unused first: ...' with
+    the checks still open - an inbound count is named, since only a person
+    can tell a vendor sending as the domain from a spoof - and the owner
+    objects, which nothing here checks. outbound, inbound: whole numbers
+    measured over `days`, both None when not measured."""
+    span = ("%d day%s" % (days, "" if days == 1 else "s")) if days else "an unknown span"
+    open_checks = []
+    if outbound is None:
+        open_checks.append("no outbound mail in 30 days (discover.py --mailflow)")
+    elif days is None or days < UNUSED_DAYS:
+        open_checks.append("no outbound mail in 30 days (the tenant measured %s)" % (span + " only" if days else span))
+    if inbound:
+        open_checks.append("the %d inbound message(s) from it in %s are spoofs rather than a vendor sending as it"
+                           % (inbound, span))
+    if not reports_cover:
+        open_checks.append("no passing volume in aggregate reports")
+    if not open_checks:
+        return "verified unused: no outbound mail in 30 days, no passing aggregate volume"
+    return "verify unused first: " + ", ".join(open_checks + ["no owner objects"])
 
 
 def evidence_for(report, domain):
@@ -365,8 +468,11 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     has_mx = bool(dns_doc.get("mx")) and not mx_null
     zone = (inventory_row or {}).get("zone") or org_domain(domain)
     zone_host = (inventory_row or {}).get("zone_host") or "unknown"
-    mailflow = (inventory_row or {}).get("mailflow") or {}
-    outbound = mailflow.get("outbound") if mailflow else None
+    mailflow = mailflow_of(report, inventory_row, domain)  # measured on every collect run with a token
+    outbound, inbound = _measured(mailflow.get("outbound")), _measured(mailflow.get("inbound"))
+    if outbound is None or inbound is None:  # not measured, or damaged: never read as nothing sent
+        outbound = inbound = None
+    reports_cover, passing = aggregate_volume(report, domain, dns_doc)
     ev = evidence_for(report, domain)
     hostname = "_dmarc." + domain
     subdomains = sorted(d for d in all_domains if d != domain and d.endswith("." + domain))
@@ -389,12 +495,11 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
         return changes, holds
 
     # --- parked domain: nothing in, nothing out, nothing signing -------------
-    sends = spf_sends(spf) or bool(selectors) or (outbound or 0) > 0
+    # passing mail as it in the aggregate reports is a sender too: a third party mailing outside recipients
+    # as the domain never passes through the tenant, so its mail flow cannot show it
+    sends = spf_sends(spf) or bool(selectors) or (outbound or 0) > 0 or passing > 0
     parked_candidate = (not has_mx) and not sends
-    if parked_candidate and (outbound is None):
-        parked_note = "verify unused first: no outbound mail in 30 days (discover.py --mailflow), no passing volume in aggregate reports, no owner objects"
-    else:
-        parked_note = "verified unused: no outbound mail in 30 days, no passing aggregate volume"
+    parked_note = unused_note(outbound, inbound, mailflow_days(report), reports_cover)
 
     # --- monitoring first --------------------------------------------------
     if "DMARC-005" in ids:

@@ -6,7 +6,8 @@
 // recipient) grouping, so every leg of every message must be present.
 // Output column names are the Defender "All email" export names that dedupe.py
 // defaults to (quoted identifiers carry the spaces), plus the three
-// authentication verdicts parsed out of AuthenticationDetails:
+// authentication verdicts parsed out of AuthenticationDetails, and last the
+// four override columns:
 //   Internet message ID       = InternetMessageId, the dedupe key with Recipients
 //   Recipients                = RecipientEmailAddress, one recipient per row
 //   Sender address / domain   = From header address and its domain
@@ -18,6 +19,13 @@
 //                               fingerprint); dedupe.py --envelope-column defaults to it
 //   Envelope domain           = the same value under the name the API contract uses
 //   Sender IP, Timestamp, Direction = SenderIPv4, Timestamp, EmailDirection
+//   Org level action / policy, User level action / policy
+//                             = OrgLevelAction, OrgLevelPolicy, UserLevelAction,
+//                               UserLevelPolicy: the local override recorded on
+//                               the leg (a transport rule, an allow list, a safe
+//                               sender list); dedupe.py names it for every message
+//                               delivered despite failing. Empty when a tenant's
+//                               schema lacks the column (column_ifexists)
 // Limits: Advanced Hunting keeps 30 days, so ago(30d) is the maximum window
 // and the API caps a single result set (100,000 rows). If a busy domain hits
 // the cap, narrow the window or split by subdomain and run twice
@@ -46,4 +54,8 @@ EmailEvents
           ['Envelope domain']          = SenderMailFromDomain,
           ['Sender IP']                = SenderIPv4,
           ['Timestamp']                = Timestamp,
-          ['Direction']                = tostring(EmailDirection)
+          ['Direction']                = tostring(EmailDirection),
+          ['Org level action']         = tostring(column_ifexists("OrgLevelAction", "")),
+          ['Org level policy']         = tostring(column_ifexists("OrgLevelPolicy", "")),
+          ['User level action']        = tostring(column_ifexists("UserLevelAction", "")),
+          ['User level policy']        = tostring(column_ifexists("UserLevelPolicy", ""))

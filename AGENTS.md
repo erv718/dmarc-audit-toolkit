@@ -36,8 +36,10 @@ file only.)
 6. **"Blocked" and "failed DMARC" are different questions.** Check both the
    authentication verdict and the delivery action, plus any local override.
    `src/dedupe.py` reports the two crossings separately (failed but delivered,
-   passed but blocked); `queries/delivered_despite_failure.kql` names the
-   override that let failing mail through. Local allow rules mask failures
+   passed but blocked), and names the override that let each failure in
+   (`delivered_by`) when the export carries the override columns
+   `queries/raw_maillog.kql` writes; `queries/delivered_despite_failure.kql`
+   groups failing mail by that override. Local allow rules mask failures
    that external receivers still see.
 7. **Do not diagnose DNS from one resolver path.** Port 53 interception
    produces SERVFAILs that look identical to a broken zone. `src/dns_audit.py`
@@ -129,7 +131,8 @@ Each query writes a CSV whose columns come straight from the KQL:
 | `queries/genuine_failures.kql` | `env`, `addr`, `genuine_failures` | Deduplicated failures by envelope domain and From address. The triage list. Already deduplicated; never re-count rows. |
 | `queries/subdomain_health.kql` | `fromdom`, `total`, `genuine_failures` | Per-subdomain failure rates. A subdomain near 100% failure is usually inbound spoofing of an unprotected domain, not a broken sender. |
 | `queries/delivered_despite_failure.kql` | `env`, `org_action`, `org_policy`, `user_action`, `compauth`, `msgs` | Failing mail that was delivered anyway, grouped by WHAT let it through. Your local overrides, named. External receivers do not forgive these. |
-| `queries/raw_maillog.kql` | dedupe.py's default export columns plus `DMARC`/`SPF`/`DKIM` | Per-leg rows for one domain. Pipe straight into `src/dedupe.py` with no column flags - this is the API-to-dedupe pipeline. |
+| `queries/raw_maillog.kql` | dedupe.py's default export columns plus `DMARC`/`SPF`/`DKIM`, then `Org level action`/`Org level policy`/`User level action`/`User level policy` | Per-leg rows for one domain. Pipe straight into `src/dedupe.py` with no column flags - this is the API-to-dedupe pipeline. The override columns let dedupe.py name what delivered a failing message. |
+| `queries/maillog_totals.kql` | `fromdom`, `logical_messages`, `passing`, `delivered_by`, `genuine_failures`, `delivered_despite_fail` | One organization's whole window at the dedupe grain, counted server side, per From domain. `collect.py` runs it for an organization its row budget cut; `logical_messages` and `passing` are dcount estimates (say "about"), the failure counts are exact. |
 | `queries/delivered_twin.kql` | `lost_*`, `twin_*`, `gap_seconds`, `verdict` | Rule 5 as a query: which "lost" rows have a delivered twin (echoes) and which are true losses. |
 | `queries/dkim_alignment.kql` | `dkim_aligned`, `spf_only`, `spf_and_dkim` per sender | Who survives forwarding and who breaks at `p=reject`. Run before any reject move. |
 | `queries/impersonation.kql` | `display_name`, `from_domain`, `msgs`, `recipients` | External senders using your people's display names. What DMARC cannot stop (rule 10). |
@@ -150,7 +153,8 @@ Starter tasks, in order:
    `src/spf_lookups.py` before proposing any SPF include).
 3. **Override audit** - from the delivered-despite-failure CSV, list which
    policies and rules are propping up failing senders; those senders fail at
-   external receivers today.
+   external receivers today. A `collect.py` run already names them per sender
+   in `report.json` (the census's `delivered_by`).
 4. **Gate check** - before any policy ratchet, rerun the failures query at
    `--timespan P7D` and the DKIM-alignment query before any move to reject;
    whatever is still failing must be explained, fixed, or formally excepted
@@ -168,9 +172,9 @@ Starter tasks, in order:
 |---|---|---|
 | `next_steps.md`, `next_steps.json` | the status document: the one-liner, where we stand, what is failing, the per-domain table, actions by owner, the ask and the open questions; the JSON is the same content as data | start here; refine the generated copy, never rewrite it from memory (rule 13) |
 | `todo.md` | the prioritised list: holds to decide, zero-risk DNS rows, senders to fix DKIM-first, tenant findings, gated enforcement steps with prerequisites, exceptions in force | work it top to bottom; every line names the file with the evidence |
-| `report.json`, `report.md` | every finding with severity, evidence, action and `verified`; the gate per domain with its reasons; `gate.exceptions` (applied, expired, invalid); `gate.evidence.dkim_evidence`; `maillog.verdicts_omitted` and `rua.truncated` say what the JSON leaves out (`audit.py --keep-verdicts` keeps the verdicts) | cite finding ids and gate reasons, never raw rows; quote deduplicated and raw counts together |
+| `report.json`, `report.md` | every finding with severity, evidence, action and `verified`; the gate per domain with its reasons; `gate.exceptions` (applied, expired, invalid); `gate.evidence.dkim_evidence`; `maillog.verdicts_omitted` and `rua.truncated` say what the JSON leaves out (`audit.py --keep-verdicts` keeps the verdicts); `mailflow` (each audited domain's mail flow as the tenant measured it, `None` per domain when not measured); `maillog.counters.delivered_despite_fail_by` and the census's `delivered_by` (the override that let failing mail in); `maillog.window_totals` (a cut organization's full window, counted in advanced hunting; an answer that counts less than the rows kept is set aside and named in `maillog.window_totals_rejected`) | cite finding ids and gate reasons, never raw rows; quote deduplicated and raw counts together; quote a cut organization's floor and its full-window totals together, and say the verdicts rest on the floor |
 | `plan.json`, `plan.md` | the records to publish with current value, rollback and prerequisites | draft the change ticket from a row; the human applies it |
-| `summary.txt` | the Slack message: deltas vs the previous run (withheld, with a note, when the row budget or the API cap cut an organization's mail log in either run, or the mail-log spans or the outside views differ too much), newly identified senders, the trend | the status line; do not recompute it |
+| `summary.txt` | the Slack message: deltas vs the previous run (withheld, with a note, when the row budget or the API cap cut an organization's mail log in either run, or the mail-log spans or the outside views differ too much), newly identified senders, the trend; the overrides that let failing mail in, and for a domain under a cut organization its full-window totals beside its floor | the status line; do not recompute it |
 | `run.json` | notes, caveats (for example a truncated mail-log slice), degraded steps, strict reasons | say when a number is a floor because of a caveat |
 | `../metrics.json`, `../metrics.md` | one entry per run since day one | trend questions |
 | `../senders.json` | every sender identity ever seen with its first and last run | "is this sender new?" is answered here, never from one week's report |

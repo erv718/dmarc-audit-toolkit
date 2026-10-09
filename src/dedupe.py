@@ -25,7 +25,12 @@ failing rows are echoes of it.
 Delivery is a separate question from authentication. With --auth-column the
 report also lists messages that failed authentication but were DELIVERED (a
 local override let them through) and messages that passed but were BLOCKED or
-QUARANTINED (something other than DMARC caught them).
+QUARANTINED (something other than DMARC caught them). When the export records
+the local overrides (the Org level / User level policy and action columns
+queries/raw_maillog.kql writes), each delivered failure names the one that let
+it in, delivered_by, from its delivered failing leg: "org: <policy>
+(<action>)", else "user: <policy> (<action>)". Without those columns nothing
+changes.
 
 Every genuine failure gets a "likely" label from the heuristic table below:
 likely_spoof, likely_misconfigured_sender or unknown. It points the
@@ -61,6 +66,8 @@ override with the --*-column flags for other tools) with these columns:
                Subject, Sender mail from domain (a warning names any absent one)
     alignment: SPF and DKIM - used only when both are present, for the
                dkim_alignment buckets and the SPF-only sender list
+    overrides: Org level action, Org level policy, User level action, User
+               level policy - used when present, never warned about
 
 Exit codes: 0 clean, 1 findings at severity major or blocking, 2 usage or
 input error.
@@ -95,6 +102,20 @@ OPTIONAL_COLS = ("sender", "domain", "location", "subject", "envelope")
 INTERNAL_DIRECTIONS = ("intra-org", "outbound")
 ALIGNMENT_COLS = ("spf", "dkim")
 ALIGNMENT_BUCKETS = ("dkim_aligned", "spf_only", "spf_and_dkim")
+# The local overrides recorded on a leg (EmailEvents' OrgLevel*/UserLevel* columns, under the names
+# queries/raw_maillog.kql writes; a caller's cols may map a key elsewhere). Optional and silent: an
+# export without them reads exactly as before, and with them a delivered failure names what let it in.
+OVERRIDE_COLS = {"org_action": "Org level action", "org_policy": "Org level policy",
+                 "user_action": "User level action", "user_policy": "User level policy"}
+# Plain words for the overrides a reader meets most, by what the policy column says; first match
+# wins (the domain list before the sender list). Anything else is shown verbatim.
+OVERRIDE_WORDS = (
+    ("transport_rule", re.compile(r"transport rule|mail flow rule|\betr\b", re.I), "an Exchange transport rule"),
+    ("allowed_domains", re.compile(r"allowed (?:sender )?domain", re.I), "the allowed sender domain list"),
+    ("allowed_senders", re.compile(r"allowed sender", re.I), "the allowed sender list"),
+    ("spoof_allow", re.compile(r"spoof|tenant allow|\btabl\b", re.I), "a spoof allow / Tenant Allow Block List entry"),
+    ("safe_senders", re.compile(r"safe (?:sender|domain)", re.I), "a user's safe sender list"),
+)
 
 SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocking": 3}
 
@@ -189,6 +210,86 @@ def subject_template(subject):
     return re.sub(r"\d+", "0", re.sub(r"\s+", " ", (subject or "").strip().lower()))
 
 
+def _reached(action, location):
+    """One leg reached a mailbox: delivered, to the inbox, junk or deleted items."""
+    loc = (location or "").lower()
+    return action in PASS_ACTIONS and ("inbox" in loc or "junk" in loc or "deleted" in loc)
+
+
+def override_columns(cols, row):
+    """{key: column name} for the OVERRIDE_COLS this export carries (row: any row, for its header)."""
+    names = {k: (cols.get(k) or name) for k, name in OVERRIDE_COLS.items()}
+    return {k: n for k, n in names.items() if n in row}
+
+
+def leg_override(leg, ovr):
+    """What a leg's own record says let it in: 'org: <policy> (<action>)' when
+    its org-level policy is set, else 'user: <policy> (<action>)' when its
+    user-level policy is (no parentheses for an empty action), else None."""
+    for side in ("org", "user"):
+        policy = field(leg, ovr, side + "_policy")
+        if policy:
+            action = field(leg, ovr, side + "_action")
+            return "%s: %s%s" % (side, policy, " (%s)" % action if action else "")
+    return None
+
+
+def delivered_by(legs, auth, actions, locations, ovr):
+    """What let a delivered failure in, taken from its delivered failing leg:
+    the legs that reached a mailbox, the ones with a failing verdict first,
+    and the first of them whose record names an override (leg_override).
+    None when none does."""
+    reached = [i for i, (a, l) in enumerate(zip(actions, locations)) if _reached(a, l)]
+    for i in [i for i in reached if auth[i][1]] + [i for i in reached if not auth[i][1]]:
+        reason = leg_override(legs[i], ovr)
+        if reason:
+            return reason
+    return None
+
+
+def override_kind(reason):
+    """The common override a delivered_by reason names (an OVERRIDE_WORDS kind), or None."""
+    text = str(reason or "")
+    return next((kind for kind, rx, _ in OVERRIDE_WORDS if rx.search(text)), None)
+
+
+def override_words(reason):
+    """A delivered_by reason as a reader sees it: the common overrides in
+    plain words, anything else verbatim."""
+    text = str(reason or "").strip()
+    return next((words for _, rx, words in OVERRIDE_WORDS if rx.search(text)), text)
+
+
+def _whole(value):
+    """A count from a document that may have been edited by hand: a whole number >= 0, else 0."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def delivered_by_text(by, total=None, cap=4):
+    """'an Exchange transport rule x2, a user's safe sender list x1' from
+    {delivered_by reason: messages}: plain words (override_words; reasons
+    that read the same are added up), the most first, '+N more' past cap.
+    With total (the delivered-despite-fail count they belong to), the
+    messages no reason covers follow: '; no override recorded for 1'. ''
+    when no reason is known: the reader keeps its words from before."""
+    merged = Counter()
+    for reason, n in (by.items() if isinstance(by, dict) else ()):
+        if str(reason or "").strip() and _whole(n):
+            merged[override_words(reason)] += _whole(n)
+    if not merged:
+        return ""
+    parts = ["%s x%d" % kv for kv in sorted(merged.items(), key=lambda kv: (-kv[1], kv[0]))]
+    if len(parts) > cap:
+        parts = parts[:cap] + ["+%d more" % (len(parts) - cap)]
+    rest = _whole(total) - sum(merged.values()) if total is not None else 0
+    return ", ".join(parts) + ("; no override recorded for %d" % rest if rest > 0 else "")
+
+
 def count_rows(rows, cols, sender_domain=None, auth_column=None):
     """Row-level tallies before any grouping. This is what 'counting rows' sees."""
     sender_domain = (sender_domain or "").strip().lower() or None
@@ -264,10 +365,7 @@ def classify(rows, cols, sender_domain=None, auth_column=None, vendor_domains=No
         anyfail = any(f for _, f in auth)
         internal = key[0] not in external  # every leg of this Message-ID, for every recipient, stayed inside
 
-        reached_mailbox = any(
-            a in PASS_ACTIONS and ("inbox" in l.lower() or "junk" in l.lower() or "deleted" in l.lower())
-            for a, l in zip(actions, locations)
-        )
+        reached_mailbox = any(_reached(a, l) for a, l in zip(actions, locations))
         relayed_only = (
             any("on-prem" in l.lower() or "external" in l.lower() for l in locations)
             and not reached_mailbox
@@ -301,6 +399,10 @@ def classify(rows, cols, sender_domain=None, auth_column=None, vendor_domains=No
             "likely": None,
             "likely_signals": [],
         }
+        ovr = override_columns(cols, legs[0])
+        if ovr:  # the export records the local overrides: a delivered failure says which one let it in
+            verdicts[key]["delivered_by"] = (delivered_by(legs, auth, actions, locations, ovr)
+                                             if verdicts[key]["delivered_despite_fail"] else None)
     label_failures(verdicts, vendor_domains)
     return verdicts
 
@@ -380,20 +482,28 @@ def spf_only_senders(verdicts):
 
 
 def summarize(verdicts):
-    """Message-level counters over the verdicts."""
+    """Message-level counters over the verdicts. delivered_despite_fail_by
+    ({delivered_by reason: messages}, the most first) is there only when at
+    least one delivered failure names the override that let it in."""
     vs = list(verdicts.values())
     by_likely = Counter(v["likely"] for v in vs if v["genuine_failure"])
-    return {
+    by_override = Counter(v["delivered_by"] for v in vs if v["delivered_despite_fail"] and v.get("delivered_by"))
+    out = {
         "logical_messages": len(vs),
         "multi_leg": sum(1 for v in vs if v["legs"] > 1),
         "genuine_failures": sum(1 for v in vs if v["genuine_failure"]),
         "echo_messages": sum(1 for v in vs if v["echo_present"]),
         "relayed_only": sum(1 for v in vs if v["relayed_only"]),
         "delivered_despite_fail": sum(1 for v in vs if v["delivered_despite_fail"]),
+    }
+    if by_override:
+        out["delivered_despite_fail_by"] = dict(sorted(by_override.items(), key=lambda kv: (-kv[1], kv[0])))
+    out.update({
         "blocked_despite_pass": sum(1 for v in vs if v["blocked_despite_pass"]),
         "by_likely": {k: by_likely.get(k, 0) for k in LIKELY_LABELS},
         "alignment": alignment_summary(vs),
-    }
+    })
+    return out
 
 
 def _dominant(counter):
@@ -415,8 +525,14 @@ def census(verdicts):
     failures not excepted) and likely_after (their majority label, None when
     none is left). Per envelope: excepted, likely_after, senders_after (the
     senders with a failure left) and sample_sender_after. Every other field
-    counts every failure, excepted or not."""
+    counts every failure, excepted or not.
+
+    Local overrides: when the verdicts carry delivered_by (the export
+    recorded the overrides), each stream says what let its delivered
+    failures in, delivered_by ({reason: messages}), over the same messages
+    as its delivered_despite_fail."""
     vs = list(verdicts.values()) if isinstance(verdicts, dict) else list(verdicts)
+    overrides = any("delivered_by" in v for v in vs)
     envs, senders = {}, {}
     for v in vs:
         env = (v.get("envelope_domain") or "").strip().lower() or "(blank)"
@@ -430,11 +546,13 @@ def census(verdicts):
         e["all"][sender] += 1
         s = senders.setdefault((sender, dom, env), {"messages": 0, "genuine_failures": 0, "likely": Counter(),
                                                     "delivered_despite_fail": 0, "excepted": 0,
-                                                    "excepted_delivered": 0, "after": Counter(),
+                                                    "excepted_delivered": 0, "after": Counter(), "by": Counter(),
                                                     "subject": v.get("subject") or "", "fail_subject": None})
         s["messages"] += 1
         if v.get("delivered_despite_fail"):
             s["delivered_despite_fail"] += 1
+            if v.get("delivered_by"):
+                s["by"][str(v["delivered_by"])] += 1
         if failing:
             e["genuine_failures"] += 1
             e["fail"][sender] += 1
@@ -457,14 +575,18 @@ def census(verdicts):
                "excepted": e["excepted"], "likely_after": _dominant(e["after"]),
                "senders_after": len(e["fail_after"]), "sample_sender_after": _dominant(e["fail_after"])}
               for env, e in envs.items()]
-    by_sender = [{"sender": sender, "domain": dom, "envelope_domain": env,
-                  "genuine_failures": s["genuine_failures"], "messages": s["messages"],
-                  "delivered_despite_fail": s["delivered_despite_fail"],
-                  "likely": _dominant(s["likely"]),
-                  "sample_subject": s["fail_subject"] if s["fail_subject"] is not None else s["subject"],
-                  "excepted": s["excepted"], "excepted_delivered": s["excepted_delivered"],
-                  "likely_counts": dict(sorted(s["after"].items())), "likely_after": _dominant(s["after"])}
-                 for (sender, dom, env), s in senders.items()]
+    by_sender = []
+    for (sender, dom, env), s in senders.items():
+        row = {"sender": sender, "domain": dom, "envelope_domain": env,
+               "genuine_failures": s["genuine_failures"], "messages": s["messages"],
+               "delivered_despite_fail": s["delivered_despite_fail"]}
+        if overrides:
+            row["delivered_by"] = dict(sorted(s["by"].items(), key=lambda kv: (-kv[1], kv[0])))
+        row.update({"likely": _dominant(s["likely"]),
+                    "sample_subject": s["fail_subject"] if s["fail_subject"] is not None else s["subject"],
+                    "excepted": s["excepted"], "excepted_delivered": s["excepted_delivered"],
+                    "likely_counts": dict(sorted(s["after"].items())), "likely_after": _dominant(s["after"])})
+        by_sender.append(row)
     by_env.sort(key=lambda r: (-r["genuine_failures"], -r["messages"], r["envelope_domain"]))
     by_sender.sort(key=lambda r: (-r["genuine_failures"], -r["messages"], r["sender"], r["envelope_domain"]))
     return {"by_envelope": by_env, "by_sender": by_sender}
@@ -500,9 +622,10 @@ def build_findings(c, verdicts, auth_column=None, missing_optional=(), sender_do
             "never report the raw row count")
     if c["delivered_despite_fail"]:
         items = [(k, v) for k, v in verdicts.items() if v["delivered_despite_fail"]]
+        by = delivered_by_text(c.get("delivered_despite_fail_by"), len(items))  # '' when no leg named one
         add("MAILFLOW-002", "major",
             "%d messages failed authentication but reached a mailbox" % len(items),
-            _sample(items),
+            ("let in by %s; " % by if by else "") + _sample(items),
             "find the override (transport rule, allow list, safe sender) and make it conditional on "
             "authentication; external receivers do not have this override")
     if c["blocked_despite_pass"]:
@@ -592,9 +715,10 @@ def _more(pairs):
 
 def _fmt_msg(key, v):
     legs = "; ".join("%s/%s" % (a or "?", l or "?") for a, l in zip(v["actions"], v["locations"]))
-    return "%s -> %s  \"%s\"  %s  envelope=%s%s" % (
+    return "%s -> %s  \"%s\"  %s  envelope=%s%s%s" % (
         v["sender"] or "(no sender)", key[1] or "(no recipient)", v["subject"] or "(no subject)",
-        legs, v["envelope_domain"] or "(none)", ("  " + v["likely"]) if v["likely"] else "")
+        legs, v["envelope_domain"] or "(none)", ("  " + v["likely"]) if v["likely"] else "",
+        ("  let in by " + override_words(v["delivered_by"])) if v.get("delivered_by") else "")
 
 
 def _list(title, why, items, top):
@@ -642,6 +766,9 @@ def print_report(c, verdicts, findings, auth_column=None, top=20):
         print(f"delivery vs authentication (auth column: {auth_column}):")
         print(f"  failed authentication but DELIVERED           : {c['delivered_despite_fail']}"
               + paint.dim("   <-- a local override let these through"))
+        by = delivered_by_text(c.get("delivered_despite_fail_by"), c["delivered_despite_fail"])
+        if by:
+            print(f"    let in by: {by}")
         print(f"  passed authentication but BLOCKED/QUARANTINED : {c['blocked_despite_pass']}"
               + paint.dim("   <-- something other than DMARC caught these"))
     print()

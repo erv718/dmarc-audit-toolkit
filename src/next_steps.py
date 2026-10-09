@@ -24,7 +24,15 @@ no number of days is ever assumed. --audience replaces the default first
 sentence of the audience line. What audit.toml formally excepts comes off
 every list that names senders exactly as the census counts it per stream,
 and is listed once, as excepted; the gate's verdict decides whether the
-next step reads ready, on hold, or in need of more data.
+next step reads ready, on hold, or in need of more data. When the mail log
+recorded the local overrides, mail delivered despite failing names the one
+that let it in (maillog.counters.delivered_despite_fail_by, the census's
+delivered_by), and each sender's action says what to change; the
+per-domain table says what the tenant measured of each domain's mail flow
+(report.mailflow) or that it was not measured; for an organization whose
+rows the row budget cut, the genuine-failure line adds the full-window
+totals counted in advanced hunting (maillog.window_totals) beside the
+floor, which every verdict still rests on.
 
 Owners file (default <repo root>/owners.csv, gitignored; see
 samples/owners.csv.example): CSV with columns pattern,owner,channel,note.
@@ -56,6 +64,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import audit  # the delta's own rules: the recorded cuts, a window's span, which spans compare
+import dedupe  # the overrides that let a delivered failure in, in plain words
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = "0.5"
@@ -596,6 +605,34 @@ def truncation_note(ml):
     return None
 
 
+def full_window(report):
+    """What collect.py counted in advanced hunting over the whole window for
+    the organizations whose rows its row budget or the API cap cut
+    (maillog.window_totals), added up over their From domains: {"orgs",
+    "hours", "span", "genuine_failures", "delivered_despite_fail"}; None
+    when the report carries none. Beside the floor, never instead of it."""
+    ml = report.get("maillog") if isinstance(report.get("maillog"), dict) else {}
+    wt = ml.get("window_totals") if isinstance(ml.get("window_totals"), dict) else {}
+    orgs = wt.get("orgs") if isinstance(wt.get("orgs"), dict) else {}
+    names, gf, ddf = [], 0, 0
+    for org, info in sorted(orgs.items()):
+        bd = info.get("by_domain") if isinstance(info, dict) else None
+        if not isinstance(bd, dict):
+            continue
+        names.append(str(org))
+        for c in bd.values():
+            if isinstance(c, dict):
+                gf += max(0, _n(c.get("genuine_failures")) or 0)
+                ddf += max(0, _n(c.get("delivered_despite_fail")) or 0)
+    if not names:
+        return None
+    hours = _f(wt.get("hours"))
+    if hours is not None and not 0 < hours < float("inf"):  # nan, an infinity, zero or less: an unnamed span
+        hours = None
+    return {"orgs": names, "hours": hours, "span": audit._hours_text(hours) if hours else "window",
+            "genuine_failures": gf, "delivered_despite_fail": ddf}
+
+
 def _carries_exceptions(obj):
     """True when census rows carry the exception counts (an audit.py that marks excepted verdicts)."""
     rows = obj.values() if isinstance(obj, dict) else (obj if isinstance(obj, list) else [])
@@ -710,8 +747,8 @@ def maillog_view(report):
         unsplit = sum(_n(g.get("excepted_failures")) or 0 for g in doms.values() if isinstance(g, dict))
     view["excepted_unsplit"] = 0 if counted else unsplit
     # delivered despite failing, per sender: what the exceptions left (an excepted sender is not told to
-    # find its override), with how many the exceptions cover
-    ddf, env_of, ddf_excepted = Counter(), {}, 0
+    # find its override), with how many the exceptions cover, and what let the rest in when the log says
+    ddf, env_of, ddf_excepted, by = Counter(), {}, 0, {}
     for v in verdicts:
         if not v.get("delivered_despite_fail"):
             continue
@@ -721,6 +758,8 @@ def maillog_view(report):
         s = (v.get("sender") or "(no sender)").lower()
         ddf[s] += 1
         env_of.setdefault(s, v.get("envelope_domain") or "")
+        if v.get("delivered_by"):
+            by.setdefault(s, Counter())[str(v["delivered_by"])] += 1
     if not verdicts:  # report.json carries the census, not the verdicts: the census names them per sender stream
         raw = census.get("by_sender") if isinstance(census, dict) else None
         for r in raw if isinstance(raw, list) else []:
@@ -733,10 +772,22 @@ def maillog_view(report):
                 s = str(r.get("sender") or "(no sender)").lower()
                 ddf[s] += n - gone
                 env_of.setdefault(s, str(r.get("envelope_domain") or ""))
-    view["ddf_senders"] = [{"name": s, "count": n, "domain": (s.rpartition("@")[2] if "@" in s else ""),
-                            "envelope": env_of.get(s, "")}
+                # a stream's overrides are counted over all of its messages: they are what is left only when
+                # no exception covered any of them (an exception covers a stream whole: its address or envelope)
+                if not gone and isinstance(r.get("delivered_by"), dict):
+                    for reason, k in r["delivered_by"].items():
+                        if reason and (_n(k) or 0) > 0:
+                            by.setdefault(s, Counter())[str(reason)] += _n(k)
+    view["ddf_senders"] = [dict({"name": s, "count": n, "domain": (s.rpartition("@")[2] if "@" in s else ""),
+                                 "envelope": env_of.get(s, "")}, **({"by": dict(by[s])} if by.get(s) else {}))
                            for s, n in sorted(ddf.items(), key=lambda kv: (-kv[1], kv[0]))]
     view["delivered_excepted"] = ddf_excepted
+    # the whole log's overrides, over every delivered failure as the count beside them (excepted or not)
+    whole = counters.get("delivered_despite_fail_by")
+    if not isinstance(whole, dict):  # a report from before the counter, or a damaged one: the verdicts, if any
+        whole = Counter(str(v["delivered_by"]) for v in verdicts
+                        if v.get("delivered_despite_fail") and v.get("delivered_by"))
+    view["ddf_by"] = {str(k): _n(n) for k, n in whole.items() if k and (_n(n) or 0) > 0}
     for s in view["by_sender"]:
         s["likely"] = s.get("likely") or "unknown"
     return view
@@ -1740,6 +1791,13 @@ def where_we_stand(report, view, trend, window=None):
             text += ", over %s" % span
         if view["truncation"]:
             text += "; the log export was cut short (%s), so this count is a floor" % view["truncation"]
+        full = full_window(report)
+        if full:  # beside the floor, never instead of it: every verdict still rests on the rows kept
+            data["window_totals"] = full
+            text += ("; over the full %s, counted in Advanced Hunting: %d genuine %s, %d delivered despite failing "
+                     "under %s (the gate, the census, the labels and the plan still use the rows kept)"
+                     % (full["span"], full["genuine_failures"], _plural(full["genuine_failures"], "failure"),
+                        full["delivered_despite_fail"], audit._names(full["orgs"])))
         if not view["auth_column"]:
             text += ("; the export carried no authentication column, so failure here means never delivered "
                      "rather than failed DMARC")
@@ -1749,17 +1807,23 @@ def where_we_stand(report, view, trend, window=None):
         data["delivered_despite_fail_senders"] = view["ddf_senders"][:3]
         gone = view.get("delivered_excepted") or 0
         data["delivered_despite_fail_excepted"] = gone
+        # what let them in, when the log recorded it (an export without the override columns says nothing new)
+        by = dedupe.delivered_by_text(view.get("ddf_by"), ddf) if ddf else ""
+        if by:
+            data["delivered_despite_fail_by"] = dict(view["ddf_by"])
         if ddf is None:
             lines.append("**Delivered despite failing: not in this run**")
         elif ddf and gone >= ddf:  # every one is formally excepted: the override that delivers them is accepted
             lines.append("**Delivered despite failing: %d** - all formally excepted in audit.toml; our own overrides "
-                         "deliver them, and that stays accepted until the exceptions expire" % ddf)
+                         "deliver them%s, and that stays accepted until the exceptions expire"
+                         % (ddf, (" (%s)" % by) if by else ""))
         else:
             text = "**Delivered despite failing: %d**" % ddf
             if gone:
                 text += " (%d of them formally excepted in audit.toml)" % gone
             if ddf:
-                text += " - these only arrive because of our own overrides; outside receivers are not as forgiving"
+                text += (" - these only arrive because of our own overrides%s; outside receivers are not as forgiving"
+                         % ((" (%s)" % by) if by else ""))
                 if view["ddf_senders"]:
                     text += " (%s)" % ", ".join("%s x%d" % (s["name"], s["count"]) for s in view["ddf_senders"][:3])
             lines.append(text)
@@ -1956,6 +2020,8 @@ def per_domain(report, plan):
     names.sort(key=lambda d: (org_domain(d), d != org_domain(d), d))
     bd = (report.get("maillog") or {}).get("by_domain") if isinstance(report.get("maillog"), dict) else None
     bd = bd if isinstance(bd, dict) else {}
+    mf = report.get("mailflow") if isinstance(report.get("mailflow"), dict) else {}
+    flows = mf.get("domains") if isinstance(mf.get("domains"), dict) else {}  # what collect.py measured, per name
     rows = []
     for d in names:
         policy, _pct = policy_text(report, d)
@@ -1984,35 +2050,98 @@ def per_domain(report, plan):
             step = audit_step
         else:
             step = "not audited in this run"
+        flow = flows.get(d) if isinstance(flows.get(d), dict) else None
         rows.append({"domain": d, "apex": org_domain(d), "policy_today": policy, "gate": gate, "gate_text": gate_text,
                      "next_step": plain(step), "plan_ids": ids,
                      "maillog": ({k: _n(ml.get(k)) for k in ("logical_messages", "genuine_failures",
-                                                              "delivered_despite_fail")} if ml else None)})
+                                                              "delivered_despite_fail")} if ml else None),
+                     "mailflow": flow, "mailflow_text": audit.mailflow_text(flow, mf.get("days"))})
     grouped = OrderedDict()
     for r in rows:
         if r["domain"] == r["apex"]:
             key = ("apex", r["domain"])
-        else:
-            key = ("sub", r["apex"], r["policy_today"], r["gate"], r["next_step"])
+        else:  # subdomains share a row only when they also share what their mail flow says
+            key = ("sub", r["apex"], r["policy_today"], r["gate"], r["next_step"], r["mailflow_text"])
         grp = grouped.setdefault(key, {"domains": [], "policy_today": r["policy_today"], "gate": r["gate"],
                                        "gate_text": r["gate_text"], "next_step": r["next_step"], "plan_ids": [],
-                                       "maillog": {}})
+                                       "maillog": {}, "mailflow_text": r["mailflow_text"], "mailflow": {}})
         grp["domains"].append(r["domain"])
         grp["plan_ids"] += r["plan_ids"]
         if r["maillog"]:
             grp["maillog"][r["domain"]] = r["maillog"]
+        if r["mailflow"]:
+            grp["mailflow"][r["domain"]] = r["mailflow"]
     return list(grouped.values())
 
 
 def render_per_domain(groups):
-    L = ["| Domain | Policy today | Gate | Next step |", "|---|---|---|---|"]
+    L = ["| Domain | Policy today | Gate | Next step | Mail flow |", "|---|---|---|---|---|"]
     for g in groups:
         step = g["next_step"]
         if g["plan_ids"]:
             step += " (plan %s)" % id_range(g["plan_ids"])
-        L.append("| %s | %s | %s | %s |" % (", ".join("`%s`" % d for d in g["domains"]), g["policy_today"],
-                                          g.get("gate_text") or g["gate"], step))
+        L.append("| %s | %s | %s | %s | %s |" % (", ".join("`%s`" % d for d in g["domains"]), g["policy_today"],
+                                               g.get("gate_text") or g["gate"], step,
+                                               g.get("mailflow_text") or "not measured"))
     return L
+
+
+def mailflow_note(report):
+    """The sentence under the per-domain table: what its mail-flow column
+    counts, and the mail it can never see - a third party sending as one of
+    our domains straight to outside recipients, which only the aggregate
+    reports show."""
+    mf = report.get("mailflow") if isinstance(report.get("mailflow"), dict) else {}
+    doms = mf.get("domains") if isinstance(mf.get("domains"), dict) else {}
+    measured = any(isinstance(c, dict) for c in doms.values())
+    unseen = ("Mail a third party sends as one of our domains straight to outside recipients never passes through "
+              "our tenant, so only the aggregate reports show it.")
+    if not measured:
+        return ("Mail flow was not measured in this run (it is counted in our tenant on every run that can reach "
+                "it). " + unseen)
+    return ("Mail flow is what passed through our own tenant in %s with that domain as the sender: out is "
+            "mail our people and systems sent, in is mail that arrived from outside (a vendor sending for us, or "
+            "a spoof); the counts are close estimates, and zero means none. %s"
+            % (audit._last_days_text(mf.get("days")), unseen))
+
+
+# What to do about each common override (dedupe.OVERRIDE_WORDS' kinds) a delivered failure names.
+OVERRIDE_FIXES = {
+    "transport_rule": "find that rule and make it conditional on authentication",
+    "allowed_senders": "take the sender off the allowed sender list in the anti-spam policy",
+    "allowed_domains": "take the domain off the allowed sender domain list in the anti-spam policy",
+    "spoof_allow": "fix the sender's authentication, then remove that allow entry",
+    "safe_senders": "ask the mailbox owners to take the sender off their safe sender lists",
+}
+OVERRIDE_FIX_OTHER = "find that override and make it conditional on authentication"
+
+
+def override_action(by, count):
+    """The action for a sender delivered despite failing, from what let its
+    messages in ({delivered_by reason: messages} over count messages):
+    'delivered because of an Exchange transport rule: find that rule and
+    make it conditional on authentication; outside receivers do not have
+    it'. Several overrides are named with their counts, and messages that
+    name none are named as such. None when no override is known: the
+    generic action stands."""
+    merged = OrderedDict()  # plain words -> [messages, kind]
+    for reason, n in sorted(((str(r), _n(n) or 0) for r, n in (by or {}).items()), key=lambda kv: (-kv[1], kv[0])):
+        if reason and n > 0:
+            words = dedupe.override_words(reason)
+            m = merged.setdefault(words, [0, dedupe.override_kind(reason)])
+            m[0] += n
+    if not merged:
+        return None
+    rest = (count or 0) - sum(m[0] for m in merged.values())
+    single = len(merged) == 1 and rest <= 0
+    causes = [(w if kind else '"%s"' % w) + ("" if single else " (%d)" % n) for w, (n, kind) in merged.items()]
+    because = audit._names(causes)
+    fixes = list(dict.fromkeys(OVERRIDE_FIXES.get(kind, OVERRIDE_FIX_OTHER) for n, kind in merged.values()))
+    if rest > 0:
+        because += ", and the log names no override for the other %d" % rest
+        fixes.append("find what let the other %d in (a transport rule, an allow list or a safe sender list)" % rest)
+    return "delivered because of %s: %s; outside receivers do not have %s" % (
+        because, "; ".join(fixes), "it" if single else "them")
 
 
 def build_actions(report, plan, view, owners):
@@ -2099,8 +2228,10 @@ def build_actions(report, plan, view, owners):
         ddf = view["ddf_senders"]  # what the exceptions left: an excepted sender's override is accepted
         for s in ddf[:TOP_ENTRIES]:
             hook = "%s - %d %s reached inboxes despite failing" % (s["name"], s["count"], _plural(s["count"], "message"))
-            action = ("find the override (transport rule, allow list, safe sender) that let them in and make it "
-                      "conditional on authentication; outside receivers do not have it")
+            # the override the log recorded for them, named; else the ones to look for
+            action = override_action(s.get("by"), s["count"]) or (
+                "find the override (transport rule, allow list, safe sender) that let them in and make it "
+                "conditional on authentication; outside receivers do not have it")
             items.append({"kind": "override", "keys": [s["name"], s.get("domain"), s.get("envelope")], "ref": ref,
                           "sender": s["name"], "hook": hook, "action": action})
         rest = ddf[TOP_ENTRIES:]
@@ -2245,7 +2376,9 @@ def build_ask(plan, org, nxt, policy):
         ids = [c.get("id") for c in p1 if c.get("id")]
         text = ("approval to publish the %d zero-risk %s (plan %s) in the next DNS change window"
                 % (len(p1), _plural(len(p1), "record"), id_range(ids)))
-        park = sum(1 for c in p1 if c.get("kind") == "park")
+        # a park row the plan verified unused needs no check; the others say which checks are open
+        park = sum(1 for c in p1 if c.get("kind") == "park"
+                   and not any(str(p).startswith("verified unused") for p in prereqs_of(c)))
         if park:
             text += ", of which %d %s the domain's unused check first" % (
                 park, "is a park row that needs" if park == 1 else "are park rows that need")
@@ -2444,6 +2577,7 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
         "stand": stand,
         "failing": dict(failing, lines=failing_lines, streams=strm_data),
         "per_domain": domains,
+        "mailflow": {"days": audit._dict(report.get("mailflow")).get("days"), "note": mailflow_note(report)},
         "actions_by_owner": groups,
         "ask": ask,
         "open_questions": questions,
@@ -2482,6 +2616,9 @@ def render_md(doc):
     L.append("")
     if doc["per_domain"]:
         L += render_per_domain(doc["per_domain"])
+        if (doc.get("mailflow") or {}).get("note"):
+            L.append("")
+            L.append(doc["mailflow"]["note"])
     else:
         L.append("No domain was audited in this run.")
     notes = [n for n in ((doc.get("next_step") or {}).get("notes") or []) if SHOWN_NOTES.match(n)]

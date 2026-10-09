@@ -15,6 +15,9 @@ every source that named it):
 For every domain the inventory records which sources named it, whether the
 tenant has verified it, and the DNS zone host (Route53, CSC, Cloudflare,
 Azure DNS, ...), which is what decides how a change gets made. Read-only.
+collect.py also measures the mail flow of every name it audits, the
+organizational domains included (row["mailflow"]), with the token it
+already holds: one aggregate query per run.
 
   python src/discover.py                       # tenant domains only
   python src/discover.py example.com --mailflow --out exports
@@ -193,8 +196,83 @@ def graph_domains(env_file=None):
         return [], "tenant lookup failed: %s" % err
 
 
+# a name the mail-flow query did not return: measured, and nothing seen
+MAILFLOW_NONE = {"messages": 0, "outbound": 0, "inbound": 0, "last_seen": None}
+
+
+def mailflow_kql(org_domains, days=30):
+    """The mail-flow aggregate: per header-from domain under the given
+    organizational domains - each organization itself and every subdomain of
+    it - the messages seen in the last `days` days, how many left from inside
+    the tenant (outbound: Outbound or Intra-org), how many came in from
+    outside (inbound), and when the last one was seen."""
+    cond = " or ".join('d == "{0}" or d endswith ".{0}"'.format(normalize(o).replace('"', "")) for o in org_domains)
+    return (
+        "EmailEvents\n"
+        "| where Timestamp > ago(%dd)\n"
+        "| extend d = tolower(SenderFromDomain)\n"
+        "| where %s\n"
+        "| summarize messages = dcount(InternetMessageId),\n"
+        "            outbound = dcountif(InternetMessageId, EmailDirection in~ (\"Outbound\", \"Intra-org\")),\n"
+        "            inbound = dcountif(InternetMessageId, EmailDirection =~ \"Inbound\"),\n"
+        "            last_seen = max(Timestamp)\n"
+        "    by d\n"
+        "| order by messages desc" % (days, cond)
+    )
+
+
+def _count(value):
+    """A count in the hunting answer: a whole number >= 0 (a long may come
+    as text), else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() and value >= 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def mailflow_counts(tok, org_domains, days=30):
+    """({name: {"messages", "outbound", "inbound", "last_seen"}}, None) for
+    every name under the given organizational domains - the organization
+    itself and its subdomains - that appeared as the header-from domain in
+    the last `days` days, from one mailflow_kql query run with a token
+    already in hand (no sign-in here). A name the answer leaves out sent and
+    received nothing the tenant saw. (None, why) when the query failed or
+    answered something else - no results list, rows that are not the
+    counts, a count that is not a whole number: then nothing counts as
+    measured, and nothing reads as zero."""
+    import graph_client
+    orgs = [o for o in dict.fromkeys(normalize(o) for o in org_domains or ()) if o]
+    if not orgs:
+        return {}, None
+    try:
+        result = graph_client.hunting(tok, mailflow_kql(orgs, days), "P%dD" % days)
+    except graph_client.GraphError as err:
+        return None, str(err)
+    results = result.get("results") if isinstance(result, dict) else None
+    if not isinstance(results, list):  # an empty list is an answer (nothing seen); no list is none
+        return None, "the answer carries no results"
+    if any(not isinstance(r, dict) for r in results) or (results and not any("d" in r for r in results)):
+        return None, "the answer is not the mail-flow counts the query asks for"
+    counts = {}
+    for r in results:
+        d = normalize(r.get("d") or "")
+        if d and DOMAIN_RE.match(d) and any(d == o or d.endswith("." + o) for o in orgs):
+            n = {k: _count(r.get(k)) for k in ("messages", "outbound", "inbound")}
+            if None in n.values():
+                return None, "the answer's counts for %s are not whole numbers" % d
+            counts[d] = dict(n, last_seen=r.get("last_seen"))
+    return counts, None
+
+
 def mailflow_subdomains(org_domains, env_file=None, days=30):
-    """Subdomains of the given organizational domains seen in mail flow.
+    """Subdomains of the given organizational domains seen in mail flow,
+    signing in with the credentials in .env (collect.py measures with the
+    token it already holds: discover(tok=...)).
 
     Every row is a subdomain that appeared as the header-from domain in the
     window, with message counts by direction. Outbound or Intra-org volume
@@ -211,37 +289,29 @@ def mailflow_subdomains(org_domains, env_file=None, days=30):
         return [], str(err)
     if cred is None:
         return [], "no credentials in .env - mail-flow expansion skipped"
-    cond = " or ".join('d endswith ".%s"' % o.replace('"', "") for o in orgs)
-    kql = (
-        "EmailEvents\n"
-        "| where Timestamp > ago(%dd)\n"
-        "| extend d = tolower(SenderFromDomain)\n"
-        "| where %s\n"
-        "| summarize messages = dcount(InternetMessageId),\n"
-        "            outbound = dcountif(InternetMessageId, EmailDirection in~ (\"Outbound\", \"Intra-org\")),\n"
-        "            inbound = dcountif(InternetMessageId, EmailDirection =~ \"Inbound\"),\n"
-        "            last_seen = max(Timestamp)\n"
-        "    by d\n"
-        "| order by messages desc" % (days, cond)
-    )
     try:
         tok = graph_client.token(cred)
-        result = graph_client.hunting(tok, kql, "P%dD" % days)
     except graph_client.GraphError as err:
         return [], "mail-flow expansion failed: %s" % err
-    rows = []
-    for r in result.get("results") or []:
-        d = normalize(r.get("d", ""))
-        if d and DOMAIN_RE.match(d):
-            rows.append({"domain": d, "messages": r.get("messages", 0),
-                         "outbound": r.get("outbound", 0), "inbound": r.get("inbound", 0),
-                         "last_seen": r.get("last_seen")})
-    return rows, None
+    counts, why = mailflow_counts(tok, orgs, days)
+    if counts is None:
+        return [], "mail-flow expansion failed: %s" % why
+    subs = sorted((d for d in counts if d not in orgs), key=lambda d: (-counts[d]["messages"], d))
+    return [dict({"domain": d}, **counts[d]) for d in subs], None
 
 
 def discover(domains=(), domain_file=None, use_graph=True, mailflow=False,
-             resolver_addr="8.8.8.8", env_file=None, ns_lookup=True):
-    """Build the inventory. Returns (inventory list, notes list)."""
+             resolver_addr="8.8.8.8", env_file=None, ns_lookup=True, tok=None, days=30):
+    """Build the inventory. Returns (inventory list, notes list).
+
+    tok: a token the caller already holds (collect.py's). With it one
+    aggregate query (mailflow_counts) measures the last `days` days of mail
+    flow for every name in the inventory, the organizational domains
+    themselves included: row["mailflow"] holds the counts, zeros for a name
+    the query saw nothing from, and stays None when the query failed (not
+    measured). mailflow=True then adds the subdomains that query saw,
+    without a second sign-in. Without tok, mailflow=True signs in to run
+    the query itself and only the subdomains it adds carry counts."""
     notes = []
     inv = {}
 
@@ -283,9 +353,26 @@ def discover(domains=(), domain_file=None, use_graph=True, mailflow=False,
         if tenant:
             notes.append("tenant: %d domains (%d verified)" % (len(tenant), sum(1 for t in tenant if t["verified"])))
 
-    if mailflow:
+    if tok is not None and inv:
         orgs = sorted({row["org_domain"] for row in inv.values()})
-        rows, note = mailflow_subdomains(orgs, env_file)
+        counts, why = mailflow_counts(tok, orgs, days)
+        if counts is None:
+            notes.append("mail flow not measured: %s" % why)
+        else:
+            subs = sorted((d for d in counts if d not in orgs), key=lambda d: (-counts[d]["messages"], d))
+            if mailflow:
+                for d in subs:
+                    add(d, "mailflow")
+                if subs:
+                    notes.append("mail flow: %d sending domains under %s" % (len(subs), ", ".join(orgs)))
+            for row in inv.values():
+                row["mailflow"] = dict(counts.get(row["domain"]) or MAILFLOW_NONE)
+            busy = sum(1 for row in inv.values() if row["mailflow"]["messages"])
+            notes.append("mail flow over the last %d days measured for %d domains (%d sent or received mail, "
+                          "%d none)" % (days, len(inv), busy, len(inv) - busy))
+    elif mailflow:
+        orgs = sorted({row["org_domain"] for row in inv.values()})
+        rows, note = mailflow_subdomains(orgs, env_file, days)
         if note:
             notes.append(note)
         for r in rows:
