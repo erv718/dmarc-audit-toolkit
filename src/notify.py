@@ -34,6 +34,7 @@ Exit codes: 0 posted or printed, 1 the post failed, 2 usage error.
 """
 
 import argparse
+import ipaddress
 import json
 import os
 import sys
@@ -134,6 +135,43 @@ def ip_check_ran(rua):
     if "ip_check" in known:
         return known["ip_check"] is True
     return bool(known.get("given") and known.get("networks"))
+
+
+def unknown_counts(rua):
+    """(ip entries, signing-domain entries, how many IPs, how many signing
+    domains) in rua.unknown_senders. The per-IP check's result is the ip
+    entries alone: a signing domain's counts are signatures on those same
+    messages, so it never adds to the sender count. When audit.py capped the
+    table to its busiest rows the kept entries are a part of the list: the IPs
+    are then recounted over every source the outside view saw (rua.source_ips,
+    else by_source_ip) that no listed prefix covers, and the signing domains
+    are the rest of the table's total."""
+    unk = [u for u in (rua.get("unknown_senders") or []) if u]
+    doms = [u for u in unk if isinstance(u, dict) and u.get("kind") == "dkim_domain"]
+    ips = [u for u in unk if not (isinstance(u, dict) and u.get("kind") == "dkim_domain")]
+    cut = rua.get("truncated") if isinstance(rua.get("truncated"), dict) else {}
+    table = cut.get("unknown_senders") if isinstance(cut.get("unknown_senders"), dict) else None
+    if table is None:
+        return ips, doms, len(ips), len(doms)
+    flt = rua.get("filters") if isinstance(rua.get("filters"), dict) else {}
+    known = flt.get("known") if isinstance(flt.get("known"), dict) else {}
+    nets = []
+    for n in known.get("networks") if isinstance(known.get("networks"), list) else []:
+        try:
+            nets.append(ipaddress.ip_network(str(n), strict=False))
+        except ValueError:
+            continue
+
+    def outside(ip):
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return True  # an address the check could not read is listed as unknown there too
+        return not any(addr.version == net.version and addr in net for net in nets)
+
+    n_ips = max(len(ips), sum(1 for ip in source_ips({"rua": rua}) if outside(ip)))
+    total = _whole(table.get("total"))
+    return ips, doms, n_ips, max(len(doms), total - n_ips)
 
 
 def census_top(census, n=CENSUS_TOP):
@@ -346,16 +384,30 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     dl_dom = (dl or {}).get("by_domain") or {}
     gate = report.get("gate") or {}
     per = gate.get("domains") or {}
+    # a domain the run measured sending nothing: the plan moves it straight to quarantine, skipping the weekly
+    # ramp whose first step the gate judges, so its line leads with the plan and gives the gate's verdict as such
+    quiet = {}
+    for c in _rows(plan.get("changes")) if isinstance(plan, dict) else []:
+        if isinstance(c, dict) and c.get("kind") == "no_mail" and c.get("domain"):
+            quiet.setdefault(str(c["domain"]).lower(), c.get("id") or "?")
     for dom in sorted(per):
         g = per[dom]
-        line = "- `%s`: p=%s, gate *%s*, next: %s" % (dom, g.get("current_policy") or "unknown", g.get("verdict", "?"),
-                                                      g.get("next_step", "?"))
+        if str(dom).lower() in quiet:
+            line = ("- `%s`: p=%s, next: no mail measured, quarantine now (plan %s); the gate's *%s* is for the weekly "
+                    "ramp this skips" % (dom, g.get("current_policy") or "unknown", quiet[str(dom).lower()],
+                                         g.get("verdict", "?")))
+        else:
+            line = "- `%s`: p=%s, gate *%s*, next: %s" % (dom, g.get("current_policy") or "unknown",
+                                                          g.get("verdict", "?"), g.get("next_step", "?"))
         own = by_dom.get(dom)
         # a domain under an org the row budget cut: its own count is the floor the gate decides on, and the
         # whole window, counted server side, goes beside it
         full = full_window_line(maillog.get("window_totals"), dom)
         if isinstance(own, dict) and own.get("genuine_failures") is not None:
             line += " - %d genuine failures of its own" % own["genuine_failures"]
+            gone = min(_whole(own.get("excepted")), _whole(own.get("genuine_failures")))
+            if gone:  # the count holds every one; the share an exception covers is named beside it
+                line += " (%d of them formally excepted in audit.toml)" % gone
             if full:
                 line += " in the rows kept (a floor; the gate, the census, the labels and the plan count these)"
             d = dl_dom.get(dom)
@@ -393,13 +445,18 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
                         disp.get("reject", 0), disp.get("quarantine", 0)))
         unk = rua.get("unknown_senders") or []
         if unk and ip_check_ran(rua):  # without the check the list names every source, the tenant's own too
-            cut = rua.get("truncated") if isinstance(rua.get("truncated"), dict) else {}
-            try:  # the table may be capped to its busiest rows: the count is the total, not the rows kept
-                total = int((cut.get("unknown_senders") or {}).get("total") or len(unk))
-            except (TypeError, ValueError):
-                total = len(unk)
-            lines.append("- unknown senders in reports: %d (top: %s)"
-                         % (total, ", ".join(sender_label(u) for u in unk[:3])))
+            # the count is the per-IP check's (ip entries, over the whole table when it was capped); the
+            # signing domains not in the known list are a clause of their own
+            ips, doms, n_ips, n_doms = unknown_counts(rua)
+            line = "- unknown senders in reports: %d" % n_ips if n_ips else \
+                "- unknown senders in reports: none outside the known IP prefixes"
+            if n_ips and ips:
+                line += " (top: %s)" % ", ".join(sender_label(u) for u in ips[:3])
+            if n_doms:
+                top = ", ".join(str(u.get("value") or "?") for u in doms[:3])
+                line += "; %d signing domain%s not in the known list%s" % (
+                    n_doms, "" if n_doms == 1 else "s", (" (top: %s)" % top) if top else "")
+            lines.append(line)
 
     if dl or previous:
         prev_gen = (dl or {}).get("previous_generated_utc") or (previous or {}).get("generated_utc")
@@ -503,9 +560,13 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
 
     if plan:
         ch = plan.get("changes") or []
-        p1 = sum(1 for c in ch if c.get("priority") == 1)
-        lines.append("- plan: %d change(s) waiting, %d are zero-risk monitoring/hygiene; %d hold(s)"
-                     % (len(ch), p1, len(plan.get("holds") or [])))
+        # a no_mail row quarantines a domain the run measured sending nothing: priority 1, but not monitoring
+        quiet = sum(1 for c in ch if c.get("kind") == "no_mail")
+        p1 = sum(1 for c in ch if c.get("priority") == 1 and c.get("kind") != "no_mail")
+        lines.append("- plan: %d change(s) waiting, %d are zero-risk monitoring/hygiene%s; %d hold(s)"
+                     % (len(ch), p1, (", %d %s no mail straight to quarantine"
+                                      % (quiet, "moves a domain that sends" if quiet == 1 else "move domains that send"))
+                        if quiet else "", len(plan.get("holds") or [])))
     return "\n".join(lines)
 
 

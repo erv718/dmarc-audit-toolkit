@@ -17,7 +17,11 @@ held by it forever. Every exception carries a reason, an expiry (until,
 YYYY-MM-DD) and a written removal criterion; one without all of them is
 reported and NOT applied, and one past its expiry blocks the gate again. The
 match is an IP, an IP prefix, a domain (the envelope or DKIM signing domain of
-the sender), or a From address.
+the sender), or a From address. An address matches every message with that
+From address, forged copies included; a vendor platform is better matched by
+its envelope domain. A domain covers an aggregate-report stream only when
+every domain the stream authenticated with, other than the audited ones, is
+under it (matches_stream).
 
 Reading TOML needs Python 3.11 or newer (tomllib in the standard library).
 """
@@ -147,6 +151,28 @@ def audit_list(cfg, key):
     return _as_list(table.get(key), key)
 
 
+def split_vendor_domains(values):
+    """(domains, warnings) for the vendor domains (--vendor-domain, audit.toml
+    vendor_domains). An IP or an IP prefix there never matches anything -
+    vendor domains name sending platforms by domain - so it is left out, with
+    one warning naming where it belongs (known, for the per-IP check). The
+    caller says it on every run, whatever else the run reads."""
+    domains, warnings = [], []
+    for v in values or ():
+        name = str(v).strip().lower().rstrip(".")
+        if not name:
+            continue
+        try:
+            ipaddress.ip_network(name, strict=False)
+        except ValueError:
+            domains.append(v)
+            continue
+        warnings.append("vendor domain %s is an IP prefix, not a domain: ignored; vendor domains name sending "
+                        "platforms for the labels, IP prefixes go in known (audit.toml known, or --known) for "
+                        "the per-IP unknown-sender check" % name)
+    return domains, warnings
+
+
 def notify_settings(cfg):
     """{enabled, target} from the [notify] table; enabled defaults to true so a
     webhook in .env keeps working for anyone without a settings file."""
@@ -222,18 +248,28 @@ def _domain_under(name, match):
     return bool(name) and (name == match or name.endswith("." + match))
 
 
-def matches_stream(exc, stream):
+def matches_stream(exc, stream, audited=()):
     """Does an exception cover one rua failing stream? IPs and prefixes match
-    the source IP; a domain matches the SPF (envelope) or DKIM signing domains
-    the stream authenticated with - the vendor's identity, never header_from."""
+    the source IP. A domain matches by the SPF (envelope) and DKIM signing
+    domains the stream authenticated with - the vendor's identity, never
+    header_from - and covers the stream only when every one of those domains
+    that is not an audited domain (or under one) is under the match. A relay
+    stream carrying the vendor's mail beside other senders' (a shared
+    Microsoft relay signing for the vendor, for one of our subdomains and for
+    another tenant) is then not the vendor's stream, and the other senders'
+    failures stay in view. audited: the audited domains (the gate's names)."""
     if exc["kind"] in ("ip", "prefix"):
         try:
             return ipaddress.ip_address(stream.get("source_ip") or "") in ipaddress.ip_network(exc["match"], strict=False)
         except ValueError:
             return False
     if exc["kind"] == "domain":
-        doms = list(stream.get("spf_domains") or []) + list(stream.get("dkim_domains") or [])
-        return any(_domain_under(d, exc["match"]) for d in doms)
+        doms = [str(d).lower() for d in list(stream.get("spf_domains") or []) + list(stream.get("dkim_domains") or [])
+                if d]
+        if not any(_domain_under(d, exc["match"]) for d in doms):
+            return False
+        own = [a for a in (str(a).strip().lower().rstrip(".") for a in audited or ()) if a]
+        return all(_domain_under(d, exc["match"]) or any(_domain_under(d, a) for a in own) for d in doms)
     return False
 
 

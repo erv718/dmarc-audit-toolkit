@@ -168,7 +168,8 @@ def test_counts_and_the_sender_history_see_every_source_when_the_tables_are_capp
     rep["rua"]["filters"] = {"known": {"given": True, "ip_check": True, "networks": ["192.0.2.0/24"]}}
     assert notify.sender_keys(rep) >= {"ip:192.0.2.10", "ip:198.51.100.7", "ip:203.0.113.9"}
     text = notify.summarize(rep, previous=report(sources=("192.0.2.10",)))
-    assert "unknown senders in reports: 1200 (top: ip 198.51.100.7)" in text
+    # the IPs outside the prefixes, recounted over every source (the table's other entries are signing domains)
+    assert "unknown senders in reports: 2 (top: ip 198.51.100.7); 1198 signing domains not in the known list" in text
     assert "*newly seen senders*: 198.51.100.7, 203.0.113.9" in text
 
 

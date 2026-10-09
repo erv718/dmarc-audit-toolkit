@@ -167,6 +167,9 @@ PREREQ_REWORDS = (
      lambda m: "the SPF-only senders (%s) are DKIM-signed, because SPF alone breaks on forwarding" % m.group(1)),
     (re.compile(r"^every legitimate sender proven with an aligned DKIM header( within 7 days)?$"),
      lambda m: "every legitimate sender is proven with an aligned DKIM header%s" % (m.group(1) or "")),
+    (re.compile(r"^one change to (\S+) a week: this row and the other rows? for it \(([^)]+)\) each rewrite "),
+     lambda m: "the other change to %s (plan %s) waits for another week, since both rewrite today's record"
+     % (m.group(1), m.group(2))),
 )
 GLOSSARY = OrderedDict([
     ("DMARC", "the published rule that tells receiving mail systems what to do with mail that claims "
@@ -1224,6 +1227,8 @@ def step_label(change):
     cur = dmarc_tags(current) if current.lower().startswith("v=dmarc1") else {}
     if kind == "park":
         return "park it with SPF -all" if is_spf else "park it with p=reject"
+    if kind == "no_mail":
+        return "move straight to p=quarantine (no mail measured)"
     if kind == "new":
         return "publish a p=%s monitoring record" % tags.get("p", "none")
     if kind == "modify":
@@ -1255,6 +1260,15 @@ def step_label(change):
             return "set sp=%s" % tags["sp"]
         return first
     return first
+
+
+def table_step(change):
+    """A plan change as the per-domain table's Next step cell: a domain the
+    run measured sending nothing reads 'no mail measured: quarantine now';
+    any other change, its step_label."""
+    if change.get("kind") == "no_mail":
+        return "no mail measured: quarantine now"
+    return step_label(change)
 
 
 def reword_prereq(text):
@@ -1598,14 +1612,22 @@ def org_next(report, plan, org, own=None):
     gate's, held by what the gate's verdict says: a go is ready, a no_go
     waits on its blockers, an insufficient_data verdict on the evidence it
     needs. With no policy read (the gate says 'unknown'), the first step is
-    always the monitoring-only record, never the gate's placeholder, and it
-    needs no evidence. The gate's notes ride along; they hold nothing."""
+    the monitoring-only record, never the gate's placeholder, and it needs
+    no evidence - unless the plan moves the domain straight to quarantine
+    (no mail measured): then that row is the first step, with its checks.
+    The gate's notes ride along; they hold nothing."""
     changes = changes_for(plan, org)
     gate = report.get("gate") or {}
     g = (gate.get("domains") or {}).get(org) or {}
     gate_step = _short_step(g.get("next_step") or (gate.get("next_step") if not gate.get("domains") else "") or "")
     verdict, _, notes = gate_split(report, org)
     notes = [plain(n) for n in notes]
+    quiet = next((c for c in changes if c.get("kind") == "no_mail"), None)
+    if quiet is not None:  # the run measured no mail sent as it: the quarantine-now row is the step, policy or not
+        return {"label": plain(step_label(quiet)), "ref": quiet.get("id"),
+                "prerequisites": [reword_prereq(p) for p in prereqs_of(quiet)], "why": quiet.get("why"),
+                "source": "plan", "kind": "no_mail", "priority": _n(quiet.get("priority")), "verdict": verdict,
+                "notes": notes, "blockers": []}
     if current_policy(report, org) is None or gate_step.lower().startswith("unknown"):
         rec = next((c for c in changes if c.get("kind") == "new"
                     and str(c.get("hostname") or "").lower().startswith("_dmarc.")), None)
@@ -1779,12 +1801,21 @@ def where_we_stand(report, view, trend, window=None):
         lines.append("**Genuine failures: not in this run** - no mail log was read, so this run cannot count them")
     else:
         gf, raw = view["genuine_failures"], view["raw_failing_rows"]
-        data.update({"genuine_failures": gf, "raw_failing_rows": raw, "truncation": view["truncation"]})
+        # the share the formal exceptions cover: the census counts it per stream, an older report's gate in total
+        gone = (sum(e["count"] for e in view.get("excepted") or []) if view.get("exceptions_counted")
+                else view.get("excepted_unsplit") or 0)
+        gone = min(max(gone, 0), gf)
+        data.update({"genuine_failures": gf, "raw_failing_rows": raw, "truncation": view["truncation"],
+                     "genuine_failures_excepted": gone})
         text = "**Genuine failures: %d**" % gf
+        share = ("%d of them formally excepted in audit.toml" % gone) if gone else ""
         if raw is not None and raw > gf:
-            text += " (raw counts would say %d - the gap is relay echoes, not broken senders)" % raw
+            text += " (%sraw counts would say %d - the gap is relay echoes, not broken senders)" % (
+                (share + "; ") if share else "", raw)
         elif raw is not None:
-            text += " (raw row counts agree: no relay echoes)"
+            text += " (%sraw row counts agree: no relay echoes)" % ((share + "; ") if share else "")
+        elif share:
+            text += " (%s)" % share
         span = span_phrase(view.get("window"))
         data["maillog_window"] = view.get("window")
         if span:
@@ -2030,16 +2061,24 @@ def per_domain(report, plan):
         gate = verdict or "not checked"
         gate_text = GATE_WORDS.get(verdict, verdict) if verdict else "not checked"
         ml = bd.get(d) if isinstance(bd.get(d), dict) else None
-        changes = changes_for(plan, d)
+        # a domain the run measured sending nothing leads with its quarantine-now row; the gate judged the
+        # weekly ramp that row skips, and its verdict says so
+        changes = sorted(changes_for(plan, d), key=lambda c: c.get("kind") != "no_mail")
+        if changes and changes[0].get("kind") == "no_mail" and verdict:
+            gate_text += " (for the weekly ramp this skips)"
         holds = holds_for(plan, d)
         ids = [c.get("id") for c in changes if c.get("id")]
         audit_step = _short_step(g.get("next_step") or "")
         if audit_step.lower().startswith("unknown"):
             audit_step = "publish a monitoring-only DMARC record so reports start (no policy could be read)"
         if changes:
-            step = step_label(changes[0])
+            step = table_step(changes[0])
             if len(changes) > 1:
-                step += ", then " + step_label(changes[1])
+                # two rows that rewrite one DMARC record from today's value are this week's alternatives (the
+                # plan says so on each), not a sequence
+                same = (str(changes[0].get("hostname") or "").startswith("_dmarc.")
+                        and all(str(changes[0].get(k)) == str(changes[1].get(k)) for k in ("hostname", "current")))
+                step += (" or %s, one a week" if same else ", then %s") % table_step(changes[1])
             if len(changes) > 2:
                 step += " (+%d more in the plan)" % (len(changes) - 2)
         elif holds:
@@ -2370,6 +2409,9 @@ def render_actions(groups, failing=None):
 
 def build_ask(plan, org, nxt, policy):
     p1 = [c for c in plan_changes(plan) if _n(c.get("priority")) == 1]
+    # a no_mail row quarantines a domain the run measured sending nothing: priority 1, but not zero-risk
+    quiet = [c for c in p1 if c.get("kind") == "no_mail"]
+    p1 = [c for c in p1 if c.get("kind") != "no_mail"]
     holds = holds_for(plan, org) or holds_for(plan)
     parts = []
     if p1:
@@ -2383,6 +2425,11 @@ def build_ask(plan, org, nxt, policy):
             text += ", of which %d %s the domain's unused check first" % (
                 park, "is a park row that needs" if park == 1 else "are park rows that need")
         parts.append(text)
+    if quiet:
+        ids = [c.get("id") for c in quiet if c.get("id")]
+        parts.append("approval to move %d %s no mail straight to quarantine (plan %s) once the checks listed with "
+                     "%s are confirmed" % (len(quiet), "domain that sends" if len(quiet) == 1 else "domains that send",
+                                           id_range(ids), "it" if len(quiet) == 1 else "each"))
     at_end = not nxt or nxt["label"].lower().startswith("none")
     first = nxt is not None and nxt.get("kind") == "first"
     which = "the step after that" if parts else "the next step"
@@ -2391,10 +2438,10 @@ def build_ask(plan, org, nxt, policy):
     elif _needs_data(nxt) and not at_end:  # the gate cannot judge the step yet: the ask is the evidence, never a go-ahead
         parts.append("more data before %s on %s (%s): %s" % (which, org, nxt["label"], nxt["prerequisites"][0]
                                                              if nxt["prerequisites"] else "report.md says which"))
-    elif nxt and nxt["prerequisites"] and not at_end:
+    elif nxt and nxt["prerequisites"] and not at_end and nxt.get("kind") != "no_mail":  # a no_mail step is asked above
         held = "is held back by this" if nxt["source"] == "gate" else "is held until this is confirmed"
         parts.append("%s on %s (%s) %s: %s" % (which, org, nxt["label"], held, nxt["prerequisites"][0]))
-    elif nxt and not nxt["prerequisites"] and not at_end and not p1:
+    elif nxt and not nxt["prerequisites"] and not at_end and not (p1 or quiet):
         parts.append("a go-ahead to %s on %s, which this run finds ready" % (nxt["label"], org))
     if holds:
         h = holds[0]

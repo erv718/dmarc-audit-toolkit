@@ -9,6 +9,10 @@ every source that named it):
   the tenant      GET /domains through the app registration (Domain.Read.All,
                   or Directory.Read.All) - used automatically when .env holds
                   credentials, skipped with --no-graph
+  EXTRA_DOMAINS   in .env, comma or space separated: domains the tenant does
+                  not hold (a registrar-only domain, a brand on another mail
+                  platform), audited beside the tenant's; read with .env, so
+                  not with --no-graph (source "env")
   --mailflow      subdomains of your domains seen sending in the last 30
                   days, from advanced hunting (ThreatHunting.Read.All)
 
@@ -19,16 +23,17 @@ collect.py also measures the mail flow of every name it audits, the
 organizational domains included (row["mailflow"]), with the token it
 already holds: one aggregate query per run.
 
-  python src/discover.py                       # tenant domains only
+  python src/discover.py                       # tenant domains, plus EXTRA_DOMAINS from .env
   python src/discover.py example.com --mailflow --out exports
   python src/discover.py --file domains.txt --no-graph --json
 
-Exit codes: 0 ok, 2 nothing to discover (no domains, no file, no credentials)
-or an input error.
+Exit codes: 0 ok, 2 nothing to discover (no domains, no file, no credentials,
+no EXTRA_DOMAINS) or an input error.
 """
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.parse
@@ -179,6 +184,28 @@ def zone_for(domain, resolver=None):
     return {"zone": org, "ns": [], "zone_host": "unknown", "ns_path": path}
 
 
+EXTRA_KEY = "EXTRA_DOMAINS"
+# what each inventory source tag means, in words (the table's legend)
+SOURCE_LABELS = {"cli": "on the command line", "file": "in --file", "settings": "in audit.toml",
+                 "tenant": "listed by the tenant", "default": "the tenant's default domain",
+                 "env": "listed in .env", "mailflow": "seen in mail flow"}
+
+
+def env_extra_domains(env_file=None):
+    """The raw EXTRA_DOMAINS value ('' when unset): domains the tenant does
+    not hold that the operator audits beside the tenant's own, such as a
+    registrar-only domain or a brand on another mail platform. Loads the
+    env file first, which never overrides the environment (as for the
+    credentials); a file that cannot be read adds nothing here, and the
+    tenant lookup says why."""
+    import run_hunting
+    try:
+        run_hunting.load_env(env_file)
+    except SystemExit:
+        pass
+    return os.environ.get(EXTRA_KEY) or ""
+
+
 def graph_domains(env_file=None):
     """Domains the tenant knows, via the app registration. Returns
     (list, note) where note explains a skip or failure in one line."""
@@ -301,8 +328,15 @@ def mailflow_subdomains(org_domains, env_file=None, days=30):
 
 
 def discover(domains=(), domain_file=None, use_graph=True, mailflow=False,
-             resolver_addr="8.8.8.8", env_file=None, ns_lookup=True, tok=None, days=30):
+             resolver_addr="8.8.8.8", env_file=None, ns_lookup=True, tok=None, days=30, extra_domains=None,
+             seen=None):
     """Build the inventory. Returns (inventory list, notes list).
+
+    extra_domains: the EXTRA_DOMAINS value the caller read from .env (a
+    string, comma or space separated, or a list): each valid domain joins
+    the inventory with the source "env", beside the tenant's; an entry that
+    is not a domain is noted and skipped, never fatal. Like a tenant domain
+    it is never a typed headline source.
 
     tok: a token the caller already holds (collect.py's). With it one
     aggregate query (mailflow_counts) measures the last `days` days of mail
@@ -311,7 +345,12 @@ def discover(domains=(), domain_file=None, use_graph=True, mailflow=False,
     the query saw nothing from, and stays None when the query failed (not
     measured). mailflow=True then adds the subdomains that query saw,
     without a second sign-in. Without tok, mailflow=True signs in to run
-    the query itself and only the subdomains it adds carry counts."""
+    the query itself and only the subdomains it adds carry counts.
+
+    seen: a dict to fill with the counts of every other name that query
+    returned (a subdomain under an audited organization that is not in the
+    inventory), so a caller can tell which unaudited subdomains send
+    through the tenant; left empty when the query failed or did not run."""
     notes = []
     inv = {}
 
@@ -353,6 +392,16 @@ def discover(domains=(), domain_file=None, use_graph=True, mailflow=False,
         if tenant:
             notes.append("tenant: %d domains (%d verified)" % (len(tenant), sum(1 for t in tenant if t["verified"])))
 
+    if extra_domains:
+        listed, bad = parse_domains([extra_domains] if isinstance(extra_domains, str) else extra_domains)
+        new = sum(1 for d in listed if d not in inv)
+        for d in listed:
+            add(d, "env")
+        if listed:
+            notes.append("%s (%s): %d domains, %d not already named" % (SOURCE_LABELS["env"], EXTRA_KEY, len(listed), new))
+        if bad:
+            notes.append("ignored non-domain entries in %s (.env): %s" % (EXTRA_KEY, ", ".join(bad)))
+
     if tok is not None and inv:
         orgs = sorted({row["org_domain"] for row in inv.values()})
         counts, why = mailflow_counts(tok, orgs, days)
@@ -367,6 +416,8 @@ def discover(domains=(), domain_file=None, use_graph=True, mailflow=False,
                     notes.append("mail flow: %d sending domains under %s" % (len(subs), ", ".join(orgs)))
             for row in inv.values():
                 row["mailflow"] = dict(counts.get(row["domain"]) or MAILFLOW_NONE)
+            if seen is not None:  # the names the same answer carries that no inventory row holds
+                seen.update({d: dict(c) for d, c in sorted(counts.items()) if d not in inv})
             busy = sum(1 for row in inv.values() if row["mailflow"]["messages"])
             notes.append("mail flow over the last %d days measured for %d domains (%d sent or received mail, "
                           "%d none)" % (days, len(inv), busy, len(inv) - busy))
@@ -402,6 +453,9 @@ def render(inventory, notes):
         ver = {True: "yes", False: "no", None: "-"}[r.get("tenant_verified")]
         lines.append("%-34s %-10s %-22s %-16s %s" % (r["domain"], ver, ",".join(r["sources"]),
                                                      r.get("zone_host", "?"), r.get("zone", "")))
+    tags = [t for t in SOURCE_LABELS if any(t in (r.get("sources") or ()) for r in inventory)]
+    if tags:
+        lines.append("sources: " + ", ".join("%s = %s" % (t, SOURCE_LABELS[t]) for t in tags))
     lines.append("")
     lines.append("%d domains" % len(inventory))
     for n in notes:
@@ -423,12 +477,15 @@ def main():
     ap.add_argument("--json", action="store_true", help="print the inventory as JSON")
     args = ap.parse_args()
 
+    # .env is read with the tenant's list, so EXTRA_DOMAINS comes with it (and not with --no-graph)
+    extra = None if args.no_graph else env_extra_domains(args.env_file)
     inventory, notes = discover(args.domains, args.file, not args.no_graph, args.mailflow,
-                                args.resolver, args.env_file, not args.no_ns)
+                                args.resolver, args.env_file, not args.no_ns, extra_domains=extra)
     if not inventory:
         for n in notes:
             print("note: " + n, file=sys.stderr)
-        usage_error("nothing to discover: give domains on the command line, --file, or credentials in .env")
+        usage_error("nothing to discover: give domains on the command line, --file, credentials in .env, "
+                    "or EXTRA_DOMAINS in .env")
 
     if args.out:
         out = Path(args.out)

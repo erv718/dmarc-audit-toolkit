@@ -5,7 +5,9 @@ What it does, in order, and what it skips when it cannot:
 
   1. verify the app registration (skipped with no credentials or --offline)
   2. discover the domains: command line, --file, the tenant's own list,
-     and with --mailflow every subdomain seen sending in 30 days; with a
+     the domains EXTRA_DOMAINS in .env adds (ones the tenant does not hold:
+     a registrar-only domain, a brand on another mail platform), and with
+     --mailflow every subdomain seen sending in 30 days; with a
      token, one aggregate query measures every audited name's mail flow
      over the last 30 days (sent from inside, received from outside, last
      seen) on every run, the organizational domains included - the plan's
@@ -684,9 +686,17 @@ def render_todo(report, plan, caveats=()):
     L.append("## Where each domain stands")
     L.append("")
     per = gate.get("domains") or {}
+    # a domain the run measured sending nothing skips the weekly ramp whose first step the gate judges: its line
+    # leads with the quarantine-now row (section 2) and gives the gate's verdict as the ramp's
+    quiet = {c.get("domain"): c.get("id") for c in changes if isinstance(c, dict) and c.get("kind") == "no_mail"}
     for d, g in sorted(per.items()):
-        L.append("- %s: p=%s, gate %s, next step: %s"
-                 % (d, g.get("current_policy") or "unknown", g.get("verdict"), g.get("next_step")))
+        if d in quiet:
+            L.append("- %s: p=%s, next step: no mail measured, quarantine now (%s, section 2); the gate's %s is for "
+                     "the weekly ramp this skips" % (d, g.get("current_policy") or "unknown", quiet[d],
+                                                    g.get("verdict")))
+        else:
+            L.append("- %s: p=%s, gate %s, next step: %s"
+                     % (d, g.get("current_policy") or "unknown", g.get("verdict"), g.get("next_step")))
     if not per:
         L.append("- no per-domain verdict in this run")
     L.append("")
@@ -696,7 +706,9 @@ def render_todo(report, plan, caveats=()):
     L += ["- %s: %s" % (h["domain"], h["reason"]) for h in holds] or ["- none"]
     L.append("")
 
-    L.append("## 2. Do now (plan priority 1, zero delivery risk)")
+    # monitoring and hygiene rows touch no mail anyone sends; a no-mail-measured row waits on its checks
+    L.append("## 2. Do now (plan priority 1: monitoring and hygiene, zero delivery risk; quarantine where no mail "
+             "is measured, after its checks)")
     L.append("")
     rows = [c for c in changes if c.get("priority") == 1]
     items = []
@@ -903,6 +915,10 @@ def main():
 
     if cfg.get("_path"):
         note("settings read from %s" % cfg["_path"])
+    # an IP prefix among the vendor domains matches nothing: said on every run, and left out of the audit
+    vendors, vendor_warnings = config_mod.split_vendor_domains(args.vendor_domain)
+    for w in vendor_warnings:
+        note(w)
     if owners_problem:  # the default file, unreadable: say so, carry on unassigned
         note("owners file skipped: %s" % owners_problem)
     elif not owners_path and not args.no_owners:
@@ -940,15 +956,18 @@ def main():
 
     # 2. domains, and with a token the mail flow of every one of them: one aggregate query, this token
     days = min(args.days, 30)  # the mail-log window, which the full-window totals share
+    # the domains the tenant does not hold, from .env: read once step 1 loaded it (not with --offline or --no-graph)
+    extra = os.environ.get(discover.EXTRA_KEY) if not (args.offline or args.no_graph) else None
+    unaudited = {}  # every other name the mail-flow query saw under those orgs: the plan's sending subdomains
     inventory, dnotes = discover.discover(args.domains, args.file, use_graph=bool(tok), mailflow=bool(tok) and args.mailflow,
                                           resolver_addr=args.resolver, env_file=args.env_file, ns_lookup=not args.offline,
-                                          tok=tok, days=MAILFLOW_DAYS)
+                                          tok=tok, days=MAILFLOW_DAYS, extra_domains=extra, seen=unaudited)
     for n in dnotes:
         note(n)
         if n.startswith("mail flow not measured"):
             degraded.append(n)
     if not inventory:
-        die("nothing to audit: give domains, --file, or credentials with Domain.Read.All")
+        die("nothing to audit: give domains, --file, credentials with Domain.Read.All, or EXTRA_DOMAINS in .env")
     domains = [r["domain"] for r in inventory]
     if from_settings:  # the domains came from audit.toml, not the command line: label them so
         for row in inventory:
@@ -1033,16 +1052,18 @@ def main():
     if window_totals and accepts(audit.build_report, "window_totals"):
         extra["window_totals"] = window_totals
     if tok and accepts(audit.build_report, "mailflow"):
-        # every audited name, measured (counts, zeros for nothing seen) or not (None: the query failed)
+        # every audited name, measured (counts, zeros for nothing seen) or not (None: the query failed); and the
+        # unaudited names the same query saw, so the plan knows which subdomains send through the tenant
         extra["mailflow"] = {"days": MAILFLOW_DAYS, "source": AGGREGATE_SOURCE,
-                             "domains": {r["domain"]: r.get("mailflow") for r in inventory}}
+                             "domains": {r["domain"]: r.get("mailflow") for r in inventory},
+                             "unaudited": unaudited}
     try:
         report = audit.build_report(
             domains=domains, domain_sources=domain_sources, rua_paths=rua_paths, maillog=maillog,
             header_files=args.headers, offline=args.offline, resolver_addr=args.resolver,
             selectors=[s.strip() for s in args.selectors.split(",")] if args.selectors else (),
             known=args.known, auth_column=auth_column, since=since,
-            vendor_domains=args.vendor_domain, exceptions=exceptions, **extra)
+            vendor_domains=vendors, exceptions=exceptions, **extra)
     except audit.UsageError as err:
         die(str(err))
     if isinstance(report.get("inputs"), dict):

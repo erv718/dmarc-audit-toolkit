@@ -82,6 +82,29 @@ own logs cannot see because they deliver to external recipients.
 Gate each step on one question: **is any legitimate sender in the failing
 bucket?** If the answer is only spoofing, advance.
 
+A domain that sends nothing has no legitimate sender to protect. When the
+run measured that - no mail out in 30 days of tenant mail flow, nothing
+passing as it in the mail log or the aggregate reports, nothing failing that
+looks like your own system, and a mail log that examined all the mail that
+came in as it - the ramp protects nobody, and the plan proposes
+`p=quarantine` straight away, then `p=reject` once a week of reports still
+shows nothing passing. Confirm first that no sender mailing less often than
+monthly (statements, renewals) uses the domain, and check what the row names:
+messages the heuristic cannot call spoofing, and, when no aggregate report
+covers the domain, a third party sending as it straight to outside
+recipients. A domain whose mail the tenant does not carry (one only
+`EXTRA_DOMAINS` names, or one whose SPF or DKIM points at another platform)
+needs aggregate reports that cover it first: the tenant's zero says nothing
+about it.
+
+Subdomains go the same way, in order: every subdomain that sends gets a
+record of its own first, then the apex's `sp=` moves to quarantine, even
+while the apex itself is still at quarantine. The plan names the sending
+subdomains still without a record, audited or not - including one whose
+mail fails in a way the heuristic cannot pin on spoofing, and an audited
+one whose mail out was not measured. The move to reject and the `sp=` step
+rewrite the same record: one a week.
+
 The weekly run answers that question for you. `src/audit.py` gives the
 verdict per domain, and `next_steps.md` carries it in the "Per domain" table
 (policy today, gate, next step), with the step's prerequisites in the

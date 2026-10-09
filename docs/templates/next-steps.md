@@ -26,9 +26,9 @@ built from, and what a person or an agent may change before sending it.
 | The one-liner (bold) | policy today (and since when, if the history shows the change), how many of our own streams still fail and how many look like spoofing, the next safe step and what it is ready when | `gate`, `dns`, `maillog.census`, the plan's next enforcement step and its prerequisites |
 | Where we stand | genuine failures with the raw count alongside (for an organization the row budget cut, the full-window totals counted in advanced hunting beside that floor, which every verdict still rests on); delivered despite failing, with the overrides that let it in when the mail log recorded them; spoofing blocked by receivers; trend versus the previous run (withheld, with the reason, when the row budget cut a mail log or the mail-log spans or the outside views are not comparable) | `maillog.counters`, `maillog.window_totals`, `rua.by_disposition`, `delta` (else `--previous`, else `metrics.json`) |
 | What is failing | the top failing envelope domains and sender addresses, each with its heuristic label; senders outside the audited domains; the outside view from aggregate reports | `maillog.census`, `maillog.by_domain`, `rua.failing_streams` |
-| Per domain | one row per audited domain: policy today, gate, next step, and its mail flow as the tenant measured it ("sends: N out, M in", "nothing sent or received", or "not measured"), then one line on what that view cannot see (a third party sending as the domain straight to outside recipients shows only in the aggregate reports) | `gate.domains`, `dns`, the plan, `mailflow` |
+| Per domain | one row per audited domain: policy today, gate, next step ("no mail measured: quarantine now" for a domain the run measured sending nothing, its gate verdict marked as the one for the weekly ramp that row skips), and its mail flow as the tenant measured it ("sends: N out, M in", "nothing sent or received", or "not measured"), then one line on what that view cannot see (a third party sending as the domain straight to outside recipients shows only in the aggregate reports) | `gate.domains`, `dns`, the plan, `mailflow` |
 | What happens next, by owner | one action per failing sender, override (named, with what to change, when the mail log recorded it), SPF-only sender, unknown source and DNS change, grouped by the owner the owners file names; the last group is `Unassigned - needs an owner` | `findings`, the plan's changes, `maillog.census`, `owners.csv` |
-| The ask | the approval or DNS window for this week's step, and what holds the step after it | the plan's zero-risk records and the next enforcement step |
+| The ask | the approval or DNS window for this week's step, and what holds the step after it; a domain the run measured sending nothing is asked apart from the zero-risk records, with its checks | the plan's zero-risk records, its quarantine-now rows and the next enforcement step |
 | Open questions | unmet prerequisites, gaps enforcement does not close, heuristics not yet verified, unassigned items | `gate.reasons`, `findings` with `verified: false`, the plan's holds |
 | Glossary | DMARC, SPF, DKIM, rua, p=, sp=, pct=, genuine failure, relay echo | fixed text |
 
@@ -74,9 +74,11 @@ Never change:
   from memory or from a conversation (rule 12).
 
 When something is missing from the document it is missing from the inputs:
-no owners file (everything unassigned), no `--known` list (every outside
-source is unknown), no plan (an offline run has no DNS section), no previous
-run (no trend). Fix the input and regenerate.
+no owners file (everything unassigned), no `--known` list with IP prefixes
+(the per-IP unknown-sender check runs only on IP prefixes; without them it
+does not run, and every outside source is listed as unknown - domains alone
+only narrow the signing-domain list), no plan (an offline run has no DNS
+section), no previous run (no trend). Fix the input and regenerate.
 
 ## Voice rules for the final document
 

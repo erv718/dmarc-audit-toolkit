@@ -72,7 +72,13 @@ file only.)
     (accepted domains, one CSV, one portal view) is not missing from the
     world. Build domain and sender inventories from the aggregate-reporting
     account and DNS, cross-checked against the mail system - never from one
-    source alone.
+    source alone. The toolkit always audits every domain the tenant lists;
+    `EXTRA_DOMAINS` in `.env` adds the ones it does not hold (a
+    registrar-only domain, a brand on another mail platform), with the
+    source `env` in `inventory.json` and `report.json`. The tenant's mail
+    log only sees mail that touches the tenant, so for a domain hosted
+    elsewhere its mail flow and mail log say little: its aggregate reports
+    carry the evidence.
 13. **Never produce a status document from memory when `next_steps.md`
     exists; edit it.** `src/next_steps.py` writes
     `audit-out/latest/next_steps.md` from the run itself (report, plan,
@@ -171,9 +177,9 @@ Starter tasks, in order:
 | File | What it holds | How to use it |
 |---|---|---|
 | `next_steps.md`, `next_steps.json` | the status document: the one-liner, where we stand, what is failing, the per-domain table, actions by owner, the ask and the open questions; the JSON is the same content as data | start here; refine the generated copy, never rewrite it from memory (rule 13) |
-| `todo.md` | the prioritised list: holds to decide, zero-risk DNS rows, senders to fix DKIM-first, tenant findings, gated enforcement steps with prerequisites, exceptions in force | work it top to bottom; every line names the file with the evidence |
-| `report.json`, `report.md` | every finding with severity, evidence, action and `verified`; the gate per domain with its reasons; `gate.exceptions` (applied, expired, invalid); `gate.evidence.dkim_evidence`; `maillog.verdicts_omitted` and `rua.truncated` say what the JSON leaves out (`audit.py --keep-verdicts` keeps the verdicts); `mailflow` (each audited domain's mail flow as the tenant measured it, `None` per domain when not measured); `maillog.counters.delivered_despite_fail_by` and the census's `delivered_by` (the override that let failing mail in); `maillog.window_totals` (a cut organization's full window, counted in advanced hunting; an answer that counts less than the rows kept is set aside and named in `maillog.window_totals_rejected`) | cite finding ids and gate reasons, never raw rows; quote deduplicated and raw counts together; quote a cut organization's floor and its full-window totals together, and say the verdicts rest on the floor |
-| `plan.json`, `plan.md` | the records to publish with current value, rollback and prerequisites | draft the change ticket from a row; the human applies it |
+| `todo.md` | the prioritised list: holds to decide, priority-1 DNS rows (zero-risk monitoring and hygiene, and "no mail measured: quarantine now" for a domain the run measured sending nothing, which waits on the checks it names), senders to fix DKIM-first, tenant findings, gated enforcement steps with prerequisites, exceptions in force | work it top to bottom; every line names the file with the evidence |
+| `report.json`, `report.md` | every finding with severity, evidence, action and `verified`; the gate per domain with its reasons; `gate.exceptions` (applied, expired, invalid); `gate.evidence.dkim_evidence`; `maillog.verdicts_omitted` and `rua.truncated` say what the JSON leaves out (`audit.py --keep-verdicts` keeps the verdicts); `mailflow` (each audited domain's mail flow as the tenant measured it, `None` per domain when not measured; `mailflow.unaudited`, the other names under the same organizations the query saw); `maillog.counters.delivered_despite_fail_by` and the census's `delivered_by` (the override that let failing mail in); `maillog.window_totals` (a cut organization's full window, counted in advanced hunting; an answer that counts less than the rows kept is set aside and named in `maillog.window_totals_rejected`) | cite finding ids and gate reasons, never raw rows; quote deduplicated and raw counts together; quote a cut organization's floor and its full-window totals together, and say the verdicts rest on the floor |
+| `plan.json`, `plan.md` | the records to publish with current value, rollback and prerequisites; a `no_mail` row quarantines a domain the run measured sending nothing, with the checks the run could not settle as prerequisites (never a zero-risk row); the `sp=` step names every sending subdomain still without a record of its own, audited or not, and proposes their monitoring records; two rows that rewrite one record from today's value name each other (one a week) | draft the change ticket from a row; the human applies it |
 | `summary.txt` | the Slack message: deltas vs the previous run (withheld, with a note, when the row budget or the API cap cut an organization's mail log in either run, or the mail-log spans or the outside views differ too much), newly identified senders, the trend; the overrides that let failing mail in, and for a domain under a cut organization its full-window totals beside its floor | the status line; do not recompute it |
 | `run.json` | notes, caveats (for example a truncated mail-log slice), degraded steps, strict reasons | say when a number is a floor because of a caveat |
 | `../metrics.json`, `../metrics.md` | one entry per run since day one | trend questions |
@@ -183,7 +189,10 @@ Exceptions: when a failing sender is explained and accepted, draft the
 `[[exceptions]]` entry for `audit.toml` (`match`, `reason`, `owner`, `until`,
 `removal_criterion`) and hand it to the human. Never write it yourself, and
 never propose one without an expiry and a removal criterion
-(`docs/methodology.md` step 5).
+(`docs/methodology.md` step 5). An address match also covers forged copies
+of that From address: for a vendor platform, match its envelope domain. A
+domain match lifts an aggregate-report stream only when every domain the
+stream authenticated with, other than the audited ones, is under it.
 
 ## What to hand back to the human
 

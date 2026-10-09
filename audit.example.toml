@@ -4,8 +4,9 @@
 # beats the built-in default. Reading it needs Python 3.11 or newer.
 
 [audit]
-# Domains to audit. Leave the list empty (or delete the line) to audit every
-# verified domain in the tenant, which needs Domain.Read.All.
+# Domains to audit beside the tenant's own, which are always audited when the app
+# registration can read them (Domain.Read.All); with no registration, this is the list.
+# Domains the tenant does not hold go in .env as EXTRA_DOMAINS (see .env.example).
 domains = ["example.com", "example.net"]
 # Also add every subdomain seen sending in the last 30 days (needs ThreatHunting.Read.All).
 # Every audited domain's own mail flow (the last 30 days) is measured on each run either way.
@@ -18,9 +19,10 @@ report_days = 30
 # unknown-sender check runs only on the IP prefixes; domains alone only narrow its
 # signing-domain list and inform the aggregate-report labels, and the per-IP check does not run.
 known = ["vendor.example", "192.0.2.0/24"]
-# Envelope domains of your sending platforms, domains only (IP prefixes go in known), for
-# the heuristic labels in the mail log and in the aggregate reports. Like known's domains
-# they narrow the signing-domain list, but they never switch the unknown-sender check on.
+# Envelope domains of your sending platforms, domains only (IP prefixes go in known; one
+# here matches nothing, and every run warns about it), for the heuristic labels in the
+# mail log and in the aggregate reports. Like known's domains they narrow the
+# signing-domain list, but they never switch the unknown-sender check on.
 vendor_domains = ["vendor.example"]
 # DKIM selectors to probe in addition to the common list.
 selectors = ["s1", "mail"]
@@ -42,7 +44,10 @@ target = "slack"
 # Formal exceptions (docs/methodology.md step 5). A failing sender listed here
 # stops holding the gate until the date passes. All four fields are required;
 # an entry missing one is reported and NOT applied. match is an IP, an IP
-# prefix, an envelope or DKIM signing domain, or a From address.
+# prefix, an envelope or DKIM signing domain, or a From address. A From address
+# also covers forged copies of it: for a vendor platform, match its envelope
+# domain. A domain covers an aggregate-report stream only when every domain the
+# stream authenticated with, other than the audited ones, is under it.
 #
 # [[exceptions]]
 # match = "192.0.2.30"

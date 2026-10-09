@@ -32,7 +32,9 @@ def test_summary_covers_gate_findings_maillog_and_outside_view():
     assert "findings: 1 (major 1)" in text
     assert "21 genuine failures (33 rows would say so)" in text
     assert "spoofing blocked by receivers: 300 rejected, 6 quarantined" in text
-    assert "unknown senders in reports: 1" in text
+    # the per-IP check found no IP outside the prefixes; the one entry is a signing domain, in its own clause
+    assert ("unknown senders in reports: none outside the known IP prefixes; 1 signing domain not in the known "
+            "list (top: vendor.example)") in text
 
 
 def test_summary_deltas_against_previous_run():

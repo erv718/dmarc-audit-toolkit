@@ -192,8 +192,8 @@ def test_d13_the_docs_say_what_known_and_vendor_domains_do(tmp_path):
     known = step2.split("- `known`:", 1)[1].split(" - `", 1)[0]
     assert "runs only on the IP prefixes" in known and "Domains alone only narrow the signing-domain list" in known
     vendors = step2.split("- `vendor_domains`:", 1)[1].split(" - `", 1)[0]
-    # only a run that reads aggregate reports warns about a prefix: the README promises no more than that
-    assert "ignored with a warning" not in vendors and "a run that reads aggregate reports warns about it" in vendors
+    # every run warns about a prefix (collect.py, whatever else it reads): the README says so
+    assert "ignored with a warning" not in vendors and "every run warns about it" in vendors
     assert "Domains only" in vendors and "IP prefixes go in `known`" in vendors
     assert "mail log and in the aggregate reports" in vendors and "never switch the unknown-sender check on" in vendors
     assert "they narrow the signing-domain list" in vendors

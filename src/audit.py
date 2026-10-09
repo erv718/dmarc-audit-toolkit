@@ -567,13 +567,17 @@ def _counters(verdicts):
     itself sent, which a spoof never is. excepted, excepted_by_likely and
     excepted_delivered: the genuine failures a formal exception covers (the
     marks mark_excepted puts on the verdicts), of which the counts above
-    still hold every one."""
+    still hold every one. message_ids: the distinct Message-IDs among them,
+    the grain the tenant's mail flow counts at (a logical message is one per
+    recipient); None when the verdicts do not carry their Message-ID."""
     failing = [v for v in verdicts if v.get("genuine_failure")]
     by_likely = Counter(v.get("likely") or "unknown" for v in failing)
     senders = Counter((v.get("sender") or "?").lower() for v in failing)
     excepted = [v for v in failing if v.get("excepted")]
     exc_likely = Counter(v.get("likely") or "unknown" for v in excepted)
+    ids = {v.get("msgid") for v in verdicts if v.get("msgid")}
     return {"logical_messages": len(verdicts),
+            "message_ids": len(ids) if ids or not verdicts else None,
             "genuine_failures": len(failing),
             "passing_messages": sum(1 for v in verdicts if v.get("passed")),
             "internal_messages": sum(1 for v in verdicts if v.get("internal") and not v.get("passed")
@@ -1038,7 +1042,7 @@ def _exception_notes(excepted):
             + f": {e['reason']}; remove when {e['removal_criterion']}" for match, (e, n, d) in hits.items()]
 
 
-def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None):
+def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None, audited=()):
     """Blockers that apply to every domain in the run, plus what the formal
     exceptions (audit.toml [[exceptions]], already split to the active ones)
     lifted: notes naming each excepted sender, the excepted rua source IPs,
@@ -1046,12 +1050,14 @@ def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None):
     counts here only on the no-domain path: with named domains the mail log
     is attributed per sender domain (_maillog_blockers, _excepted_by_domain),
     so no gate inherits another's rows. An excepted failure holds nothing,
-    delivered despite failing or not."""
+    delivered despite failing or not. audited: the gate's names; a domain
+    exception covers a failing stream only when every domain the stream
+    authenticated with, other than these, is under it (config.matches_stream)."""
     blockers, notes, excepted_streams = [], [], []
     active = list(exceptions or [])
     if rua_doc:
         for f in rua_doc["failing_streams"]:
-            hit = next((e for e in active if config_mod.matches_stream(e, f)), None)
+            hit = next((e for e in active if config_mod.matches_stream(e, f, audited)), None)
             if hit:
                 excepted_streams.append(f["source_ip"])
                 notes.append(f"{f['source_ip']} ({f['count']} msgs, {f['likely']}) excepted until {hit['until']}: "
@@ -1349,7 +1355,7 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
     if remarked:
         mark_excepted(maillog_doc, active)
         _follow_marks(maillog_doc, names)
-    shared, exc = _shared_blockers(rua_doc, None if names else maillog_doc, tenant_docs, active)
+    shared, exc = _shared_blockers(rua_doc, None if names else maillog_doc, tenant_docs, active, names)
     notes = list(exc["notes"])
     excepted = {}
     if names:
@@ -2179,13 +2185,22 @@ def _mx_line(r):
     return ", ".join(r["mx"])
 
 
+def _excepted_share(c):
+    """' (N of them formally excepted in audit.toml)' for a counters slice whose
+    genuine failures a formal exception partly covers (its excepted count, from
+    the marks build_report puts on the verdicts), else ''. The count beside it
+    still holds every one."""
+    n = min(max(_count(_dict(c).get("excepted")) or 0, 0), max(_count(_dict(c).get("genuine_failures")) or 0, 0))
+    return f" ({n} of them formally excepted in audit.toml)" if n else ""
+
+
 def _md_domain_counters(c):
     """One domain's mail-log line, from its own counters."""
     if not c["logical_messages"]:
         return "no mail-log rows for this domain in the window"
     likely = ", ".join(f"{n} {label}" for label, n in c["by_likely"].items() if n) or "none"
     tops = ", ".join(f"{t['sender']} x{t['genuine_failures']}" for t in (c.get("top_senders") or [])[:3])
-    return (f"{c['logical_messages']} logical messages, {c['genuine_failures']} genuine failures, "
+    return (f"{c['logical_messages']} logical messages, {c['genuine_failures']} genuine failures{_excepted_share(c)}, "
             f"{c['echo_messages']} echo; delivered despite fail {c['delivered_despite_fail']}, "
             f"blocked despite pass {c['blocked_despite_pass']}; likely split: {likely}"
             + (f"; top failing senders: {tops}" if tops else ""))
@@ -2201,8 +2216,8 @@ def _md_by_domain(L, bd):
         shown = ", ".join(f"{r['domain']} {r['genuine_failures']} failing of {r['logical_messages']}"
                           for r in doms[:8]) + (f" (+{len(doms) - 8} more)" if len(doms) > 8 else "")
         L.append(f"- no domain named: all {oc.get('logical_messages', 0)} logical messages "
-                 f"({oc.get('genuine_failures', 0)} genuine failures) counted once under {OTHER}"
-                 + (f"; sender domains seen: {shown}" if shown else ""))
+                 f"({oc.get('genuine_failures', 0)} genuine failures{_excepted_share(oc)}) counted once under "
+                 f"{OTHER}" + (f"; sender domains seen: {shown}" if shown else ""))
         return
     for d, dc in bd.items():
         if d == OTHER:
@@ -2213,15 +2228,15 @@ def _md_by_domain(L, bd):
             subs = st.get("domains") or []
             shown = ", ".join(subs[:8]) + (f" (+{len(subs) - 8} more)" if len(subs) > 8 else "")
             L.append(f"  - unaudited subdomains ({shown}): {st['logical_messages']} logical messages, "
-                     f"{st['genuine_failures']} genuine failures - counted separately, not gated; "
-                     "add them to the domain list to gate them")
+                     f"{st['genuine_failures']} genuine failures{_excepted_share(st)} - counted separately, not "
+                     "gated; add them to the domain list to gate them")
     if oc.get("logical_messages"):
         doms = oc.get("sender_domains") or []
         shown = ", ".join(f"{r['domain']} {r['genuine_failures']} failing of {r['logical_messages']}"
                           for r in doms[:8]) + (f" (+{len(doms) - 8} more)" if len(doms) > 8 else "")
         L.append(f"- {OTHER} - sender domains outside the audited list: {oc['logical_messages']} logical "
-                 f"messages, {oc['genuine_failures']} genuine failures ({shown}) - reported once, "
-                 "attached to no gate")
+                 f"messages, {oc['genuine_failures']} genuine failures{_excepted_share(oc)} ({shown}) - reported "
+                 "once, attached to no gate")
     else:
         L.append(f"- {OTHER}: no rows from sender domains outside the audited list")
 
@@ -2275,6 +2290,15 @@ def _md_mailflow(L, report):
             seen = (f"; last seen {str(counts['last_seen'])[:16].replace('T', ' ')}"
                     if isinstance(counts, dict) and counts.get("last_seen") else "")
             L.append(f"- {d}: {mailflow_text(counts, mf.get('days'))}{seen}")
+        # the names the same query saw under those organizations that are not audited: the ones sending
+        # out through the tenant are subdomains the plan wants a record of their own for before sp= moves
+        out = sorted(((n, _count(_dict(c).get("outbound")) or 0) for n, c in _dict(mf.get("unaudited")).items()),
+                     key=lambda nc: (-nc[1], nc[0]))
+        sending = [f"{n} {k} out" for n, k in out if k > 0]
+        if sending:
+            L.append(f"- not audited, seen sending through the tenant: {', '.join(sending[:8])}"
+                     + (f" (+{len(sending) - 8} more)" if len(sending) > 8 else "")
+                     + " - the plan counts them among the subdomains that send")
     L.append("")
     L.append(MAILFLOW_NOTE)
     L.append("")
@@ -2718,6 +2742,10 @@ def main():
         except config_mod.ConfigError as exc:
             die(str(exc))
         exceptions = cfg.get("exceptions") or []
+    # an IP prefix among the vendor domains matches nothing: said on every run, as collect.py says it, and left out
+    vendors, vendor_warnings = config_mod.split_vendor_domains(list(args.vendor_domain) + cfg_vendors)
+    for w in vendor_warnings:
+        print("note: " + w, file=sys.stderr)
 
     # Domains: command line (comma or space separated), --file, and - unless
     # --no-graph or --offline - the tenant's own verified domain list, merged
@@ -2777,7 +2805,7 @@ def main():
             offline=args.offline, resolver_addr=args.resolver,
             selectors=[s.strip() for s in args.selectors.split(",")] if args.selectors else (),
             known=args.known, sender_domain=args.sender_domain, auth_column=args.auth_column,
-            vendor_domains=list(args.vendor_domain) + cfg_vendors, authserv_id=args.authserv_id, strict=args.strict,
+            vendor_domains=vendors, authserv_id=args.authserv_id, strict=args.strict,
             min_volume=args.min_volume, fail_threshold=args.fail_threshold,
             since=args.since, until=args.until, expect_policy=args.expect_policy,
             retiring=args.retiring_selector, columns=columns,

@@ -86,8 +86,9 @@ needs a script.
    PowerShell auditors need a certificate.
 5. **Fill `.env`.** Copy `.env.example` to `.env` and paste the tenant ID,
    client ID and secret value. Set `RUA_MAILBOX` to the report mailbox if you
-   added `Mail.Read`, otherwise leave it empty. `.env` is gitignored; never
-   commit it, paste it into a chat, or send it anywhere.
+   added `Mail.Read`, otherwise leave it empty. `EXTRA_DOMAINS` (optional)
+   adds domains the tenant does not hold; Step 2 says how. `.env` is
+   gitignored; never commit it, paste it into a chat, or send it anywhere.
 6. **Scope `Mail.Read` to the report mailbox** (only if you set `RUA_MAILBOX`).
    As an application permission it can read every mailbox in the tenant; an
    Exchange Online Application Access Policy restricts it to the one that
@@ -110,7 +111,7 @@ needs a script.
 | Permission | Where it lives | What the toolkit does with it | Used by | Without it |
 |---|---|---|---|---|
 | `ThreatHunting.Read.All` | Microsoft Graph, Application | runs the advanced hunting queries: 30 days of mail-flow telemetry, deduplicated | `collect.py`, `run_hunting.py`, `discover.py --mailflow` | no tenant data; DNS, saved reports and files still work |
-| `Domain.Read.All` | Microsoft Graph, Application | reads the tenant's verified domain list, so a run with no arguments audits everything you own | `collect.py`, `discover.py`, `audit.py` | list the domains in `audit.toml` or on the command line |
+| `Domain.Read.All` | Microsoft Graph, Application | reads the tenant's verified domain list, so a run with no arguments audits everything you own | `collect.py`, `discover.py`, `audit.py` | list the domains in `audit.toml`, on the command line or in `EXTRA_DOMAINS` (`.env`) |
 | `Mail.Read`, scoped by an Application Access Policy | Microsoft Graph, Application | reads aggregate (rua) reports out of one mailbox: the outside view | `fetch_rua.py`, `collect.py` | no outside view; save the report files by hand and pass `--rua` |
 | `Exchange.ManageAsApp` (optional) | Office 365 Exchange Online, Application, plus the **Global Reader** directory role on the app and a certificate | lets the three PowerShell auditors run unattended; they read transport rules, bypasses and groups, which Graph does not expose | `audit_rules.ps1`, `audit_bypasses.ps1`, `audit_groups.ps1` through `ToolkitExo.ps1` | run those three yourself after `Connect-ExchangeOnline`, or skip them |
 
@@ -147,11 +148,21 @@ it names your domains. Everything in it is optional and every value can also be
 given as a command-line flag; a flag beats the file. The ones worth setting on
 day one:
 
-- `domains`: leave empty to audit every verified domain in the tenant, or list
-  them. `mailflow = true` adds every subdomain seen sending in the last 30 days.
-  Either way, every run that has the app registration measures each audited
-  domain's own mail flow over the last 30 days, the organizational domain
-  included.
+- `domains`: every domain the tenant lists is always audited when the app
+  registration can read them; names listed here are audited beside them (and
+  with no app registration, they are the list). Domains the tenant does not
+  hold - a registrar-only domain, a brand on another mail platform - go in
+  `.env` as `EXTRA_DOMAINS=brand.example, parked.example` (comma or space
+  separated; an entry that is not a domain is noted and skipped).
+  `collect.py` and `discover.py` read it with the credentials, so a run with
+  `--offline` or `--no-graph` does not. The tenant's mail log only sees mail
+  that touches the tenant, so for a domain hosted elsewhere the mail-flow
+  measurement and the mail log say little and its aggregate reports carry
+  the evidence: the plan never moves such a domain straight to quarantine on
+  the tenant's zero alone. `mailflow = true` adds every subdomain seen
+  sending in the last 30 days. Either way, every run that has the app
+  registration measures each audited domain's own mail flow over the last
+  30 days, the organizational domain included.
 - `known`: your vendors' IP prefixes and domains. The unknown-sender check in
   the aggregate reports runs only on the IP prefixes: with them, every source
   outside them and every DKIM signing domain that is neither yours nor listed
@@ -162,8 +173,7 @@ day one:
   labels in the mail log and in the aggregate reports start informed. Like the
   domains in `known` they narrow the signing-domain list, but they never
   switch the unknown-sender check on. Domains only: an IP prefix here never
-  matches anything (a run that reads aggregate reports warns about it); IP
-  prefixes go in `known`.
+  matches anything (every run warns about it); IP prefixes go in `known`.
 - `rua_address`: the `mailto:` the plan writes into new DMARC records.
 - `keep = 12`: how many dated runs stay under `audit-out/history/`.
 - `[notify] enabled`: whether the Slack summary posts when a webhook is set.
@@ -195,9 +205,10 @@ logical messages            : 81
 The third line runs entirely from the bundled synthetic samples with no
 credentials and no network, which is the quickest way to see the outputs; the
 block under it is `dedupe.py`'s own report on those samples, the
-deduplication every run performs. A run verifies the registration, reads the domain list, measures each
-audited domain's mail flow with one aggregate query (what the tenant sent as
-it and received with it as the From domain), pulls the raw mail log for each
+deduplication every run performs. A run verifies the registration, reads the
+domain list (the tenant's, plus `EXTRA_DOMAINS`), measures each audited
+domain's mail flow with one aggregate query (what the tenant sent as it and
+received with it as the From domain), pulls the raw mail log for each
 organizational domain (sized by the hour and pulled in complete windows,
 newest first, so a busy domain never comes back as a truncated day), counts
 the whole window in advanced hunting for an organization whose rows the row
@@ -230,8 +241,10 @@ Read them in this order, all under `audit-out/latest/`:
    any tenant that runs the toolkit gets the same document from the same
    inputs. `next_steps.json` is the same content as data.
 2. **`todo.md`**: one prioritised list. Decide the holds first, then the
-   zero-risk DNS rows, then the senders to fix DKIM-first, then tenant
-   configuration, then the gated enforcement steps with their prerequisites.
+   priority-1 DNS rows (the zero-risk monitoring and hygiene rows, and a
+   "quarantine now" row once its checks are confirmed), then the senders to
+   fix DKIM-first, then tenant configuration, then the gated enforcement
+   steps with their prerequisites.
    Every line says which file holds the evidence.
 3. **`report.md`**: the gate verdict per domain (`go`, `no_go`, or
    `insufficient_data` when a zero would only mean "no data"), each finding
@@ -271,21 +284,54 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
 `src/audit.py`):
 
 - **Monitoring first.** Every domain and subdomain gets `p=none` with a `rua`
-  address before anything else; parked domains get `v=spf1 -all` and
-  `p=reject` once "unused" is verified. Every run with the app registration
-  measures each domain's mail flow over 30 days (whatever `--days` says). A
-  parked candidate (no MX, no sender in SPF, no DKIM selector) reads as
-  verified unused only when the tenant saw no mail from it, out or in, in
-  those 30 days and the run's aggregate reports, which cover its DMARC
-  record, count no passing mail as it; otherwise its prerequisite names the
-  checks still open (mail a third party sends as the domain straight to
-  outside recipients never passes through the tenant, so only the reports
-  show it). Passing mail as it in those reports means the domain sends: it
-  gets a monitoring record, not a park.
+  address before anything else, unless the run measured it sending nothing
+  (below); parked domains get `v=spf1 -all` and `p=reject` once "unused" is
+  verified. Every run with the app registration measures each domain's mail
+  flow over 30 days (whatever `--days` says). A parked candidate (no MX, no
+  sender in SPF, no DKIM selector) reads as verified unused only when the
+  tenant saw no mail from it, out or in, in those 30 days and the run's
+  aggregate reports, which cover its DMARC record, count no passing mail as
+  it; otherwise its prerequisite names the checks still open (mail a third
+  party sends as the domain straight to outside recipients never passes
+  through the tenant, so only the reports show it). Passing mail as it in
+  those reports means the domain sends: it gets a monitoring record, not a
+  park.
 - **One ratchet per domain per week**: `p=none` to `p=quarantine; pct=25`, to
-  `pct=100`, to `p=reject`, then the subdomain policy `sp=`, then SPF `-all`.
-  A step appears only when the earlier ones are done and a week of reports has
-  flowed.
+  `pct=100`, to `p=reject`, then SPF `-all`. A step appears only when the
+  earlier ones are done and a week of reports has flowed.
+- **No mail measured: quarantine now.** A domain the run measured sending
+  nothing skips that ramp, which would protect nobody: no mail out in the
+  tenant's 30-day mail flow; nothing passing, internal, formally excepted or
+  failing like our own system in its own mail-log rows, and those rows
+  examined all the mail that came in as it (a mail log the row budget or a
+  shorter window cut verifies nothing, unless the full-window totals cover
+  it); no passing volume as it in the aggregate reports. Mail that comes in
+  as it and fails looking like spoofing is no reason to wait; mail the
+  heuristic cannot call spoofing is named on the row as a check, never
+  called spoofing. A domain whose mail the tenant does not carry - one only
+  `EXTRA_DOMAINS` (or a file, or the command line) names, or one whose SPF
+  or DKIM points at another platform - needs aggregate reports that cover
+  it; until then it gets the monitoring record or the ramp. The plan
+  proposes its `p=quarantine` record (no `pct`) as a priority-1 row, "no
+  mail measured: quarantine now", which is not one of the zero-risk rows: it
+  waits until no sender that mails less often than monthly (statements,
+  renewals) uses the domain, and until the checks it names are confirmed.
+  `p=reject` follows after a week of reports still showing nothing passing,
+  with no DKIM proof to wait for and the same checks carried over. The
+  per-domain lines lead with it, and give the gate's verdict as the one for
+  the weekly ramp it skips. The parked rule comes first where it applies.
+- **Subdomains: their own records first, then `sp=`.** With the apex at
+  `p=quarantine` (pct 100) or `p=reject` and `sp=none`, the plan proposes
+  `sp=quarantine` once every subdomain that sends or may send - outbound in
+  the tenant's mail flow (the same query counts the unaudited names under
+  your organizations), passing in the mail log or in the aggregate reports,
+  failing there as our own system does, as an unclear sender or as a
+  formally excepted one, and an audited subdomain whose mail out was not
+  measured - has a `_dmarc` record of its own. It proposes the missing
+  monitoring records itself and holds the step, naming them, until they
+  exist; with no aggregate report covering the apex's record it says what
+  only those would show. At quarantine the move to reject and the `sp=` step
+  both rewrite the apex's record, so each row names the other: one a week.
 - **Deduplicated failure gate.** A legitimate sender still failing holds the
   next step and the hold says who. Spoofs that receivers already reject do not
   hold anything: enforcement is what stops them. Each domain is judged on its
@@ -295,11 +341,19 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   evidence from the aggregate reports or from a mail log carrying SPF and DKIM
   verdicts (`queries/raw_maillog.kql` writes them). Senders passing on SPF
   alone hold the move, because forwarding breaks SPF. With no DKIM evidence at
-  all the verdict is `insufficient_data`, never "go".
+  all the verdict is `insufficient_data`, never "go". (A domain the run
+  measured sending nothing has no sender to prove: its reject row waits on a
+  week of reports showing nothing passing instead.)
 - **Formal exceptions.** A failing sender you have explained and accepted can
   be excepted in `audit.toml` (`[[exceptions]]`: match, reason, owner, until,
   removal criterion). Entries missing a field are reported and ignored;
-  expired ones block again.
+  expired ones block again. An address match covers every message with that
+  From address, forged copies included; for a vendor platform prefer its
+  envelope domain, which a spoof of your From address does not carry. A
+  domain match covers an aggregate-report stream only when every domain the
+  stream authenticated with, other than your audited ones, is under it, so a
+  shared relay that also carries other senders' mail is never lifted by one
+  vendor's exception.
 
 ## Step 5 - put it on a weekly schedule
 
@@ -412,7 +466,7 @@ answer.
 | `src/next_steps.py` | `report.json` in, `next_steps.md` + `next_steps.json` out: the status document you send. One-line status, deduplicated counts with the raw number alongside, what is failing, a per-domain table, actions grouped by owner, the ask and the open questions. Reads `plan.json`, `metrics.json`, the previous run and `owners.csv` when they exist; deterministic, no AI. |
 | `src/plan.py` | `report.json` in, `plan.md` out: the exact records to publish, with current value, rollback, priority and prerequisites. |
 | `src/config.py` | Reads `audit.toml`: settings and the formal exceptions. Library only. |
-| `src/discover.py` | Finds the domains: command line, file, the tenant, subdomains seen in mail flow; records each zone's DNS host; with `collect.py`'s token, measures every domain's own mail flow in one aggregate query. |
+| `src/discover.py` | Finds the domains: command line, file, the tenant, `EXTRA_DOMAINS` from `.env` (domains the tenant does not hold), subdomains seen in mail flow; records each zone's DNS host; with `collect.py`'s token, measures every domain's own mail flow in one aggregate query. |
 | `src/verify_setup.py` | Proves the app registration: token, roles (required, recommended, excess), domain list, a hunting query, the report mailbox, and that other mailboxes are denied. |
 | `src/graph_client.py` | Shared Microsoft Graph helper. Library only. |
 | `src/fetch_rua.py` | Pulls aggregate (rua) reports out of the report mailbox. The weekly job reads the last 30 days on a first run and only new reports after; run standalone it backfills the whole mailbox, up to `--max` messages per run, and `--since` starts anywhere. Attachments come back inline, about 20 per call. |

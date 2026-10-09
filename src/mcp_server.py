@@ -460,7 +460,11 @@ def parse_rua(
     senders, unknown senders, policy seen by reporters. Counts are
     receiver-reported and include forwarded copies; cross-check any failure
     number against the tenant log with dedupe_maillog before reporting it.
-    known: comma-separated sender domains/IP prefixes you recognise.
+    known: comma-separated sender domains and IP prefixes you recognise. The
+    per-IP unknown-sender check runs only on the IP prefixes; with none
+    listed it does not run and every source is listed as unknown, and
+    domains alone only narrow the signing-domain list and inform the labels
+    (finding OUTSIDE-009 says when the check did not run).
     Relative paths resolve from the repo root."""
     if not paths:
         return {"error": "no paths given"}
@@ -553,7 +557,8 @@ def run_audit(
                          "got a path resolving outside it"}
     try:
         cfg = config_mod.load(config)
-        vendors = config_mod.audit_list(cfg, "vendor_domains")
+        # an IP prefix among the vendor domains matches nothing: left out, and the reply says so, as the CLIs do
+        vendors, vendor_warnings = config_mod.split_vendor_domains(config_mod.audit_list(cfg, "vendor_domains"))
     except config_mod.ConfigError as err:
         return {"error": str(err)}
     try:
@@ -574,6 +579,8 @@ def run_audit(
                  "preview below may contain tenant data now in the conversation "
                  "- redact before publishing (AGENTS.md rule 3)."),
     }
+    if vendor_warnings:
+        reply["warnings"] = vendor_warnings
     reply.update(_cap_list(report["findings"], "findings"))
     try:
         jpath, mpath = audit_mod.write_reports(report, opath)
