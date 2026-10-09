@@ -405,7 +405,17 @@ def census(verdicts):
     every (sender, domain, envelope) stream seen, with its genuine failures
     (and, per stream, how many were delivered despite failing), worst first. Clean entries stay in, so a new sender shows up before it
     fails. Takes the verdict dict from classify() or the --json verdict list.
-    {"by_envelope": [...], "by_sender": [...]}"""
+    {"by_envelope": [...], "by_sender": [...]}
+
+    Formal exceptions: audit.py marks every verdict an [[exceptions]] entry
+    covers (v["excepted"]), and each entry says how much of it was excepted
+    and what is left, so a reader subtracts exact numbers. Per stream:
+    excepted (genuine failures excepted), excepted_delivered (the excepted
+    ones delivered despite failing), likely_counts ({label: n} over the
+    failures not excepted) and likely_after (their majority label, None when
+    none is left). Per envelope: excepted, likely_after, senders_after (the
+    senders with a failure left) and sample_sender_after. Every other field
+    counts every failure, excepted or not."""
     vs = list(verdicts.values()) if isinstance(verdicts, dict) else list(verdicts)
     envs, senders = {}, {}
     for v in vs:
@@ -414,12 +424,13 @@ def census(verdicts):
         dom = (v.get("domain") or "").strip().lower()
         failing = bool(v.get("genuine_failure"))
         likely = v.get("likely") or "unknown"
-        e = envs.setdefault(env, {"messages": 0, "genuine_failures": 0,
-                                  "all": Counter(), "fail": Counter(), "likely": Counter()})
+        e = envs.setdefault(env, {"messages": 0, "genuine_failures": 0, "excepted": 0, "all": Counter(),
+                                  "fail": Counter(), "likely": Counter(), "fail_after": Counter(), "after": Counter()})
         e["messages"] += 1
         e["all"][sender] += 1
         s = senders.setdefault((sender, dom, env), {"messages": 0, "genuine_failures": 0, "likely": Counter(),
-                                                    "delivered_despite_fail": 0,
+                                                    "delivered_despite_fail": 0, "excepted": 0,
+                                                    "excepted_delivered": 0, "after": Counter(),
                                                     "subject": v.get("subject") or "", "fail_subject": None})
         s["messages"] += 1
         if v.get("delivered_despite_fail"):
@@ -432,15 +443,27 @@ def census(verdicts):
             s["likely"][likely] += 1
             if s["fail_subject"] is None:
                 s["fail_subject"] = v.get("subject") or ""
+            if v.get("excepted"):
+                e["excepted"] += 1
+                s["excepted"] += 1
+                s["excepted_delivered"] += bool(v.get("delivered_despite_fail"))
+            else:
+                e["fail_after"][sender] += 1
+                e["after"][likely] += 1
+                s["after"][likely] += 1
     by_env = [{"envelope_domain": env, "genuine_failures": e["genuine_failures"], "messages": e["messages"],
                "senders": len(e["all"]), "sample_sender": _dominant(e["fail"]) or _dominant(e["all"]),
-               "likely": _dominant(e["likely"])}
+               "likely": _dominant(e["likely"]),
+               "excepted": e["excepted"], "likely_after": _dominant(e["after"]),
+               "senders_after": len(e["fail_after"]), "sample_sender_after": _dominant(e["fail_after"])}
               for env, e in envs.items()]
     by_sender = [{"sender": sender, "domain": dom, "envelope_domain": env,
                   "genuine_failures": s["genuine_failures"], "messages": s["messages"],
                   "delivered_despite_fail": s["delivered_despite_fail"],
                   "likely": _dominant(s["likely"]),
-                  "sample_subject": s["fail_subject"] if s["fail_subject"] is not None else s["subject"]}
+                  "sample_subject": s["fail_subject"] if s["fail_subject"] is not None else s["subject"],
+                  "excepted": s["excepted"], "excepted_delivered": s["excepted_delivered"],
+                  "likely_counts": dict(sorted(s["after"].items())), "likely_after": _dominant(s["after"])}
                  for (sender, dom, env), s in senders.items()]
     by_env.sort(key=lambda r: (-r["genuine_failures"], -r["messages"], r["envelope_domain"]))
     by_sender.sort(key=lambda r: (-r["genuine_failures"], -r["messages"], r["sender"], r["envelope_domain"]))

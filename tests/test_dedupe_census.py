@@ -169,9 +169,11 @@ def test_cli_json_carries_the_full_census_and_the_report_prints_it():
     fails = [e["genuine_failures"] for e in cs["by_envelope"]]
     assert fails == sorted(fails, reverse=True)
     assert set(cs["by_envelope"][0]) == {"envelope_domain", "genuine_failures", "messages", "senders",
-                                        "sample_sender", "likely"}
+                                        "sample_sender", "likely",
+                                        "excepted", "likely_after", "senders_after", "sample_sender_after"}
     assert set(cs["by_sender"][0]) == {"sender", "domain", "envelope_domain", "genuine_failures", "messages", "delivered_despite_fail",
-                                      "likely", "sample_subject"}
+                                      "likely", "sample_subject",
+                                      "excepted", "excepted_delivered", "likely_counts", "likely_after"}
     p = run_cli()
     assert p.returncode in (0, 1), p.stderr
     assert "genuine failures by envelope domain (" in p.stdout

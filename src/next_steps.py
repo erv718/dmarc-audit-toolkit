@@ -21,7 +21,10 @@ when the report carries it, else the whole census "across all audited
 domains". The window in the heading is the aggregate reports' own date
 range, else the requested --since/--until bounds, else "this run's window";
 no number of days is ever assumed. --audience replaces the default first
-sentence of the audience line.
+sentence of the audience line. What audit.toml formally excepts comes off
+every list that names senders exactly as the census counts it per stream,
+and is listed once, as excepted; the gate's verdict decides whether the
+next step reads ready, on hold, or in need of more data.
 
 Owners file (default <repo root>/owners.csv, gitignored; see
 samples/owners.csv.example): CSV with columns pattern,owner,channel,note.
@@ -66,7 +69,10 @@ ACTIONABLE = ("major", "blocking")
 DEFAULT_AUDIENCE = "For the people who own our email domains and sending systems"
 LIKELY_WORDS = {"likely_spoof": "looks like spoofing",
                 "likely_misconfigured_sender": "looks like our own system misconfigured",
+                "likely_misconfigured": "looks like our own system misconfigured",
                 "unknown": "unclear", "mixed": "mixed - some look like spoofing, some like our own systems"}
+# the three groups every heuristic label falls into; rua_parse spells the middle one likely_misconfigured
+OWN, SPOOF, UNCLEAR = "likely_misconfigured_sender", "likely_spoof", "unknown"
 GATE_WORDS = {"go": "ready", "no_go": "not yet", "insufficient_data": "needs more data"}
 FIRST_STEP = "publish a monitoring-only DMARC record for %s so reports start"
 # CLI flags in audit prose, as the words a reader without the CLI can act on.
@@ -132,7 +138,7 @@ JARGON_WORDS = tuple((re.compile(p, re.I), r) for p, r in (
 ID_RX = re.compile(r"(?<![\w(-])((?:[A-Z]{2,}|P)-\d{2,})(?![\w-])(?![^(]*\))")
 # The gate's mail-log blocker, split by blocker_items() so spoofs are never a gap to close.
 GAP_RX = re.compile(r"^(\d+) logical message\(s\) from this domain failed with no passing copy "
-                    r"\(deduplicated(?:; \d+ more excepted)?\)"
+                    r"\(deduplicated(?:; (\d+) more excepted)?\)"
                     r"(?:; top senders: .*)?$")
 # Plan prerequisites written as observations, reworded as the condition that clears them.
 PREREQ_REWORDS = (
@@ -256,6 +262,22 @@ def _f(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _likely(label):
+    """A heuristic label as this document reads it: the aggregate reports'
+    likely_misconfigured is the mail log's likely_misconfigured_sender (our
+    own system, misconfigured), one meaning in two spellings; no label is
+    unknown."""
+    if not isinstance(label, str) or not label:
+        return UNCLEAR
+    return OWN if label == "likely_misconfigured" else label
+
+
+def _group(label):
+    """The one-liner's group for a label: our own, spoofing, or unclear."""
+    label = _likely(label)
+    return label if label in (OWN, SPOOF) else UNCLEAR
 
 
 def _day(value):
@@ -422,7 +444,8 @@ def _entries(obj, name_keys):
     """A summary list (list of dicts) or map (name -> count or dict) as
     [{name, count, likely, ...}] worst first, entries with no genuine failures
     dropped (audit.py's census lists clean senders too); None when the shape
-    is not understood."""
+    is not understood. The census's exception counts ride along (excepted,
+    likely_counts, likely_after, ...) for _after_exceptions."""
     if isinstance(obj, dict):
         items = []
         for k, v in obj.items():
@@ -443,7 +466,19 @@ def _entries(obj, name_keys):
             continue
         likely = it.get("likely") or it.get("label")
         entry = {"name": name.strip().lower(), "count": count,
-                 "likely": likely if isinstance(likely, str) else None, "messages": _n(it.get("messages"))}
+                 "likely": _likely(likely) if isinstance(likely, str) else None, "messages": _n(it.get("messages"))}
+        for key in ("excepted", "excepted_delivered", "senders_after"):
+            if _n(it.get(key)) is not None:
+                entry[key] = _n(it[key])
+        if isinstance(it.get("likely_counts"), dict):
+            counts = Counter()
+            for label, n in it["likely_counts"].items():
+                counts[_likely(label)] += _n(n) or 0
+            entry["likely_counts"] = dict(counts)
+        if "likely_after" in it:
+            entry["likely_after"] = _likely(it["likely_after"]) if it["likely_after"] else None
+        if it.get("sample_sender_after"):
+            entry["sample_sender_after"] = str(it["sample_sender_after"])
         senders = it.get("senders")
         if isinstance(senders, list) and senders:
             entry["senders"] = [str(s) for s in senders]
@@ -561,9 +596,51 @@ def truncation_note(ml):
     return None
 
 
+def _carries_exceptions(obj):
+    """True when census rows carry the exception counts (an audit.py that marks excepted verdicts)."""
+    rows = obj.values() if isinstance(obj, dict) else (obj if isinstance(obj, list) else [])
+    return any(isinstance(r, dict) and "excepted" in r for r in rows)
+
+
+def _after_exceptions(entries, what):
+    """(left, excepted) for census entries that carry the exception counts:
+    each entry keeps the failures no exception covers, labelled by what is
+    left (likely_after), and an envelope names the senders still failing
+    through it; an entry with nothing left drops out. excepted: one
+    {name, domain, envelope, count} per stream an exception covered, so the
+    excepted messages are listed once, as such."""
+    left, excepted = [], []
+    for e in entries:
+        n_exc = min(e.get("excepted") or 0, e["count"])
+        if n_exc and what == "sender":
+            excepted.append({"name": e["name"], "domain": e.get("domain"), "envelope": e.get("envelope"),
+                             "count": n_exc})
+        e = dict(e, count=e["count"] - n_exc)
+        if e["count"] <= 0:
+            continue
+        if "likely_after" in e:
+            e["likely"] = e["likely_after"] or e.get("likely")
+        if what == "envelope" and e.get("senders_after") is not None:
+            e["sender_count"] = e["senders_after"]
+            e["senders"] = [e["sample_sender_after"]] if e.get("sample_sender_after") else []
+        left.append(e)
+    left.sort(key=lambda e: (-e["count"], e["name"]))
+    excepted.sort(key=lambda e: (-e["count"], e["name"], str(e.get("envelope") or "")))
+    return left, excepted
+
+
 def maillog_view(report):
     """What the document needs from the mail log: summaries when the report
-    carries them, else derived from the verdicts. None when there is no mail log."""
+    carries them, else derived from the verdicts. None when there is no mail log.
+
+    The lists that name senders are what the formal exceptions left: the
+    census counts the excepted failures per stream (audit.py marks every
+    verdict an exception covers), so each stream loses exactly its own, and
+    the excepted messages are listed once, in view["excepted"]. A report
+    whose census does not carry those counts (written before audit.py marked
+    them) is not reduced at all: nothing in it says which stream an
+    exception covered, so its excepted total (excepted_unsplit) can only be
+    named as a part of the counts shown."""
     ml = report.get("maillog")
     if not isinstance(ml, dict):
         return None
@@ -592,40 +669,74 @@ def maillog_view(report):
 
     census = ml.get("census")
     by_env = by_sender = None
+    counted = False  # the excepted failures are counted per stream: what is left can be named exactly
+    excepted = []
     if isinstance(census, dict):
         env_obj = next((census[k] for k in ("by_envelope", "envelope", "env", "envelopes") if k in census), None)
         snd_obj = next((census[k] for k in ("by_sender", "sender", "senders", "addr") if k in census), None)
         by_env = _entries(env_obj, ENV_KEYS) if env_obj is not None else None
         by_sender = _entries(snd_obj, SENDER_KEYS) if snd_obj is not None else None
+        counted = _carries_exceptions(snd_obj) and by_sender is not None
+        if counted:
+            by_sender, excepted = _after_exceptions(by_sender, "sender")
+            if by_env is not None:
+                by_env = _after_exceptions(by_env, "envelope")[0]
     elif isinstance(census, list):
         by_env = _entries(census, ENV_KEYS)
     if by_env is not None or by_sender is not None:
         view["basis"] = "census"
     if (by_env is None or by_sender is None) and verdicts:
-        v_env, v_snd = _from_verdicts(genuine)
+        # the verdicts themselves: the ones an exception covers carry its mark and are listed apart
+        v_env, v_snd = _from_verdicts([v for v in genuine if not v.get("excepted")])
+        if by_sender is None:
+            counted = any("excepted" in v for v in genuine)
+            gone = Counter(((v.get("sender") or "(no sender)").lower(), (v.get("domain") or "").lower(),
+                            (v.get("envelope_domain") or "(blank)").lower()) for v in genuine if v.get("excepted"))
+            excepted = [{"name": s, "domain": d, "envelope": e, "count": n}
+                        for (s, d, e), n in sorted(gone.items(), key=lambda kv: (-kv[1], kv[0]))]
         by_env = by_env if by_env is not None else v_env
         by_sender = by_sender if by_sender is not None else v_snd
         view["basis"] = view["basis"] or "verdicts"
     view["by_envelope"] = by_env or []
     view["by_sender"] = by_sender or []
     view["census_missing"] = by_env is None and by_sender is None
-    ddf = Counter((v.get("sender") or "(no sender)").lower() for v in verdicts if v.get("delivered_despite_fail"))
-    env_of = {}
-    if ddf:
-        for v in verdicts:
-            s = (v.get("sender") or "(no sender)").lower()
-            if s in ddf and s not in env_of:
-                env_of[s] = v.get("envelope_domain") or ""
-    else:  # report.json carries the census, not the verdicts: the census names them per sender stream
+    view["excepted"] = excepted
+    view["exceptions_counted"] = counted
+    gate = report.get("gate") if isinstance(report.get("gate"), dict) else {}
+    gate_exc = gate.get("exceptions") if isinstance(gate.get("exceptions"), dict) else {}
+    unsplit = _n(gate_exc.get("excepted_maillog_failures"))
+    if unsplit is None:  # a gate older still: what it excepted per domain
+        doms = gate.get("domains") if isinstance(gate.get("domains"), dict) else {}
+        unsplit = sum(_n(g.get("excepted_failures")) or 0 for g in doms.values() if isinstance(g, dict))
+    view["excepted_unsplit"] = 0 if counted else unsplit
+    # delivered despite failing, per sender: what the exceptions left (an excepted sender is not told to
+    # find its override), with how many the exceptions cover
+    ddf, env_of, ddf_excepted = Counter(), {}, 0
+    for v in verdicts:
+        if not v.get("delivered_despite_fail"):
+            continue
+        if v.get("excepted"):
+            ddf_excepted += 1
+            continue
+        s = (v.get("sender") or "(no sender)").lower()
+        ddf[s] += 1
+        env_of.setdefault(s, v.get("envelope_domain") or "")
+    if not verdicts:  # report.json carries the census, not the verdicts: the census names them per sender stream
         raw = census.get("by_sender") if isinstance(census, dict) else None
-        for r in raw or []:
-            if isinstance(r, dict) and _n(r.get("delivered_despite_fail")):
+        for r in raw if isinstance(raw, list) else []:
+            n = _n(r.get("delivered_despite_fail")) if isinstance(r, dict) else None
+            if not n:
+                continue
+            gone = min(max(_n(r.get("excepted_delivered")) or 0, 0), n)
+            ddf_excepted += gone
+            if n > gone:
                 s = str(r.get("sender") or "(no sender)").lower()
-                ddf[s] += _n(r.get("delivered_despite_fail"))
+                ddf[s] += n - gone
                 env_of.setdefault(s, str(r.get("envelope_domain") or ""))
     view["ddf_senders"] = [{"name": s, "count": n, "domain": (s.rpartition("@")[2] if "@" in s else ""),
                             "envelope": env_of.get(s, "")}
                            for s, n in sorted(ddf.items(), key=lambda kv: (-kv[1], kv[0]))]
+    view["delivered_excepted"] = ddf_excepted
     for s in view["by_sender"]:
         s["likely"] = s.get("likely") or "unknown"
     return view
@@ -636,11 +747,65 @@ def maillog_view(report):
 OWN_SCOPES = ("own domain", "unaudited subdomains")
 
 
+def _split(s):
+    """{group: failures} for one census stream: from its likely_counts when
+    the census carries them (what the exceptions left, label by label), else
+    the whole stream under its own label."""
+    n = _n(s.get("count")) or 0
+    split = s.get("likely_counts") if isinstance(s.get("likely_counts"), dict) else None
+    out = Counter()
+    if split and sum(_n(v) or 0 for v in split.values()) == n:
+        for label, v in split.items():
+            out[_group(label)] += _n(v) or 0
+    else:
+        out[_group(s.get("likely"))] += n
+    return out
+
+
+def _by_address(entries):
+    """Census streams merged per address, each with what it has left per
+    group (likes: own, spoof, unclear, from _split): an address with
+    failures under two labels is named under both, with each count. An
+    address with nothing left drops out."""
+    merged = {}
+    for s in entries:
+        name = str(s.get("name") or "?").lower()
+        e = merged.setdefault(name, {"name": name, "count": 0, "domain": s.get("domain"), "likes": Counter()})
+        e["count"] += _n(s.get("count")) or 0
+        e["likes"].update(_split(s))
+    out = []
+    for e in merged.values():
+        likes = Counter({k: v for k, v in e["likes"].items() if v > 0})
+        e.update(likes=dict(likes), likely=likes.most_common(1)[0][0] if likes else UNCLEAR)
+        if e["count"] > 0:
+            out.append(e)
+    return sorted(out, key=lambda e: (-e["count"], e["name"]))
+
+
+def _groups(senders):
+    """{own, spoof, unclear} for the one-liner: every address with what it
+    has left under that group, worst first."""
+    groups = {OWN: [], SPOOF: [], UNCLEAR: []}
+    for s in senders:
+        for label, n in (s.get("likes") or {s.get("likely"): s.get("count") or 0}).items():
+            if n > 0:
+                groups[_group(label)].append({"name": s["name"], "count": n, "domain": s.get("domain"),
+                                              "likely": _group(label)})
+    for g in groups.values():
+        g.sort(key=lambda e: (-e["count"], e["name"]))
+    return groups
+
+
 def own_domain_view(report, view, org):
     """The organization domain's own mail-log numbers (maillog.by_domain[org]:
     its genuine failures, top senders and the likely split), with the census
-    entries for its senders; None when the report carries no per-domain
-    attribution, in which case the one-liner falls back to the whole census."""
+    entries for its senders merged per address; None when the report carries
+    no per-domain attribution, in which case the one-liner falls back to the
+    whole census. What the formal exceptions cover comes off exactly:
+    by_domain counts the excepted failures per label and the census per
+    stream, both from the marks audit.py put on the verdicts. A report from
+    before those counts keeps every number raw, and its excepted total (the
+    gate's) is only named as a part of them (excepted_reduced False)."""
     ml = report.get("maillog") if isinstance(report.get("maillog"), dict) else None
     bd = (ml or {}).get("by_domain")
     c = bd.get(org) if isinstance(bd, dict) else None
@@ -650,178 +815,84 @@ def own_domain_view(report, view, org):
     sub = c.get("subdomains_total") if isinstance(c.get("subdomains_total"), dict) else None
     if not _n(c.get("logical_messages")) and sub and _n(sub.get("logical_messages")):
         c, subs = sub, [str(d) for d in (sub.get("domains") or [])]  # the org's mail all sits in its subdomains
-    senders = [s for s in (view["by_sender"] if view else []) if s.get("domain") == org or s.get("domain") in subs]
-    gate_dom = ((report.get("gate") or {}).get("domains") or {}).get(org) or {}
-    exc_likely = gate_dom.get("excepted_by_likely") if isinstance(gate_dom.get("excepted_by_likely"), dict) else {}
-    exc_senders = gate_dom.get("excepted_senders") if isinstance(gate_dom.get("excepted_senders"), dict) else None
-    exc_streams = (gate_dom.get("excepted_senders_by_likely")
-                   if isinstance(gate_dom.get("excepted_senders_by_likely"), dict) else {})
-    excepted = sum(_n(v) or 0 for v in exc_likely.values()) or (_n(gate_dom.get("excepted_failures")) or 0)
-    # one entry per address whatever envelope it failed through, less what the gate formally excepted:
-    # the gate's blocker counts are after the exceptions, so every number here is too. A gate that
-    # does not say which of a sender's streams it excepted (an older report.json) cannot be taken off
-    # the named counts: then the split and the names stay raw and the excepted total is a subset clause.
-    reduce = exc_senders is not None and bool(exc_streams)
-    merged = {}
-    for s in senders:
-        name = str(s.get("name") or "?").lower()
-        e = merged.setdefault(name, {"name": name, "count": 0, "domain": s.get("domain"), "likes": Counter()})
-        e["count"] += _n(s.get("count")) or 0
-        e["likes"][s.get("likely") or "unknown"] += _n(s.get("count")) or 0
-    senders = []
-    for e in merged.values():
-        likes = e.pop("likes")
-        if reduce:
-            # the exception comes off the stream it covered, label by label; the census files a stream under
-            # its majority label while the gate counts each verdict's own, so what a label cannot absorb
-            # spills over the address's other labels, largest first: the address loses exactly the gate's total
-            per = exc_streams.get(e["name"]) if isinstance(exc_streams.get(e["name"]), dict) else {}
-            spill = 0
-            for label, n in per.items():
-                took = min(_n(n) or 0, likes.get(label, 0))
-                likes[label] -= took
-                spill += (_n(n) or 0) - took
-            for label, have in likes.most_common():
-                took = min(spill, have)
-                likes[label] -= took
-                spill -= took
-            likes = Counter({k: v for k, v in likes.items() if v > 0})
-            e["count"] = sum(likes.values())
-        e["likely"] = likes.most_common(1)[0][0] if likes else "unknown"
-        if e["count"] > 0:
-            senders.append(e)
-    senders.sort(key=lambda s: (-s["count"], s["name"]))
+    senders = _by_address([s for s in (view["by_sender"] if view else [])
+                           if s.get("domain") == org or s.get("domain") in subs])
     by_likely = c.get("by_likely") if isinstance(c.get("by_likely"), dict) else None
-    if by_likely is not None:
-        if reduce:
-            by_likely = {k: max(0, (_n(v) or 0) - (_n(exc_likely.get(k)) or 0)) for k, v in by_likely.items()}
-    elif senders:
+    reduced = _n(c.get("excepted")) is not None
+    if reduced:
+        excepted = _n(c["excepted"])
+        gone = c.get("excepted_by_likely") if isinstance(c.get("excepted_by_likely"), dict) else {}
+        if by_likely is not None:
+            by_likely = {k: max(0, (_n(v) or 0) - (_n(gone.get(k)) or 0)) for k, v in by_likely.items()}
+    else:
+        gate_dom = ((report.get("gate") or {}).get("domains") or {}).get(org) or {}
+        gone = gate_dom.get("excepted_by_likely") if isinstance(gate_dom.get("excepted_by_likely"), dict) else {}
+        excepted = sum(_n(v) or 0 for v in gone.values()) or (_n(gate_dom.get("excepted_failures")) or 0)
+    if by_likely is None and senders:
         cnt = Counter()
         for s in senders:
-            cnt[s.get("likely") or "unknown"] += s["count"]
-        by_likely = {k: cnt.get(k, 0) for k in ("likely_spoof", "likely_misconfigured_sender", "unknown")}
+            cnt.update(s["likes"])
+        by_likely = {k: cnt.get(k, 0) for k in (SPOOF, OWN, UNCLEAR)}
     return {"genuine_failures": _n(c["genuine_failures"]), "logical_messages": _n(c.get("logical_messages")),
-            "delivered_despite_fail": _n(c.get("delivered_despite_fail")), "excepted_reduced": reduce,
+            "delivered_despite_fail": _n(c.get("delivered_despite_fail")), "excepted_reduced": reduced,
             "by_likely": {k: _n(v) or 0 for k, v in by_likely.items()} if by_likely else None,
             "top_senders": _entries(c.get("top_senders"), SENDER_KEYS) or [], "senders": senders,
             "subdomains": subs, "window": c.get("window") if isinstance(c.get("window"), dict) else None,
             "excepted": excepted}
 
 
-def _env_key(value):
-    """An envelope domain spelled the way the census keys it: lower-case, no
-    trailing dot, '(blank)' when the message had none."""
-    return str(value or "").strip().lower().rstrip(".") or "(blank)"
-
-
 def _excepted_names(entries, cap=3):
     return ", ".join("%s x%d" % (e["name"], e["count"]) for e in entries[:cap]) + (", ..." if len(entries) > cap else "")
 
 
-def excepted_view(report, view):
-    """The census view less what the gate formally excepted, stream by stream,
-    for the sections that name senders: an excepted sender is not told to fix
-    anything, what remains of it keeps its own stream's label, and the
-    excepted messages are listed once, as such, in view["excepted"]. A gate
-    that names excepted senders without their streams (an older report.json)
-    leaves the view as it is: nothing says which stream to take them off."""
-    if view is None:
-        return None
-    budgets = {}  # (From domain, address) -> what the gate excepted of it: in total, by envelope, by label
-    for dom, g in (((report.get("gate") or {}).get("domains") or {}).items()):
-        if not isinstance(g, dict) or not isinstance(g.get("excepted_senders"), dict):
-            continue
-        by_env = g.get("excepted_senders_by_envelope") if isinstance(g.get("excepted_senders_by_envelope"), dict) else None
-        by_label = g.get("excepted_senders_by_likely") if isinstance(g.get("excepted_senders_by_likely"), dict) else None
-        if by_env is None and by_label is None:
-            continue
-        for sender, n in g["excepted_senders"].items():
-            envs = by_env.get(str(sender).lower()) if by_env else None
-            labels = by_label.get(str(sender).lower()) if by_label else None
-            budgets[(str(dom).lower(), str(sender).lower())] = {
-                "total": _n(n) or 0,
-                "envelopes": {_env_key(k): _n(v) or 0 for k, v in envs.items()} if isinstance(envs, dict) else None,
-                "labels": {str(k): _n(v) or 0 for k, v in labels.items()} if isinstance(labels, dict) else None}
-    if not budgets:
-        return view
-    out, excepted, by_sender, env_cut = dict(view), [], [], Counter()
-    for s in view["by_sender"]:
-        name = str(s.get("name") or "").lower()
-        dom = str(s.get("domain") or name.rpartition("@")[2]).lower()
-        b, count, label = budgets.get((dom, name)), _n(s.get("count")) or 0, s.get("likely") or "unknown"
-        env = _env_key(s.get("envelope"))
-        take = min(count, b["total"]) if b else 0
-        if b and b["envelopes"] is not None:  # exceptions match on the envelope: exactly the stream they covered
-            take = min(take, b["envelopes"].get(env, 0))
-        elif b and b["labels"] is not None:  # a gate with the label split only: the stream carrying that label
-            take = min(take, b["labels"].get(label, 0))
-        if take <= 0:
-            by_sender.append(s)
-            continue
-        b["total"] -= take
-        if b["envelopes"] is not None:
-            b["envelopes"][env] -= take
-        elif b["labels"] is not None:
-            b["labels"][label] -= take
-        excepted.append({"name": s.get("name"), "domain": s.get("domain"), "envelope": s.get("envelope"), "count": take})
-        env_cut[env] += take
-        if count - take > 0:
-            by_sender.append(dict(s, count=count - take))
-    by_sender.sort(key=lambda s: (-(_n(s.get("count")) or 0), str(s.get("name"))))
-    by_envelope = []
-    for e in view["by_envelope"]:
-        key = _env_key(e.get("name"))
-        cut = env_cut.get(key, 0)
-        left = (_n(e.get("count")) or 0) - cut
-        if left <= 0:
-            continue
-        if cut:  # the envelope's example senders are the ones still failing through it
-            e = dict(e, count=left)
-            names = [s["name"] for s in by_sender if _env_key(s.get("envelope")) == key]
-            if names:
-                e["senders"], e["sender_count"] = names[:3], len(names)
-        by_envelope.append(e)
-    by_envelope.sort(key=lambda e: (-(_n(e.get("count")) or 0), str(e.get("name"))))
-    out.update(by_sender=by_sender, by_envelope=by_envelope, excepted=excepted)
-    return out
+def _excepted_ips(report):
+    """The aggregate-report sources the gate formally excepted: never work, never listed as failing."""
+    gate = report.get("gate") if isinstance(report.get("gate"), dict) else {}
+    exc = gate.get("exceptions") if isinstance(gate.get("exceptions"), dict) else {}
+    ips = exc.get("excepted_streams")
+    return {str(ip) for ip in ips if ip} if isinstance(ips, list) else set()
 
 
-def streams(view, rua, own=None):
+def streams(view, rua, own=None, excepted_ips=()):
     """The one-liner's senders: the organization domain's own (from
     maillog.by_domain), else every sender in the census 'across all audited
-    domains', else source IPs from the aggregate reports when there is no mail log."""
+    domains', else source IPs from the aggregate reports when there is no mail
+    log, less the ones the gate formally excepted (excepted_ips). An address
+    is named in every group where it has failures left, with that many."""
     if own is not None:
-        groups = {"likely_misconfigured_sender": [], "likely_spoof": [], "unknown": []}
-        for s in own["senders"]:
-            groups[s["likely"] if s.get("likely") in groups else "unknown"].append(s)
+        groups = _groups(own["senders"])
         scope = "unaudited subdomains" if own.get("subdomains") else "own domain"
         # the domain's own span when the report carries it: the whole log often reaches further
         return {"basis": "mail log", "scope": scope, "window": own.get("window") or (view or {}).get("window"),
                 "excepted": own.get("excepted") or 0, "excepted_reduced": own.get("excepted_reduced", True),
-                "own": groups["likely_misconfigured_sender"],
-                "spoof": groups["likely_spoof"], "unclear": groups["unknown"],
+                "own": groups[OWN], "spoof": groups[SPOOF], "unclear": groups[UNCLEAR],
                 "genuine_failures": own["genuine_failures"], "logical_messages": own["logical_messages"],
                 "by_likely": own["by_likely"], "top_senders": own["top_senders"],
                 "subdomains": own.get("subdomains") or []}
     if view is not None and (view["by_sender"] or view["genuine_failures"] is not None):
-        own_s = [s for s in view["by_sender"] if s["likely"] == "likely_misconfigured_sender"]
-        spoof = [s for s in view["by_sender"] if s["likely"] == "likely_spoof"]
-        unclear = [s for s in view["by_sender"] if s["likely"] not in ("likely_misconfigured_sender", "likely_spoof")]
-        return {"basis": "mail log", "scope": "all audited domains", "window": view.get("window"),
-                "excepted": sum(e["count"] for e in (view.get("excepted") or [])), "excepted_reduced": True,
-                "own": own_s, "spoof": spoof, "unclear": unclear}
+        groups = _groups(_by_address(view["by_sender"]))
+        excepted = view.get("excepted") or []
+        out = {"basis": "mail log", "scope": "all audited domains", "window": view.get("window"),
+               "excepted": sum(e["count"] for e in excepted), "excepted_reduced": True,
+               "excepted_senders": len({str(e["name"]).lower() for e in excepted}),
+               "own": groups[OWN], "spoof": groups[SPOOF], "unclear": groups[UNCLEAR]}
+        if not view.get("exceptions_counted") and view.get("excepted_unsplit"):
+            out.update(excepted=view["excepted_unsplit"], excepted_reduced=False, excepted_senders=None)
+        return out
     if isinstance(rua, dict):
-        fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict)]
+        skip = {str(ip) for ip in excepted_ips or ()}
+        fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict) and str(s.get("source_ip")) not in skip]
 
         def conv(s):
             return {"name": "%s as %s" % (s.get("source_ip", "?"), ", ".join(s.get("header_from") or [])[:60] or "?"),
                     "count": _n(s.get("fail")) if _n(s.get("fail")) is not None else (_n(s.get("count")) or 0),
-                    "likely": s.get("likely") or "unknown"}
-        own_s = [conv(s) for s in fs if s.get("likely") == "likely_misconfigured_sender"]
-        spoof = [conv(s) for s in fs if s.get("likely") == "likely_spoof"]
-        unclear = [conv(s) for s in fs if s.get("likely") not in ("likely_misconfigured_sender", "likely_spoof")]
-        return {"basis": "aggregate reports", "scope": "aggregate reports", "own": own_s, "spoof": spoof,
-                "unclear": unclear}
+                    "likely": _group(s.get("likely"))}
+        groups = {OWN: [], SPOOF: [], UNCLEAR: []}
+        for s in fs:
+            e = conv(s)
+            groups[e["likely"]].append(e)
+        return {"basis": "aggregate reports", "scope": "aggregate reports", "own": groups[OWN],
+                "spoof": groups[SPOOF], "unclear": groups[UNCLEAR]}
     return None
 
 
@@ -1338,20 +1409,69 @@ def policy_text(report, domain):
     return text, (pct if low else None)
 
 
-def gate_reasons(report, domain):
-    """The gate's reasons that are blockers, not narration, as the audit wrote them."""
-    gate = report.get("gate") or {}
-    g = (gate.get("domains") or {}).get(domain) or {}
-    statement = (gate.get("evidence") or {}).get("statement")
-    out = []
-    for r in g.get("reasons") or (gate.get("reasons") if not gate.get("domains") else []) or []:
-        if domain:
-            r = re.sub(r"^%s: " % re.escape(domain), "", r)
-        if r == statement or re.match(r"^(policy (is|p=)|step being gated|no DMARC policy could be determined"
-                                      r"|\d+ failing stream\(s\) look like spoofs|exception: )", r):
+# A report from before the gate split its reasons into blockers and notes: the gate's framing of the
+# verdict (FRAME_RX: an insufficient_data verdict says there what evidence is missing), and what it notes
+# without holding anything (NOTE_RX: the mail-log notes, the go verdict's narration, the exception notes).
+FRAME_RX = re.compile(r"^(policy (is|p=)|step being gated|no DMARC policy could be determined)")
+NOTE_RX = re.compile(r"^(unaudited subdomain\(s\) .* not gated here|no mail-log rows for this domain in the window"
+                     r"|\d+ failing stream\(s\) look like spoofs|\S+ \(\d+ msgs, [\w-]+\)$|exception: )")
+# the gate's notes the document shows under the per-domain table, as plain() words them: what the
+# mail log says about the domain that no other section does (the rest is already in What is failing)
+SHOWN_NOTES = re.compile(r"^(unaudited subdomains |no mail-log rows )")
+
+
+def _data_hold(reason):
+    """The evidence an insufficient_data reason says is missing, without the
+    policy narration around it ('policy is p=none (...) but no failure
+    evidence was supplied: ...; step being gated: ...')."""
+    text = re.sub(r"; (?:step being gated|next step): .*$", "", reason)
+    for rx in (r"\bbut (.+)$", r"nothing to ratchet - (.+)$"):
+        m = re.search(rx, text)
+        if m:
+            return m.group(1)
+    return text
+
+
+def gate_split(report, domain):
+    """(verdict, blockers, notes) for one domain as the gate decided them:
+    what holds its next step (for insufficient_data, the evidence it needs)
+    and what holds nothing. gate.domains[d] carries both lists since the
+    gate wrote them; for an older report they are sorted out of the reasons.
+    Either way the verdict decides: a go holds nothing, whatever its reasons
+    say. The verdict is None for a gate with no verdict for the domain."""
+    gate = report.get("gate") if isinstance(report.get("gate"), dict) else {}
+    doms = gate.get("domains") if isinstance(gate.get("domains"), dict) else {}
+    g = doms.get(domain) if doms else gate
+    g = g if isinstance(g, dict) else {}
+    verdict = g.get("verdict") if isinstance(g.get("verdict"), str) else None
+
+    def bare(r):
+        return re.sub(r"^%s: " % re.escape(domain), "", str(r)) if domain else str(r)
+    if isinstance(g.get("blockers"), list):
+        notes = g.get("notes") if isinstance(g.get("notes"), list) else []
+        return verdict, [bare(r) for r in g["blockers"] if r], [bare(r) for r in notes if r]
+    evidence = gate.get("evidence") if isinstance(gate.get("evidence"), dict) else {}
+    blockers, notes, data = [], [], []
+    for r in g.get("reasons") if isinstance(g.get("reasons"), list) else []:
+        r = bare(r)
+        if r == evidence.get("statement"):
             continue
-        out.append(r)
-    return out
+        if NOTE_RX.match(r):
+            notes.append(r)
+        elif FRAME_RX.match(r):
+            data.append(_data_hold(r))
+        else:
+            blockers.append(r)
+    if verdict == "go":
+        return verdict, [], notes + blockers
+    if verdict == "insufficient_data":
+        return verdict, data[:1], notes + blockers
+    return verdict, blockers, notes
+
+
+def gate_reasons(report, domain):
+    """The gate's blockers for one domain, as the audit wrote them: what holds its next step."""
+    return gate_split(report, domain)[1]
 
 
 def _named(entries, cap=3):
@@ -1367,30 +1487,43 @@ def _spoof_clause(policy):
     return "no policy stops them until one is published"
 
 
+def _part(senders, labels):
+    """Each address with its failures under these groups, worst first."""
+    out = [{"name": s["name"], "count": sum((s.get("likes") or {}).get(k, 0) for k in labels)} for s in senders]
+    return sorted((s for s in out if s["count"] > 0), key=lambda s: (-s["count"], s["name"]))
+
+
 def blocker_items(report, domain, own=None):
     """The gate's blockers for one domain as the reader sees them, each typed:
     'own' (our senders: a gap to close), 'spoof' (failures that look like
-    spoofing, which the policy handles once they are confirmed not ours) or
+    spoofing, which the policy handles once they are confirmed not ours),
+    'data' (insufficient_data: the evidence the step still needs) or
     'other'. The mail-log failure count is split with the domain's own likely
-    split, so spoofs are never asked to be closed."""
+    split, and each address is named with its failures in each part, so
+    spoofs are never asked to be closed. A report whose split and names
+    still hold the excepted messages (written before the census counted
+    them) keeps the gate's own sentence: its count is after the exceptions."""
+    verdict, blockers, _ = gate_split(report, domain)
+    if verdict == "insufficient_data":
+        return [{"kind": "data", "text": plain(b)} for b in blockers]
     out = []
     bl = (own or {}).get("by_likely") or {}
+    unsplit = bool(own) and not own.get("excepted_reduced", True)  # the split and names still hold the excepted
     clause = _spoof_clause(current_policy(report, domain))
-    for r in gate_reasons(report, domain):
+    for r in blockers:
         m = GAP_RX.match(r)
-        if m and bl.get("likely_spoof"):
-            total, spoof_n = int(m.group(1)), bl["likely_spoof"]
+        if m and bl.get(SPOOF) and not (unsplit and (own.get("excepted") or m.group(2))):
+            total, spoof_n = int(m.group(1)), bl[SPOOF]
             rest = total - spoof_n
             senders = (own or {}).get("senders") or []
             if rest > 0:
-                ours = [s for s in senders if s.get("likely") != "likely_spoof"]
-                who = "our own senders" if not bl.get("unknown") else "senders that are ours or unclear"
-                names = _named(ours)
+                who = "our own senders" if not bl.get(UNCLEAR) else "senders that are ours or unclear"
+                names = _named(_part(senders, (OWN, UNCLEAR)))
                 out.append({"kind": "own", "text": "%d %s from %s failed with no passing copy%s; the other %d look "
                             "like spoofing, and %s" % (rest, _plural(rest, "message"), who,
                                                        (" (%s)" % names) if names else "", spoof_n, clause)})
             else:
-                spoofs = [s for s in senders if s.get("likely") == "likely_spoof"]
+                spoofs = _part(senders, (SPOOF,))
                 names = _named(spoofs)
                 out.append({"kind": "spoof", "text": "%d %s from %s that look like spoofing failed with no passing "
                             "copy%s; once they are confirmed not ours, %s"
@@ -1399,6 +1532,8 @@ def blocker_items(report, domain, own=None):
                                else "addresses", (" (%s)" % names) if names else "", clause)})
             continue
         out.append({"kind": "other", "text": plain(r)})
+    if verdict == "no_go" and not out:  # the gate holds the step even when its words were not recognised
+        out.append({"kind": "other", "text": "the audit's gate says not yet (report.md lists why)"})
     return out
 
 
@@ -1409,34 +1544,52 @@ def gate_blockers(report, domain, own=None):
 
 def org_next(report, plan, org, own=None):
     """The org domain's next step: the first plan change for it, else the
-    gate's. With no policy read (the gate says 'unknown'), the first step is
-    always the monitoring-only record, never the gate's placeholder."""
+    gate's, held by what the gate's verdict says: a go is ready, a no_go
+    waits on its blockers, an insufficient_data verdict on the evidence it
+    needs. With no policy read (the gate says 'unknown'), the first step is
+    always the monitoring-only record, never the gate's placeholder, and it
+    needs no evidence. The gate's notes ride along; they hold nothing."""
     changes = changes_for(plan, org)
     gate = report.get("gate") or {}
     g = (gate.get("domains") or {}).get(org) or {}
     gate_step = _short_step(g.get("next_step") or (gate.get("next_step") if not gate.get("domains") else "") or "")
+    verdict, _, notes = gate_split(report, org)
+    notes = [plain(n) for n in notes]
     if current_policy(report, org) is None or gate_step.lower().startswith("unknown"):
         rec = next((c for c in changes if c.get("kind") == "new"
                     and str(c.get("hostname") or "").lower().startswith("_dmarc.")), None)
         return {"label": FIRST_STEP % org, "ref": rec.get("id") if rec else None, "prerequisites": [],
                 "why": "no policy could be read", "source": "plan" if rec else "gate", "kind": "first",
-                "priority": _n(rec.get("priority")) if rec else None, "blockers": blocker_items(report, org, own)}
+                "priority": _n(rec.get("priority")) if rec else None, "verdict": verdict, "notes": notes,
+                "blockers": [b for b in blocker_items(report, org, own) if b["kind"] != "data"]}
     if changes:
         c = changes[0]
         prereqs = [reword_prereq(p) for p in prereqs_of(c)]
         return {"label": plain(step_label(c)), "ref": c.get("id"), "prerequisites": prereqs,
                 "why": c.get("why"), "source": "plan", "kind": c.get("kind"), "priority": c.get("priority"),
-                "blockers": []}
+                "verdict": verdict, "notes": notes, "blockers": []}
     if gate_step:
         items = blocker_items(report, org, own)
         return {"label": plain(gate_step), "ref": None, "prerequisites": [b["text"] for b in items],
-                "why": None, "source": "gate", "kind": None, "priority": None, "blockers": items}
+                "why": None, "source": "gate", "kind": None, "priority": None, "verdict": verdict, "notes": notes,
+                "blockers": items}
     return None
+
+
+def _needs_data(nxt):
+    """True for a gate step the gate cannot judge yet (insufficient_data)."""
+    return bool(nxt) and nxt["source"] == "gate" and nxt.get("verdict") == "insufficient_data"
 
 
 def _readiness(nxt):
     """', ready when ...' for a plan step (its prerequisites are conditions),
-    ', on hold while: ...' for a gate step (its blockers are observations)."""
+    ', on hold while: ...' for a gate step (its blockers are observations),
+    ', on hold - it needs more data: ...' when the gate says
+    insufficient_data. A gate step is ready now only when nothing holds it
+    and its verdict is not insufficient_data."""
+    if _needs_data(nxt):
+        return ", on hold - it needs more data%s." % ((": " + "; ".join(nxt["prerequisites"]))
+                                                     if nxt["prerequisites"] else " (report.md says which)")
     if not nxt["prerequisites"]:
         return ", and it is ready now."
     if nxt["source"] == "gate":
@@ -1471,11 +1624,15 @@ def _own_domain_sentence(org, policy, strm):
                 org, seen, _plural(seen, "message"))
         return "The mail log has no rows for %s, so nothing here can say which of its senders fail." % org
     span = span_phrase(strm.get("window"))
-    mid = lead + "%d %s from %s failed with no passing copy%s" % (gf, _plural(gf, "message"), subject,
-                                                                 (" in %s" % span) if span else "")
+    # an older report: the parts below still hold the excepted messages, so their count qualifies the total
+    unsplit = bool(strm.get("excepted")) and not strm.get("excepted_reduced", True)
+    mid = lead + "%d %s from %s failed with no passing copy%s%s" % (
+        gf, _plural(gf, "message"), subject,
+        (" (%d of them formally excepted in audit.toml)" % strm["excepted"]) if unsplit else "",
+        (" in %s" % span) if span else "")
     if bl:
-        own_n, spoof_n = bl.get("likely_misconfigured_sender", 0), bl.get("likely_spoof", 0)
-        unclear_n = bl.get("unknown", 0)
+        own_n, spoof_n = bl.get(OWN, 0), bl.get(SPOOF, 0)
+        unclear_n = bl.get(UNCLEAR, 0)
         parts = []
         if own_n:
             who = ("%d of our own senders" % len(strm["own"])) if strm["own"] else "our own senders"
@@ -1495,12 +1652,9 @@ def _own_domain_sentence(org, policy, strm):
             k = len(strm["spoof"])
             who = ("%d %s" % (k, _plural(k, "address", "addresses"))) if k else "addresses"
             parts.append("%d from %s that look like spoofing%s" % (spoof_n, who, _handled(policy, k or spoof_n)))
-        if strm.get("excepted") and strm.get("excepted_reduced", True):
+        if strm.get("excepted") and not unsplit:
             parts.append("%d formally excepted in audit.toml" % strm["excepted"])
         mid += ": " + "; ".join(parts)
-        if strm.get("excepted") and not strm.get("excepted_reduced", True):  # raw counts: the excepted are among them
-            mid += " (of which %d %s formally excepted in audit.toml)" % (strm["excepted"],
-                                                                        _plural(strm["excepted"], "is", "are"))
     else:
         tops = _named(strm["top_senders"])
         if tops:
@@ -1539,8 +1693,14 @@ def one_liner(org, policy, pct, since, strm, nxt):
         if spoof:
             mid += "; %d %s like spoofing%s" % (len(spoof), _plural(len(spoof), unit + " looks", unit + "s look"),
                                                 _handled(policy, len(spoof)))
-        if strm.get("excepted"):
-            mid += "; %d formally excepted in audit.toml" % strm["excepted"]
+        n = strm.get("excepted") or 0
+        if n and strm.get("excepted_reduced", True):  # the senders above are what the exceptions left
+            k = strm.get("excepted_senders")
+            mid += "; %d %s%s formally excepted in audit.toml" % (
+                n, _plural(n, "message"), (" from %d %s" % (k, _plural(k, "sender"))) if k else "")
+        elif n:  # an older report: the senders above still hold them
+            mid += "; %d of their failing %s %s formally excepted in audit.toml" % (
+                n, _plural(n, "message"), _plural(n, "is", "are"))
         mid += "."
     if nxt and nxt.get("kind") == "first":
         ref = (" (plan %s)" % nxt["ref"]) if nxt.get("ref") else ""
@@ -1587,10 +1747,17 @@ def where_we_stand(report, view, trend, window=None):
         ddf = view["delivered_despite_fail"]
         data["delivered_despite_fail"] = ddf
         data["delivered_despite_fail_senders"] = view["ddf_senders"][:3]
+        gone = view.get("delivered_excepted") or 0
+        data["delivered_despite_fail_excepted"] = gone
         if ddf is None:
             lines.append("**Delivered despite failing: not in this run**")
+        elif ddf and gone >= ddf:  # every one is formally excepted: the override that delivers them is accepted
+            lines.append("**Delivered despite failing: %d** - all formally excepted in audit.toml; our own overrides "
+                         "deliver them, and that stays accepted until the exceptions expire" % ddf)
         else:
             text = "**Delivered despite failing: %d**" % ddf
+            if gone:
+                text += " (%d of them formally excepted in audit.toml)" % gone
             if ddf:
                 text += " - these only arrive because of our own overrides; outside receivers are not as forgiving"
                 if view["ddf_senders"]:
@@ -1721,13 +1888,17 @@ def what_is_failing(report, view):
             data["excepted"] = list(view["excepted"])
     if rua:
         fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict)]
-        out = []
+        skip = _excepted_ips(report)
+        out, excepted = [], []
         for s in fs:
             fail = _n(s.get("fail")) if _n(s.get("fail")) is not None else (_n(s.get("count")) or 0)
-            out.append({"name": s.get("source_ip") or "?", "count": fail, "total": _n(s.get("count")),
-                        "likely": s.get("likely") or "unknown", "header_from": list(s.get("header_from") or []),
-                        "dispositions": s.get("dispositions") or {}})
+            e = {"name": s.get("source_ip") or "?", "count": fail, "total": _n(s.get("count")),
+                 "likely": _likely(s.get("likely")), "header_from": list(s.get("header_from") or []),
+                 "dispositions": s.get("dispositions") or {}}
+            (excepted if str(s.get("source_ip")) in skip else out).append(e)
         data["outside"] = out
+        if excepted:  # listed once, as what they are: not sources to chase
+            data["outside_excepted"] = excepted
         if view is not None:
             lines.append("")
         if out:
@@ -1743,17 +1914,35 @@ def what_is_failing(report, view):
             if rest:
                 lines.append("- Notes, not headlines: %s" % ", ".join(
                     "%s x%d (%s)" % (e["name"], e["count"], LIKELY_WORDS.get(e["likely"], "unclear")) for e in rest))
+            if excepted:
+                lines.append("- Formally excepted in audit.toml and not counted above: %s" % _note_line(excepted))
+        elif excepted:
+            lines.append("From the outside (aggregate reports): every source that fails with volume is formally "
+                         "excepted in audit.toml: %s." % _note_line(excepted))
         else:
             lines.append("From the outside (aggregate reports): no source fails with volume.")
     dl = report.get("delta") if isinstance(report.get("delta"), dict) else None
     if dl and isinstance(dl.get("new_senders"), list):
         new = _entries(dl["new_senders"], SENDER_KEYS) or []
+        gone = []
+        if _carries_exceptions(dl["new_senders"]):  # the census rows say what an exception covered
+            new, gone = _after_exceptions(new, "sender")
+        day = _day(dl.get("previous_generated_utc")) or "date unknown"
+        n = sum(e["count"] for e in gone)
         if new:
             more = (" (+%d more)" % (len(new) - TOP_ENTRIES)) if len(new) > TOP_ENTRIES else ""
             lines.append("")
-            lines.append("Failing senders not seen in the previous run (%s): %s%s"
-                         % (_day(dl.get("previous_generated_utc")) or "date unknown", _note_line(new[:TOP_ENTRIES]), more))
+            lines.append("Failing senders not seen in the previous run (%s): %s%s%s"
+                         % (day, _note_line(new[:TOP_ENTRIES]), more,
+                            ("; formally excepted in audit.toml and not counted here: %d %s (%s)"
+                             % (n, _plural(n, "message"), _excepted_names(gone))) if gone else ""))
             data["new_senders"] = new
+        elif gone:
+            lines.append("")
+            lines.append("Senders not seen in the previous run (%s) fail only where audit.toml formally excepts them: "
+                         "%d %s (%s)." % (day, n, _plural(n, "message"), _excepted_names(gone)))
+        if gone:
+            data["new_senders_excepted"] = gone
     return data, lines
 
 
@@ -1856,13 +2045,22 @@ def build_actions(report, plan, view, owners):
 
     if view is not None:
         ref = "MAILFLOW-001" if "MAILFLOW-001" in ids_present else "mail log"
-        own_all = [s for s in view["by_sender"] if s["likely"] != "likely_spoof"]
+        # each stream as the exceptions left it, its spoof-labelled failures apart from the rest
+        own_all, spoof = [], []
+        for s in view["by_sender"]:
+            split = _split(s)
+            ours = split.get(OWN, 0) + split.get(UNCLEAR, 0)
+            if ours > 0:
+                own_all.append(dict(s, count=ours, likely=OWN if split.get(OWN, 0) >= split.get(UNCLEAR, 0) else UNCLEAR))
+            if split.get(SPOOF, 0) > 0:
+                spoof.append(dict(s, count=split[SPOOF]))
+        own_all.sort(key=lambda s: (-s["count"], s["name"]))
         for s in own_all[:SENDER_ITEMS_CAP]:
             hook = "%s - %d %s" % (s["name"], s["count"], _plural(s["count"], "message"))
             subj = ('subjects like "%s"' % str(s["subjects"][0])[:60]) if s.get("subjects") else ""
             env = ("envelope %s" % s["envelope"]) if s.get("envelope") else ""
             detail = "; ".join(x for x in (subj, env) if x)
-            if s["likely"] == "likely_misconfigured_sender":
+            if s["likely"] == OWN:
                 action = ("DKIM-sign this sender (or align its SPF): the messages failed with no passing copy "
                           "and look like our own system")
             else:
@@ -1879,13 +2077,18 @@ def build_actions(report, plan, view, owners):
                           "hook": "%d more senders with %d %s between them" % (len(rest), total, _plural(total, "message")),
                           "action": "work through them from the census in report.json (maillog.census); "
                                     "none is a headline on its own"})
-        spoof = [s for s in view["by_sender"] if s["likely"] == "likely_spoof"]
         if spoof:
             total = sum(s["count"] for s in spoof)
-            top_dom = Counter(s.get("domain") or "" for s in spoof).most_common(1)[0][0]
-            top_env = Counter(s.get("envelope") or "" for s in spoof).most_common(1)[0][0]
-            hook = "%d %s from %d %s that look like spoofing" % (total, _plural(total, "message"), len(spoof),
-                                                                   _plural(len(spoof), "address", "addresses"))
+            k = len({s["name"] for s in spoof})
+            # "most" counts messages: a one-message part split off a mixed stream weighs one, not a stream
+            doms, envs = Counter(), Counter()
+            for s in spoof:
+                doms[s.get("domain") or ""] += s["count"]
+                envs[s.get("envelope") or ""] += s["count"]
+            top_dom, top_env = doms.most_common(1)[0][0], envs.most_common(1)[0][0]
+            hook = "%d %s from %d %s that %s like spoofing" % (total, _plural(total, "message"), k,
+                                                                 _plural(k, "address", "addresses"),
+                                                                 _plural(total, "looks", "look"))
             action = "confirm none of them is ours, then leave them to the policy"
             if top_env:
                 action += " (most came in via %s%s)" % (top_env, (", as %s" % top_dom) if top_dom else "")
@@ -1893,36 +2096,49 @@ def build_actions(report, plan, view, owners):
         if view["by_sender"] or view["genuine_failures"] == 0 or view.get("excepted"):
             covered.add(("maillog", "MAILFLOW-001"))  # nothing left to work: every named failure is excepted
         ref = "MAILFLOW-002" if "MAILFLOW-002" in ids_present else "mail log"
-        for s in view["ddf_senders"][:TOP_ENTRIES]:
+        ddf = view["ddf_senders"]  # what the exceptions left: an excepted sender's override is accepted
+        for s in ddf[:TOP_ENTRIES]:
             hook = "%s - %d %s reached inboxes despite failing" % (s["name"], s["count"], _plural(s["count"], "message"))
             action = ("find the override (transport rule, allow list, safe sender) that let them in and make it "
                       "conditional on authentication; outside receivers do not have it")
             items.append({"kind": "override", "keys": [s["name"], s.get("domain"), s.get("envelope")], "ref": ref,
                           "sender": s["name"], "hook": hook, "action": action})
-        if view["ddf_senders"] or view["delivered_despite_fail"] == 0:
+        rest = ddf[TOP_ENTRIES:]
+        if rest:
+            total = sum(s["count"] for s in rest)
+            items.append({"kind": "override", "keys": [], "ref": ref,
+                          "hook": "%d more %s with %d %s that reached inboxes despite failing"
+                                  % (len(rest), _plural(len(rest), "sender"), total, _plural(total, "message")),
+                          "action": "find the overrides that let them in from the census in report.json "
+                                    "(maillog.census, delivered_despite_fail per sender) and make each conditional "
+                                    "on authentication"})
+        delivered = view["delivered_despite_fail"]
+        if ddf or delivered == 0 or (delivered is not None and delivered <= (view.get("delivered_excepted") or 0)):
             covered.add(("maillog", "MAILFLOW-002"))
 
     rua = report.get("rua") if isinstance(report.get("rua"), dict) else None
     if rua:
-        fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict)]
+        skip = _excepted_ips(report)  # formally excepted: listed once in What is failing, never work
+        fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict) and str(s.get("source_ip")) not in skip]
         ref = "OUTSIDE-001" if "OUTSIDE-001" in ids_present else "aggregate reports"
         spoof_fs = []
         for s in fs:
             hf = [h for h in (s.get("header_from") or []) if isinstance(h, str)]
             fail = _n(s.get("fail")) if _n(s.get("fail")) is not None else (_n(s.get("count")) or 0)
-            if s.get("likely") == "likely_spoof":
+            label = _likely(s.get("likely"))
+            if label == SPOOF:
                 spoof_fs.append((s, hf, fail))
                 continue
             hook = "%s - %d failing %s as %s" % (s.get("source_ip") or "?", fail, _plural(fail, "message"),
                                                  ", ".join(hf[:2]) or "?")
-            if s.get("likely") == "likely_misconfigured_sender":
+            if label == OWN:
                 action = "DKIM-sign the system behind this IP with an aligned d=: receivers see it fail"
             else:
                 action = ("find out whose system this IP is: receivers see it fail and the heuristic could not "
                           "tell spoof from our own")
             sig = plain("; ".join(str(x) for x in (s.get("likely_signals") or [])[:2]))
-            if sig:
-                action += " (%s)" % sig[:140]
+            if sig:  # whole: the signal that decided the label is often the second one
+                action += " (%s)" % sig
             items.append({"kind": "stream", "keys": hf + [org_domain(h) for h in hf], "ref": ref,
                           "hook": hook, "action": action})
         if spoof_fs:
@@ -2004,9 +2220,14 @@ def build_actions(report, plan, view, owners):
     return out
 
 
-def render_actions(groups):
+def render_actions(groups, failing=None):
+    """The owner groups as markdown; failing (the document's What is failing
+    data) says why nothing is left when the exceptions took it all."""
     L = []
     if not any(g["items"] for g in groups):
+        if (failing or {}).get("excepted") or (failing or {}).get("outside_excepted"):
+            return ["- Nothing to do this week: no plan changes, and every failure this run names is formally "
+                    "excepted in audit.toml (What is failing lists them)."]
         return ["- Nothing to do this week: no plan changes and no actionable findings in this run."]
     for g in groups:
         L.append("- **%s**" % g["owner"] + (" (%s)" % g["channel"] if g["channel"] else ""))
@@ -2031,11 +2252,14 @@ def build_ask(plan, org, nxt, policy):
         parts.append(text)
     at_end = not nxt or nxt["label"].lower().startswith("none")
     first = nxt is not None and nxt.get("kind") == "first"
+    which = "the step after that" if parts else "the next step"
     if first:
         pass  # no policy could be read: the ask is the monitoring record, below
+    elif _needs_data(nxt) and not at_end:  # the gate cannot judge the step yet: the ask is the evidence, never a go-ahead
+        parts.append("more data before %s on %s (%s): %s" % (which, org, nxt["label"], nxt["prerequisites"][0]
+                                                             if nxt["prerequisites"] else "report.md says which"))
     elif nxt and nxt["prerequisites"] and not at_end:
         held = "is held back by this" if nxt["source"] == "gate" else "is held until this is confirmed"
-        which = "the step after that" if parts else "the next step"
         parts.append("%s on %s (%s) %s: %s" % (which, org, nxt["label"], held, nxt["prerequisites"][0]))
     elif nxt and not nxt["prerequisites"] and not at_end and not p1:
         parts.append("a go-ahead to %s on %s, which this run finds ready" % (nxt["label"], org))
@@ -2076,6 +2300,10 @@ def open_questions(report, plan, org, nxt, owners, groups):
         for b in blockers:
             if b["kind"] == "spoof":
                 q = "Can we confirm none of these is ours on %s: %s?" % (org, b["text"])
+            elif b["kind"] == "data" and at_end:  # no step left: the data confirms the enforcement in place
+                q = "Can we supply the data that confirms enforcement on %s is safe: %s?" % (org, b["text"])
+            elif b["kind"] == "data":
+                q = "Can we supply the data the next step on %s (%s) needs: %s?" % (org, nxt["label"], b["text"])
             elif nxt.get("kind") == "first":
                 q = ("Can we close this gap on %s (a monitoring-only record reports it but does not fix it): %s?"
                      % (org, b["text"]))
@@ -2178,8 +2406,7 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
     if not since and isinstance(changed, dict) and changed.get("to") == policy and changed.get("from"):
         since = date  # the delta shows the policy changed in this very run
     own = own_domain_view(report, view, org)
-    xview = excepted_view(report, view)  # the sections that name senders show what the gate did not except
-    strm = streams(xview, rua, own)
+    strm = streams(view, rua, own, _excepted_ips(report))
     nxt = org_next(report, plan, org, own)
     line = one_liner(org, policy, pct, since, strm, nxt)
     window = window_of(report)
@@ -2191,9 +2418,9 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
                           trend_from_metrics(metrics, report, view) if metrics else None])
     trend = apply_comparability(trend, delta, report, view)
     stand = where_we_stand(report, view, trend, window)
-    failing, failing_lines = what_is_failing(report, xview)
+    failing, failing_lines = what_is_failing(report, view)
     domains = per_domain(report, plan)
-    groups = build_actions(report, plan, xview, owners)
+    groups = build_actions(report, plan, view, owners)
     ask = build_ask(plan, org, nxt, policy)
     questions = open_questions(report, plan, org, nxt, owners, groups)
     strm_data = None
@@ -2207,6 +2434,8 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
                               "top_senders": [{"name": s["name"], "count": s["count"]} for s in strm["top_senders"]]})
             if strm.get("subdomains"):
                 strm_data["subdomains"] = list(strm["subdomains"])  # whose rows these numbers are
+        elif strm["basis"] == "mail log":  # the whole census: the excepted messages, and from how many senders
+            strm_data.update({"excepted": strm.get("excepted") or 0, "excepted_senders": strm.get("excepted_senders")})
     doc = {
         "tool": "next_steps.py", "version": VERSION, "date": date, "org_domain": org,
         "policy": {"p": policy, "pct": pct, "since": since, "text": policy_str},
@@ -2255,10 +2484,15 @@ def render_md(doc):
         L += render_per_domain(doc["per_domain"])
     else:
         L.append("No domain was audited in this run.")
+    notes = [n for n in ((doc.get("next_step") or {}).get("notes") or []) if SHOWN_NOTES.match(n)]
+    if notes:
+        L.append("")
+        L.append("From the audit on %s (information; it holds nothing):" % doc["org_domain"])
+        L += ["- %s" % n for n in notes]
     L.append("")
     L.append("## What happens next, by owner")
     L.append("")
-    L += render_actions(doc["actions_by_owner"])
+    L += render_actions(doc["actions_by_owner"], doc["failing"])
     L.append("")
     L.append("## The ask")
     L.append("")
