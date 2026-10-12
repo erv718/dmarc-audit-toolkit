@@ -1152,7 +1152,9 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
         qev = None  # the tenant sees none of its own mail: only aggregate reports that cover it can say none passes
     quiet = qev is not None and not (parked_candidate and needs_record) and "DMARC-005" not in ids
     # an organizational domain whose sending subdomains have no record of their own keeps them where they are
-    pin = quiet and domain == org_domain(domain) and bool(missing) and not (dmarc and not inherited and sp_tag)
+    # (always, not only when this run saw a sending subdomain: one that mails less often would otherwise follow
+    # the apex to quarantine unseen; the subdomains move with the sp= step and its own checks)
+    pin = quiet and domain == org_domain(domain) and not (dmarc and not inherited and sp_tag)
     # what the run could not settle itself, each a check for a person before the record moves
     quiet_checks = ["no sender that mails less often than monthly (statements, renewals) uses this domain"]
     if quiet and not reports_cover:
@@ -1211,9 +1213,12 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
                          else "no aggregate report in this run covers it (see the checks)")
         why = ("quarantine now: %s, so a weekly ramp would protect nobody; reject follows once a week of reports "
                "still shows nothing passing" % "; ".join(parts))
-        if pin:
+        if pin and missing:
             why += ("; sp=none keeps its subdomains where they are until the ones that send (%s) have records of "
                     "their own" % missing_text)
+        elif pin:
+            why += ("; sp=none keeps its subdomains where they are: they move with the sp= step, once the reports "
+                    "show which of them send")
         return why
 
     fast = False  # a quarantine-now record replaces this run's ramp rows

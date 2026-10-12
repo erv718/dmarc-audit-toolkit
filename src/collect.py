@@ -370,6 +370,8 @@ def pull_maillog(tok, org_domains, out_csv, days=30, max_rows=ROW_BUDGET, volume
         except (graph_client.GraphError, ValueError) as err:
             notes.append("mail log for %s not pulled: %s" % (org, err))
             got = None
+            if cuts is not None:  # the whole org is missing from this run's log: nothing compares across it
+                cuts[org] = {"reason": "not pulled", "error": str(err)[:200]}
         if volumes is not None:
             if "internal" not in info:  # the sizing did not answer: one more try, for the volume alone
                 hourly_counts(tok, template, org, days * 24, 0, info)
@@ -1150,6 +1152,8 @@ def main():
                                              encoding="utf-8")
     if tok and not args.maillog and orgs:
         note(headline_note(report.get("gate") or {}, orgs, volumes))
+    if report.get("delta_error"):
+        note(report["delta_error"])
     # an hour still at the API row cap dropped rows, and a row budget kept only the newest
     # hours: the mail-log counts for that domain are a floor, said so in the report too
     caveats = []
@@ -1238,7 +1242,12 @@ def main():
     known_before, new_senders = update_senders(out / "senders.json", report, stamp)
 
     # 9. summary and notification
-    text = notify.summarize(report, prev_report, plan, known_senders=known_before, history=entries)
+    try:
+        text = notify.summarize(report, prev_report, plan, known_senders=known_before, history=entries)
+    except Exception as exc:  # a damaged earlier report or history entry: the run's files still get written
+        text = "*DMARC audit* summary not built: %s: %s (report.md and next_steps.md hold the run)" % (
+            type(exc).__name__, exc)
+        note("summary not built: %s: %s" % (type(exc).__name__, exc))
     (run_dir / "summary.txt").write_text(text + "\n", encoding="utf-8")
     shutil.copy2(run_dir / "summary.txt", latest / "summary.txt")
     strict_reasons = []

@@ -369,7 +369,7 @@ def test_r2_a_domain_that_sends_nothing_goes_straight_to_quarantine(tmp_path):
     # brand.example: Microsoft 365 MX, no DMARC record, nothing in or out in 30 days, no report covers it
     brand = one(by["brand.example"], "no_mail")
     assert brand["priority"] == 1 and brand["hostname"] == "_dmarc.brand.example"
-    assert brand["value"] == "v=DMARC1; p=quarantine; rua=%s;" % RUA and brand["current"] == "none"
+    assert brand["value"] == "v=DMARC1; p=quarantine; sp=none; rua=%s;" % RUA and brand["current"] == "none"
     assert brand["prerequisites"] == [
         "no sender that mails less often than monthly (statements, renewals) uses this domain",
         "no third party sends as brand.example straight to outside recipients: no aggregate report in this run "
@@ -384,7 +384,7 @@ def test_r2_a_domain_that_sends_nothing_goes_straight_to_quarantine(tmp_path):
     assert [c["kind"] for c in by["brand.example"]] == ["no_mail"]  # no ramp row, no DKIM task: nothing sends
     # spoofed.example: its only mail is spoofing, which is no reason to wait; its own record keeps its rua
     spoofed = one(by["spoofed.example"], "no_mail")
-    assert spoofed["value"] == "v=DMARC1; p=quarantine; rua=%s;" % RUA
+    assert spoofed["value"] == "v=DMARC1; p=quarantine; sp=none; rua=%s;" % RUA
     assert spoofed["current"] == "v=DMARC1; p=none; rua=%s;" % RUA
     assert spoofed["prerequisites"] == ["no sender that mails less often than monthly (statements, renewals) uses "
                                         "this domain"]  # the reports cover it and show nothing passing
@@ -436,7 +436,7 @@ def test_r2_the_plan_md_row_the_table_and_todo_say_it_in_plain_words(tmp_path):
     assert ("## 2. Do now (plan priority 1: monitoring and hygiene, zero delivery risk; quarantine where no mail is "
             "measured, after its checks)") in todo
     do_now = todo.split("## 2. Do now", 1)[1].split("## 3.", 1)[0]
-    assert ("- %s brand.example: TXT at `_dmarc.brand.example` = `v=DMARC1; p=quarantine; rua=%s;` (current: `none`) "
+    assert ("- %s brand.example: TXT at `_dmarc.brand.example` = `v=DMARC1; p=quarantine; sp=none; rua=%s;` (current: `none`) "
             "- quarantine now: " % (brand["id"], RUA)) in do_now
     assert do_now.count("  - before applying: no sender that mails less often than monthly (statements, renewals) "
                         "uses this domain") == 3
@@ -524,7 +524,7 @@ def test_r2_quarantine_drops_the_pct_and_reject_follows_without_a_dkim_proof():
     sample = quiet_report(**{"dns/brand.example/dmarc": "v=DMARC1; p=quarantine; pct=25; rua=%s; fo=1;" % RUA,
                              "dns/brand.example/effective_policy": "quarantine"})
     row = one(plan_of(sample)["changes"], "no_mail")
-    assert row["value"] == "v=DMARC1; p=quarantine; rua=%s; fo=1;" % RUA  # no pct: 100 percent
+    assert row["value"] == "v=DMARC1; p=quarantine; sp=none; rua=%s; fo=1;" % RUA  # no pct: 100 percent
     # a week later, at quarantine and still nothing passing: reject, with no DKIM proof to wait for
     week = quiet_report(**{"dns/brand.example/dmarc": "v=DMARC1; p=quarantine; rua=%s;" % RUA,
                            "dns/brand.example/effective_policy": "quarantine"})
@@ -715,7 +715,8 @@ def test_r2_quarantine_now_says_only_what_the_run_read():
     assert row["why"] == ("quarantine now: the tenant measured no mail sent as brand.example in 30 days; nothing came "
                           "in with it as the From domain; no aggregate report in this run covers it (see the checks), "
                           "so a weekly ramp would protect nobody; reject follows once a week of reports still shows "
-                          "nothing passing")
+                          "nothing passing; sp=none keeps its subdomains where they are: they move with the sp= step, "
+                          "once the reports show which of them send")
     assert "in the mail log or the aggregate reports" not in row["why"]
     assert "no legitimate sender is caught" not in row["human_summary"]
 

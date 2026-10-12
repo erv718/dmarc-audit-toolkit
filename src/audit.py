@@ -1707,9 +1707,11 @@ def _cut_cause(*infos):
     'the API row cap', both, or None when the info does not say."""
     budget = any(_dict(i).get("reason") == "row budget" or "kept_hours" in _dict(i) for i in infos)
     cap = any(_dict(i).get("reason") == "api cap" or _cut_hours_capped(i) for i in infos)
-    if budget and cap:
-        return "the row budget and the API row cap"
-    return "the row budget" if budget else ("the API row cap" if cap else None)
+    failed = any(_dict(i).get("reason") == "not pulled" for i in infos)
+    causes = [c for c, on in (("the row budget", budget), ("the API row cap", cap), ("a failed pull", failed)) if on]
+    if not causes:
+        return None
+    return causes[0] if len(causes) == 1 else ", ".join(causes[:-1]) + " and " + causes[-1]
 
 
 def _cut_kept(info):
@@ -2050,7 +2052,11 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
     if maillog_doc and isinstance(maillog_cuts, dict):
         maillog_doc["cuts"] = dict(maillog_cuts)  # what collect.py cut: the delta reads it, and so does the next run's
     if previous_report:
-        report["delta"] = build_delta(report, previous_report)
+        try:
+            report["delta"] = build_delta(report, previous_report)
+        except Exception as exc:  # a damaged earlier report.json must never stop this run: no delta, and why
+            report["delta_error"] = ("the previous run's report.json could not be compared (%s: %s): no delta "
+                                     "this run" % (type(exc).__name__, exc))
     if maillog_doc and not keep_verdicts:
         maillog_doc["verdicts_omitted"] = len(maillog_doc.get("verdicts") or [])
         maillog_doc["verdicts"] = []  # the census, by_domain and the counters carry what the readers need

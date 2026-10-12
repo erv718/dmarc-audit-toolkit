@@ -694,7 +694,7 @@ def test_k2_a_quarantine_now_row_carries_the_address_too():
     # quarantine now rewrites the record anyway, at priority 1: it carries the address, one change to the record
     p = plan_mod.build_plan(quiet("v=DMARC1; p=none; rua=mailto:a@vendor.example;"), rua=REPORTS)
     assert [(c["kind"], c["priority"], c["value"]) for c in p["changes"]] == [
-        ("no_mail", 1, "v=DMARC1; p=quarantine; rua=mailto:a@vendor.example,%s;" % REPORTS)]
+        ("no_mail", 1, "v=DMARC1; p=quarantine; sp=none; rua=mailto:a@vendor.example,%s;" % REPORTS)]
     assert p["changes"][0]["prerequisites"][-1] == OUTSIDE % ("quiet.example", "quiet.example")
     assert p["changes"][0]["human_summary"].endswith(
         " The same change adds dmarc-reports@corp.example to the record's reporting addresses, so its aggregate reports "
@@ -706,7 +706,7 @@ def test_k2_the_address_is_never_written_twice():
     for rec in ("v=DMARC1; p=none; rua=;", "v=DMARC1; p=none; rua= ;"):
         p = plan_mod.build_plan(quiet(rec), rua=REPORTS)
         assert [(c["kind"], c["value"]) for c in p["changes"]] == [
-            ("no_mail", "v=DMARC1; p=quarantine; rua=%s;" % REPORTS)], rec
+            ("no_mail", "v=DMARC1; p=quarantine; sp=none; rua=%s;" % REPORTS)], rec
         assert p["changes"][0]["prerequisites"].count(OUTSIDE % ("quiet.example", "quiet.example")) == 1
     # two rua= tags: the plan reads the last one, as dmarc_tags and the audit do, so it checks and edits that one
     two = "v=DMARC1; p=reject; rua=%s; rua=mailto:dmarc@vendor.example;" % REPORTS
