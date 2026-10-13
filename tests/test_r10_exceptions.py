@@ -525,11 +525,27 @@ def test_c17_a_go_verdict_is_ready_and_its_notes_hold_nothing(tmp_path):
 
 
 def test_c16_c17_the_first_step_needs_no_evidence_and_a_no_go_always_holds():
-    # no policy read: the first step is the monitoring-only record, never the gate's missing-policy hold
+    # no policy read because DNS was never read (an offline run): the step is to read it, held for that data -
+    # never a monitoring record beside one nobody could see, never a go-ahead (round 11, N4)
     gate = audit.gate_verdict({}, None, None, ["example.com"])
     assert gate["domains"]["example.com"]["verdict"] == "insufficient_data"
     doc = next_steps.build(assemble(gate, {}))
-    assert doc["next_step"]["kind"] == "first" and doc["next_step"]["blockers"] == []
+    assert doc["next_step"]["kind"] == "unread" and doc["next_step"]["data"]
+    assert "monitoring-only" not in doc["one_liner"] and "go-ahead" not in doc["ask"]
+    assert doc["one_liner"].endswith("The next safe step is to determine example.com's DMARC policy, on hold - it needs "
+                                     "more data: no DMARC policy could be determined for example.com - run online so "
+                                     "live DNS is checked, or supply rua reports that cover it.")
+    assert doc["ask"].startswith("The ask this week: more data before the next step on example.com (determine "
+                                 "example.com's DMARC policy): no DMARC policy could be determined")
+    assert [q for q in doc["open_questions"] if q["kind"] == "blocker"
+            and q["question"].startswith("Can we supply the data the next step on example.com")]
+    # DNS answered that there is no record at all: the first step is the monitoring-only record, which needs no
+    # evidence, and the gate's missing-policy hold never holds it
+    absent = {"example.com": dict(dns("none")["example.com"], dmarc=None, dmarc_source=None, effective_policy=None,
+                                  dmarc_status="absent")}
+    gate = audit.gate_verdict(absent, None, None, ["example.com"])
+    doc = next_steps.build(assemble(gate, absent))
+    assert doc["next_step"]["kind"] == "first" and doc["next_step"]["data"] == []
     assert not [q for q in doc["open_questions"] if q["kind"] == "blocker"]
     assert doc["one_liner"].endswith("The first step is to publish a monitoring-only DMARC record for example.com so "
                                      "reports start; no policy could be read.")

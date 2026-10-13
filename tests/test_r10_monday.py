@@ -20,20 +20,36 @@ def sample_report(**kw):
                               rua_paths=[str(ROOT / "samples" / "rua")], offline=True, auth_column="DMARC", **kw)
 
 
-@pytest.mark.parametrize("damage", [
-    lambda p: p["maillog"]["counters"].__setitem__("genuine_failures", "x"),  # a count that is not a number
-    lambda p: p["gate"].__setitem__("domains", ["x"]),                        # a map that is a list
+@pytest.mark.parametrize("damage, note, withheld", [
+    (lambda p: p["maillog"]["counters"].__setitem__("genuine_failures", "x"),  # a count that is not a number
+     "genuine_failures is not a whole number in the previous run's report.json (x): its delta is not computed",
+     "- genuine failures: n/a (a count that is no whole number, see the note below); delivered despite fail: +0"),
+    (lambda p: p["maillog"]["by_domain"]["example.com"].__setitem__("genuine_failures", None),  # a null count
+     "the counts for example.com are not whole numbers in one of the two report.json files: its delta is not computed",
+     "- genuine failures: +0; delivered despite fail: +0"),
 ])
-def test_a_damaged_previous_report_leaves_the_delta_out_and_says_why(damage):
+def test_a_damaged_count_in_the_previous_report_withholds_that_delta_and_says_why(damage, note, withheld):
     previous = json.loads(json.dumps(sample_report()))
     damage(previous)
-    with pytest.raises(Exception):
-        audit.build_delta(sample_report(), previous)  # the damage is real: the comparison itself fails
-    rep = sample_report(previous_report=previous)  # and yet the run's report is built
-    assert "delta" not in rep
-    assert rep["delta_error"].startswith("the previous run's report.json could not be compared (")
-    assert rep["delta_error"].endswith("): no delta this run")
+    rep = sample_report(previous_report=previous)  # the run's report is built, with the delta: one count withheld
+    assert "delta_error" not in rep and note in rep["delta"]["notes"]
     assert rep["gate"]["verdict"] and rep["findings"] is not None
+    md = audit.render_md(rep)  # and report.md renders the withheld count, never a traceback over a format code
+    assert any(l.startswith(withheld) for l in md.splitlines())
+    assert ("example.com +0 genuine" in md) == ("example.com" not in note)
+
+
+@pytest.mark.parametrize("broken", ["build_delta", "_md_delta"])
+def test_a_comparison_that_fails_or_cannot_be_rendered_leaves_the_delta_out_and_says_why(monkeypatch, broken):
+    def fail(*a, **k):
+        raise ValueError("a damaged previous report")
+    monkeypatch.setattr(audit, broken, fail)  # the comparison itself, or report.md's rendering of it, fails
+    rep = sample_report(previous_report=json.loads(json.dumps(sample_report())))  # and yet the run's report is built
+    assert "delta" not in rep
+    assert rep["delta_error"] == ("the previous run's report.json could not be compared (ValueError: a damaged previous "
+                                  "report): no delta this run")
+    assert rep["gate"]["verdict"] and rep["findings"] is not None
+    assert "## Since the previous run" not in audit.render_md(rep)
 
 
 def test_collect_writes_every_file_when_the_summary_cannot_be_built(monkeypatch, tmp_path):

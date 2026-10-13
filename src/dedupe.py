@@ -236,27 +236,53 @@ def leg_override(leg, ovr):
 
 def delivered_by(legs, auth, actions, locations, ovr):
     """What let a delivered failure in, taken from its delivered failing leg:
-    the legs that reached a mailbox, the ones with a failing verdict first,
+    among the legs that reached a mailbox, the ones with a failing verdict,
     and the first of them whose record names an override (leg_override).
-    None when none does."""
+    When a failing leg reached a mailbox and none of them names one, None:
+    another copy's override (an internal copy an Exchange rule let through)
+    is not what let the failing copy in, and the data shows no cause. Only
+    when no failing leg reached a mailbox - the failing copy was caught and
+    a copy with no verdict was delivered - do the other delivered legs say
+    what let the message in."""
     reached = [i for i, (a, l) in enumerate(zip(actions, locations)) if _reached(a, l)]
-    for i in [i for i in reached if auth[i][1]] + [i for i in reached if not auth[i][1]]:
+    failing = [i for i in reached if auth[i][1]]
+    for i in failing or [i for i in reached if not auth[i][1]]:
         reason = leg_override(legs[i], ovr)
         if reason:
             return reason
     return None
 
 
+# The recorded action an override reason ends with ("org: Exchange transport rule (Allow)"), and the actions
+# that let mail in. A Block, Junk or Quarantine action on a leg that still reached a mailbox is not an allow:
+# such a reason keeps its own words and gets no allow-removal fix.
+ACTION_RX = re.compile(r"\(([^()]*)\)\s*$")
+ALLOW_ACTIONS = re.compile(r"allow|deliver|skip|bypass|pass|none", re.I)
+
+
+def override_allows(reason):
+    """True unless the reason's recorded action says it was not an allow."""
+    m = ACTION_RX.search(str(reason or "").strip())
+    action = m.group(1).strip() if m else ""
+    return not action or bool(ALLOW_ACTIONS.search(action))
+
+
 def override_kind(reason):
-    """The common override a delivered_by reason names (an OVERRIDE_WORDS kind), or None."""
+    """The common override a delivered_by reason names (an OVERRIDE_WORDS
+    kind), or None - also for a reason whose recorded action is not an allow."""
     text = str(reason or "")
+    if not override_allows(text):
+        return None
     return next((kind for kind, rx, _ in OVERRIDE_WORDS if rx.search(text)), None)
 
 
 def override_words(reason):
     """A delivered_by reason as a reader sees it: the common overrides in
-    plain words, anything else verbatim."""
+    plain words, anything else verbatim - a reason whose recorded action is
+    not an allow too, with that action visible."""
     text = str(reason or "").strip()
+    if not override_allows(text):
+        return text
     return next((words for _, rx, words in OVERRIDE_WORDS if rx.search(text)), text)
 
 
@@ -288,6 +314,22 @@ def delivered_by_text(by, total=None, cap=4):
         parts = parts[:cap] + ["+%d more" % (len(parts) - cap)]
     rest = _whole(total) - sum(merged.values()) if total is not None else 0
     return ", ".join(parts) + ("; no override recorded for %d" % rest if rest > 0 else "")
+
+
+def delivered_by_phrase(by, total):
+    """What let total delivered failures in, as one phrase, when the export
+    recorded the overrides (by is the {reason: messages} map, empty when it
+    named none): 'let in by an Exchange transport rule x2; no override
+    recorded for 7', or 'no override recorded for any of the 9'. '' when the
+    export had no override columns (by is not a map): the reader then keeps
+    its older words, and never reads a recorded nothing as an override."""
+    if not isinstance(by, dict):
+        return ""
+    named = delivered_by_text(by)
+    rest = _whole(total) - sum(_whole(n) for reason, n in by.items() if str(reason or "").strip())
+    if named:
+        return "let in by %s" % named + ("; no override recorded for %d" % rest if rest > 0 else "")
+    return "no override recorded for any of the %d" % _whole(total) if _whole(total) else ""
 
 
 def count_rows(rows, cols, sender_domain=None, auth_column=None):
@@ -376,6 +418,10 @@ def classify(rows, cols, sender_domain=None, auth_column=None, vendor_domains=No
         alignment = None
         if auth_column and all(cols.get(k) and cols[k] in legs[0] for k in ALIGNMENT_COLS):
             alignment = message_alignment(legs, cols, auth, domain)
+        # whether the envelope passed SPF on some leg, when the export says: a forged MAIL FROM fails it, so the
+        # gate can say how many messages a formal exception by envelope domain lifted that failed it
+        spf_pass = (any(field(leg, cols, "spf").lower() == "pass" for leg in legs)
+                    if cols.get("spf") and cols["spf"] in legs[0] else None)
 
         verdicts[key] = {
             "legs": len(legs),
@@ -399,6 +445,8 @@ def classify(rows, cols, sender_domain=None, auth_column=None, vendor_domains=No
             "likely": None,
             "likely_signals": [],
         }
+        if spf_pass is not None:
+            verdicts[key]["spf_pass"] = spf_pass
         ovr = override_columns(cols, legs[0])
         if ovr:  # the export records the local overrides: a delivered failure says which one let it in
             verdicts[key]["delivered_by"] = (delivered_by(legs, auth, actions, locations, ovr)
@@ -483,8 +531,10 @@ def spf_only_senders(verdicts):
 
 def summarize(verdicts):
     """Message-level counters over the verdicts. delivered_despite_fail_by
-    ({delivered_by reason: messages}, the most first) is there only when at
-    least one delivered failure names the override that let it in."""
+    ({delivered_by reason: messages}, the most first) is there whenever the
+    export recorded the overrides - empty when no delivered failure names
+    one, so a reader can tell a recorded nothing from columns that were
+    never there."""
     vs = list(verdicts.values())
     by_likely = Counter(v["likely"] for v in vs if v["genuine_failure"])
     by_override = Counter(v["delivered_by"] for v in vs if v["delivered_despite_fail"] and v.get("delivered_by"))
@@ -496,7 +546,7 @@ def summarize(verdicts):
         "relayed_only": sum(1 for v in vs if v["relayed_only"]),
         "delivered_despite_fail": sum(1 for v in vs if v["delivered_despite_fail"]),
     }
-    if by_override:
+    if by_override or any("delivered_by" in v for v in vs):
         out["delivered_despite_fail_by"] = dict(sorted(by_override.items(), key=lambda kv: (-kv[1], kv[0])))
     out.update({
         "blocked_despite_pass": sum(1 for v in vs if v["blocked_despite_pass"]),
@@ -622,12 +672,16 @@ def build_findings(c, verdicts, auth_column=None, missing_optional=(), sender_do
             "never report the raw row count")
     if c["delivered_despite_fail"]:
         items = [(k, v) for k, v in verdicts.items() if v["delivered_despite_fail"]]
-        by = delivered_by_text(c.get("delivered_despite_fail_by"), len(items))  # '' when no leg named one
+        by = delivered_by_phrase(c.get("delivered_despite_fail_by"), len(items))  # '' without the override columns
+        recorded = isinstance(c.get("delivered_despite_fail_by"), dict)
         add("MAILFLOW-002", "major",
             "%d messages failed authentication but reached a mailbox" % len(items),
-            ("let in by %s; " % by if by else "") + _sample(items),
-            "find the override (transport rule, allow list, safe sender) and make it conditional on "
-            "authentication; external receivers do not have this override")
+            ("%s; " % by if by else "") + _sample(items),
+            ("for the ones with an override named, make it conditional on authentication (external receivers do "
+             "not have it); for the ones with none recorded, at p=none the delivery is the policy's own doing, and "
+             "at quarantine or reject look for what the log does not record" if recorded else
+             "find the override (transport rule, allow list, safe sender) and make it conditional on "
+             "authentication; external receivers do not have this override"))
     if c["blocked_despite_pass"]:
         items = [(k, v) for k, v in verdicts.items() if v["blocked_despite_pass"]]
         add("MAILFLOW-003", "minor",
@@ -761,14 +815,16 @@ def print_report(c, verdicts, findings, auth_column=None, top=20):
     print(f"  messages with an echo leg : {c['echo_messages']}"
           + paint.dim("   <-- a failing copy of a message that also passed; not failures"))
     print(f"  delivered only via relay  : {c['relayed_only']}")
+    recorded = isinstance(c.get("delivered_despite_fail_by"), dict)  # the export carried the override columns
     if auth_column:
         print()
         print(f"delivery vs authentication (auth column: {auth_column}):")
         print(f"  failed authentication but DELIVERED           : {c['delivered_despite_fail']}"
-              + paint.dim("   <-- a local override let these through"))
-        by = delivered_by_text(c.get("delivered_despite_fail_by"), c["delivered_despite_fail"])
+              + paint.dim("   <-- the override columns say what let each in" if recorded
+                          else "   <-- a local override let these through"))
+        by = delivered_by_phrase(c.get("delivered_despite_fail_by"), c["delivered_despite_fail"])
         if by:
-            print(f"    let in by: {by}")
+            print(f"    {by}")
         print(f"  passed authentication but BLOCKED/QUARANTINED : {c['blocked_despite_pass']}"
               + paint.dim("   <-- something other than DMARC caught these"))
     print()
@@ -817,7 +873,8 @@ def print_report(c, verdicts, findings, auth_column=None, top=20):
                       % (e["genuine_failures"], e["messages"], e["domain"] or "(none)", e["envelope_domain"],
                          e["sample_subject"] or "(no subject)"))
     if auth_column:
-        _list("failed authentication but DELIVERED", "a local override let these through",
+        _list("failed authentication but DELIVERED",
+              "the override column names what let each in" if recorded else "a local override let these through",
               [(k, v) for k, v in verdicts.items() if v["delivered_despite_fail"]], top)
         _list("passed authentication but BLOCKED or QUARANTINED", "something other than DMARC caught these",
               [(k, v) for k, v in verdicts.items() if v["blocked_despite_pass"]], top)

@@ -47,7 +47,7 @@ the outputs are what a human reads, and what an AI agent may read later.
 
   python src/collect.py                              # tenant domains, tenant data, weekly shape
   python src/collect.py example.com,other.example    # named domains merged with the tenant's
-  python src/collect.py example.com --offline --rua samples/rua --maillog samples/sample_maillog.csv --auth-column DMARC
+  python src/collect.py example.com --offline --rua samples/rua --maillog samples/sample_maillog.csv --auth-column DMARC --no-notify
 
 Settings: audit.toml in the repo root (copy audit.example.toml) supplies the
 domains, known senders, retention, the notification switch and the formal
@@ -110,8 +110,9 @@ AGGREGATE_SOURCE = "Advanced Hunting aggregate"
 MAILFLOW_DAYS = 30
 TOTALS_COLUMNS = ("fromdom", "logical_messages", "passing", "genuine_failures", "delivered_despite_fail")
 RUN_JSON_SENDERS = 200  # new sender identities listed in run.json; senders.json holds them all, the count says how many
-RUN_FILES = ("report.md", "report.json", "plan.md", "plan.json", "next_steps.md", "next_steps.json", "todo.md",
-             "inventory.json", "domains.txt", "summary.txt", "run.json", "setup.json", "maillog.csv", "verify.md")
+RUN_FILES = ("report.md", "report.json", audit.CENSUS_FILE, "plan.md", "plan.json", "next_steps.md", "next_steps.json",
+             "todo.md", "inventory.json", "domains.txt", "summary.txt", "run.json", "setup.json", "maillog.csv",
+             "verify.md")
 PRIORITY_WORD = {1: "now, zero delivery risk", 2: "before enforcement", 3: "enforcement step, gated",
                  4: "subdomain policy, gated", 5: "final hardening, gated"}
 
@@ -524,10 +525,12 @@ def pull_window_totals(tok, orgs, days=30):
     and so does one whose answer counts no mail under it at all: it was cut
     because it has more rows than the budget keeps, so an empty answer is a
     failed one (audit.build_report also sets aside totals below the rows
-    kept)."""
+    kept). orgs may be pull_maillog's cuts dict: the note then names the
+    cut's own cause (a pull that failed left no rows to hold too many)."""
     notes, counted = [], {}
     if not orgs:
         return None, notes
+    cuts = orgs if isinstance(orgs, dict) else {}
     try:
         template = TOTALS_QUERY.read_text(encoding="utf-8-sig")
     except OSError as err:
@@ -545,8 +548,10 @@ def pull_window_totals(tok, orgs, days=30):
                          % (org, TOTALS_QUERY.name, totals_rejection(res, org)))
             continue
         if not by_domain:
-            notes.append("mail log: full-window totals for %s not counted: the answer holds no mail under it, yet its "
-                         "rows were cut for holding too many" % org)
+            cut = cuts.get(org) if isinstance(cuts.get(org), dict) else {}
+            notes.append("mail log: full-window totals for %s not counted: the answer holds no mail under it, %s"
+                         % (org, "and its rows were not read (the pull failed)" if cut.get("reason") == "not pulled"
+                            else "yet its rows were cut for holding too many"))
             continue
         counted[org] = {"by_domain": by_domain, "source": AGGREGATE_SOURCE}
         sums = {k: sum(c[k] for c in by_domain.values())
@@ -623,13 +628,38 @@ def previous_run(history_dir, current_stamp):
 
 def read_report(path):
     """An earlier run's report.json as a dict, else None: a broken previous
-    run must not stop this one. utf-8-sig, so a BOM from an editor is fine."""
+    run must not stop this one. utf-8-sig, so a BOM from an editor is fine.
+    A census split off to census.json beside it is read back whole, so the
+    delta's new senders compare whole censuses."""
     try:
         with open(path, encoding="utf-8-sig") as fh:
             doc = json.load(fh)
     except (OSError, ValueError):
         return None
-    return doc if isinstance(doc, dict) and doc.get("gate") else None
+    return audit.load_census(doc, path) if isinstance(doc, dict) and doc.get("gate") else None
+
+
+def inherit_run_cuts(report, run_json):
+    """An earlier report that records no cut (written before maillog.cuts,
+    maillog.truncation and the caveats existed) says nothing about the row
+    budget that cut its mail log; the run.json beside it does, in
+    collect.py's own notes. Those notes join the report's caveats, in
+    memory, so audit.maillog_cuts reads the cut and the delta withholds the
+    comparison. Nothing when the report records its cuts, or run.json is
+    missing or unreadable."""
+    ml = report.get("maillog") if isinstance(report, dict) and isinstance(report.get("maillog"), dict) else None
+    if ml is None or isinstance(ml.get("cuts"), dict) or audit.maillog_cuts(report):
+        return
+    try:
+        doc = json.loads(Path(run_json).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return
+    notes = doc.get("notes") if isinstance(doc, dict) and isinstance(doc.get("notes"), list) else []
+    texts = [n for n in notes if isinstance(n, str)
+             and ("row budget reached" in n or "rows within one hour" in n)]
+    if texts:
+        caveats = report.get("caveats") if isinstance(report.get("caveats"), list) else []
+        report["caveats"] = caveats + [t for t in texts if t not in caveats]
 
 
 def accepts(fn, name):
@@ -685,7 +715,9 @@ def metrics_entry(stamp, report, plan):
                     for d, g in sorted(per.items())},
         "findings": (report.get("summary") or {}).get("by_severity") or {},
         "genuine_failures": ml.get("genuine_failures"),
-        "maillog_hours": ((report.get("maillog") or {}).get("window") or {}).get("hours"),
+        # the exact span from the window's stamps, as the delta judges it (the stored hours are rounded, and a
+        # rounded figure can fall on the other side of the half-span rule the delta applies)
+        "maillog_hours": audit._hours((report.get("maillog") or {}).get("window")),
         # the orgs whose pull the row budget or the API cap cut: their counts, and the whole log's, are a
         # floor over the hours kept, so the trend never compares them (the whole log's span can still hold)
         "maillog_cut_orgs": sorted(audit.maillog_cuts(report)),
@@ -700,14 +732,40 @@ def metrics_entry(stamp, report, plan):
 
 
 def _number(value):
-    """A metrics value as a number, else None: a hand-edited or damaged entry reads as unknown."""
-    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    """A metrics value as a finite number, else None: a hand-edited or damaged entry (text, nan, an infinity,
+    an integer too large to be a float) reads as unknown."""
+    return notify._finite(value)
+
+
+def backfill_cut_orgs(entries, prev_name, prev_report):
+    """Give the previous run's metrics entry the maillog_cut_orgs key when
+    it was written before the cuts were recorded (round 9), from what that
+    run's own report says (audit.maillog_cuts parses its truncation and
+    caveats): the Slack trend then refuses the comparison the delta refuses,
+    instead of calling a floor against a whole count worsening. The entry
+    is found by its run stamp; nothing changes when it has the key. Returns
+    the orgs filled in, or None."""
+    if not prev_name or not isinstance(prev_report, dict):
+        return None
+    for e in entries:
+        if isinstance(e, dict) and str(e.get("run")) == str(prev_name) and "maillog_cut_orgs" not in e:
+            e["maillog_cut_orgs"] = sorted(audit.maillog_cuts(prev_report))
+            return e["maillog_cut_orgs"]
+    return None
+
+
+def _whole_number(value):
+    """A metrics count for a %d: its whole part, 0 when it is no number."""
+    n = _number(value)
+    return int(n) if n is not None else 0
 
 
 def render_metrics(entries, last=12):
-    """metrics.md, the last runs as a table. A run whose mail log the row
-    budget or the API cap cut shows its failure count as the floor it is;
-    an entry or a value of the wrong type reads as unknown, never an error."""
+    """metrics.md, the last runs as a table (metrics.json holds every run).
+    A run whose mail log the row budget or the API cap cut shows its failure
+    count as the floor it is - a run from before the cuts were recorded by
+    its per-domain spans, as notify reads them; an entry or a value of the
+    wrong type reads as unknown, never an error."""
     rows = [e for e in entries if isinstance(e, dict)][-last:]
     L = ["# Runs", "", "| run | domains: policy / gate | findings | genuine failures | pass rate | plan rows |", "|---|---|---|---|---|---|"]
     for e in rows:
@@ -718,15 +776,16 @@ def render_metrics(entries, last=12):
         if len(per) > 4:
             doms += " (+%d)" % (len(per) - 4)
         f = e.get("findings") if isinstance(e.get("findings"), dict) else {}
-        fs = ", ".join("%s %d" % (k, v) for k, v in sorted(f.items()) if _number(v) is not None) or "-"
+        fs = ", ".join("%s %d" % (k, _whole_number(v)) for k, v in sorted(f.items(), key=str)
+                       if _number(v) is not None) or "-"
         gf = _number(e.get("genuine_failures"))
-        cut = [str(o) for o in e.get("maillog_cut_orgs") or [] if o] if isinstance(e.get("maillog_cut_orgs"), list) else []
-        gfs = "-" if gf is None else ("%s (floor, %s cut)" % (gf, ", ".join(cut)) if cut else str(gf))
+        cut = notify._cut_orgs(e) or []
+        gfs = "-" if gf is None else ("%d (floor, %s cut)" % (gf, ", ".join(cut)) if cut else "%d" % gf)
         rate = _number(e.get("rua_pass_rate"))
         pr = "%.1f%%" % (100 * rate) if rate is not None else "-"
         L.append("| %s | %s | %s | %s | %s | %d (%d now) |" % (e.get("run") or "-", doms, fs, gfs, pr,
-                                                               _number(e.get("plan_changes")) or 0,
-                                                               _number(e.get("plan_priority1")) or 0))
+                                                               _whole_number(e.get("plan_changes")),
+                                                               _whole_number(e.get("plan_priority1"))))
     L.append("")
     return "\n".join(L)
 
@@ -761,20 +820,52 @@ def headline_note(gate, orgs, volumes):
     return "headline signal: no internal mail in any org domain this run - %s" % chosen
 
 
+def read_history(path, expect, stamp=None, notes=None):
+    """A history file collect.py keeps (metrics.json, senders.json) as the
+    shape it expects (list or dict), or None when the file is absent. A file
+    that exists but cannot be read as that shape - broken JSON, a BOM or a
+    UTF-16 encoding from an editor is read fine - is never overwritten by a
+    fresh history: it is set aside under its name plus .unreadable-<stamp>,
+    the note says so, and the history starts again."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        doc = json.loads(audit._decode_export(p.read_bytes()))
+    except (OSError, ValueError):
+        doc = None
+    if isinstance(doc, expect):
+        return doc
+    aside = p.with_name("%s.unreadable-%s" % (p.name, stamp or utc_stamp()))
+    try:
+        p.replace(aside)
+        where = "set aside as %s" % aside.name
+    except OSError as err:
+        where = "could not be set aside (%s)" % err
+    if notes is not None:
+        notes.append("%s is not the %s collect.py writes (%s): %s; the history starts again from this run"
+                     % (p.name, "list" if expect is list else "object", "unreadable" if doc is None else type(doc).__name__,
+                        where))
+    return None
+
+
 def load_json(path, default):
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        return json.loads(audit._decode_export(Path(path).read_bytes()))
     except (OSError, ValueError):
         return default
 
 
-def update_senders(path, report, stamp):
+def update_senders(path, report, stamp, notes=None):
     """senders.json remembers every sender identity ever seen (notify.sender_keys:
     rua source IPs and mail-log envelope domains) with its first and last run,
     so "newly identified" means new to the whole history, not merely absent
-    last week. Returns (keys known before this run, keys new in this run)."""
-    state = load_json(path, {})
+    last week. An entry that is not an object (a hand edit) is replaced by a
+    fresh one; a file that is not the object collect.py writes is set aside
+    (read_history). Returns (keys known before this run, keys new in this run)."""
+    state = read_history(path, dict, stamp, notes) or {}
     seen = state.get("senders") if isinstance(state.get("senders"), dict) else {}
+    seen = {k: (v if isinstance(v, dict) else {"first_seen": stamp}) for k, v in seen.items()}
     known_before = set(seen)
     now = notify.sender_keys(report)
     new = sorted(k for k in now if k not in seen)
@@ -804,16 +895,39 @@ def render_todo(report, plan, caveats=()):
     L.append("")
     per = gate.get("domains") or {}
     # a domain the run measured sending nothing skips the weekly ramp whose first step the gate judges: its line
-    # leads with the quarantine-now row (section 2) and gives the gate's verdict as the ramp's
+    # leads with the quarantine-now row (section 2) and gives the gate's verdict as the ramp's - unless the
+    # gate's blockers hold that row too. A domain the plan parks, or gives a record of its own, leads with those
+    # rows the same way: the gate's ramp step is not its next step
     quiet = {c.get("domain"): c.get("id") for c in changes if isinstance(c, dict) and c.get("kind") == "no_mail"}
+    own = {}  # the priority-1 rows that replace the gate's step: park rows, and the domain's own _dmarc record
+    for c in changes:
+        if not isinstance(c, dict) or c.get("priority") != 1 or c.get("domain") in quiet:
+            continue
+        if c.get("kind") == "park" or (c.get("kind") == "new" and c.get("hostname") == "_dmarc.%s" % c.get("domain")):
+            own.setdefault(c["domain"], []).append(c)
+    dns = report.get("dns") if isinstance(report.get("dns"), dict) else {}
     for d, g in sorted(per.items()):
         if d in quiet:
-            L.append("- %s: p=%s, next step: no mail measured, quarantine now (%s, section 2); the gate's %s is for "
-                     "the weekly ramp this skips" % (d, g.get("current_policy") or "unknown", quiet[d],
-                                                    g.get("verdict")))
+            left = audit.ramp_blockers_left(report, d)
+            L.append("- %s: p=%s, next step: no mail measured, quarantine now (%s, section 2); the gate's %s %s"
+                     % (d, g.get("current_policy") or "unknown", quiet[d], g.get("verdict"),
+                        "is for the weekly ramp this skips" if not left else "holds that row too: %s" % left[0]))
+        elif d in own:
+            what = "; then ".join("%s (%s, section 2)" % (next_steps.step_label(c), c.get("id")) for c in own[d])
+            L.append("- %s: p=%s, gate %s, next step: %s" % (d, g.get("current_policy") or "unknown", g.get("verdict"), what))
         else:
-            L.append("- %s: p=%s, gate %s, next step: %s"
-                     % (d, g.get("current_policy") or "unknown", g.get("verdict"), g.get("next_step")))
+            step = str(g.get("next_step") or "")
+            at = re.search(r"\s+on the record at (\S+)$", step)
+            doc = dns.get(d) if isinstance(dns.get(d), dict) else {}
+            if doc.get("inherited"):
+                # a name a plan hold says needs a record of its own before the apex moves to reject: one statement
+                held = audit.inherited_step(d, step, plan)
+                if held != step:
+                    step = held
+                elif at and at.group(1) != "_dmarc." + d:
+                    # the gate's step on the parent's record is the apex's step, not this name's
+                    step = "none of its own: it follows %s and moves with the apex's step" % at.group(1)
+            L.append("- %s: p=%s, gate %s, next step: %s" % (d, g.get("current_policy") or "unknown", g.get("verdict"), step))
     if not per:
         L.append("- no per-domain verdict in this run")
     L.append("")
@@ -958,7 +1072,9 @@ def main():
     pre_args, _rest = pre.parse_known_args()
     ap = argparse.ArgumentParser(parents=[pre],
                                  description="Run the whole DMARC audit and write report, plan, to-do, history and summary.")
-    ap.add_argument("domains", nargs="*", help="domains, comma or space separated (default: audit.toml, else the tenant's)")
+    ap.add_argument("domains", nargs="*",
+                    help="domains, comma or space separated, audited beside the tenant's own (those are read whenever "
+                         "the app registration can; default list: audit.toml's domains)")
     ap.add_argument("--file", metavar="PATH", help="file with one domain per line")
     ap.add_argument("--no-graph", action="store_true", help="never touch the tenant: no domain list, no mail log, no mailbox")
     ap.add_argument("--mailflow", action="store_true", help="add subdomains seen sending in the last 30 days")
@@ -1157,6 +1273,8 @@ def main():
     prev_report = read_report(prev_dir / "report.json") if prev_dir else None
     if prev_dir and prev_report is None:
         note("previous run %s: report.json unreadable - no delta this run" % prev_dir.name)
+    if prev_report is not None:  # an older report's cut is in the run.json beside it, nowhere in the report
+        inherit_run_cuts(prev_report, prev_dir / "run.json")
 
     # 5. audit
     extra = {}
@@ -1223,7 +1341,9 @@ def main():
     md = audit.render_md(report)
     if caveats:
         md += "\n## Caveats\n\n" + "\n".join("- " + c for c in caveats) + "\n"
-    (run_dir / "report.json").write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+    if audit.write_report_json(report, run_dir / "report.json"):  # a large census goes to census.json beside it
+        note("report.json keeps %s of the census; the whole census is in %s next to it"
+             % (audit.CENSUS_KEEPS, audit.CENSUS_FILE))
     (run_dir / "report.md").write_text(md, encoding="utf-8")
     covered = str(fetch_rua.load_state(out / "rua_state.json").get("covered_from") or "")[:10] if fetch_rua else ""
     if since and covered and covered > since:
@@ -1250,12 +1370,12 @@ def main():
 
     # 7. history and metrics
     metrics_path = out / "metrics.json"
-    try:
-        entries = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else []
-    except ValueError:
-        entries = []
-    if not isinstance(entries, list):  # not the history this file holds: start it again, as for broken JSON
-        entries = []
+    history_notes = []  # a history file that is not what collect.py writes is set aside, never overwritten
+    entries = read_history(metrics_path, list, stamp, history_notes) or []
+    filled = backfill_cut_orgs(entries, prev_dir.name if prev_dir else None, prev_report)
+    if filled:  # an entry from before the cuts were recorded: its own report says which orgs were cut
+        note("metrics.json: the previous run's entry now records the mail log cut for %s, from its report"
+             % ", ".join(filled))
     entries.append(metrics_entry(stamp, report, plan))
     metrics_path.write_text(json.dumps(entries, indent=1), encoding="utf-8")
     (out / "metrics.md").write_text(render_metrics(entries), encoding="utf-8")
@@ -1292,7 +1412,13 @@ def main():
     for old in history[:-args.keep] if args.keep > 0 else []:
         shutil.rmtree(old, ignore_errors=True)
 
-    known_before, new_senders = update_senders(out / "senders.json", report, stamp)
+    known_before, new_senders = update_senders(out / "senders.json", report, stamp, history_notes)
+    for n in history_notes:
+        degrade(n)
+    # a sender identity under an organization the previous run's cut log may have missed is recorded, but not
+    # announced as new: the delta withholds it for the same reason (notify says so in the summary)
+    maybe_missed = sorted(notify.senders_maybe_missed(report, new_senders))
+    announced = [k for k in new_senders if k not in maybe_missed]
 
     # 9. summary and notification
     try:
@@ -1320,8 +1446,10 @@ def main():
                                                       "owners_file": str(owners_path) if owners_path else None,
                                                       "next_steps": steps is not None,
                                                       "settings": cfg.get("_path"),
-                                                      "new_senders": new_senders[:RUN_JSON_SENDERS],
-                                                      "new_senders_count": len(new_senders),
+                                                      "new_senders": announced[:RUN_JSON_SENDERS],
+                                                      "new_senders_count": len(announced),
+                                                      "new_senders_maybe_missed": maybe_missed[:RUN_JSON_SENDERS],
+                                                      "new_senders_maybe_missed_count": len(maybe_missed),
                                                       "caveats": caveats, "degraded": degraded,
                                                       "strict_reasons": strict_reasons,
                                                       "exit_code": code}, indent=1), encoding="utf-8")

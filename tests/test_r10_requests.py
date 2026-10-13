@@ -779,8 +779,12 @@ def test_r3_the_sp_step_at_quarantine_names_every_sending_subdomain_without_a_re
     doc = next_steps.build(rep, p)
     assert "move to p=reject or set sp=quarantine, one a week (plan %s, %s)" % (reject["id"], sp["id"]) in \
         next_steps.render_md(doc)
-    assert doc["one_liner"].endswith("and the other change to _dmarc.corp.example (plan %s) waits for another week, "
-                                     "since both rewrite today's record." % sp["id"])
+    assert ("and the other change to _dmarc.corp.example (plan %s) waits for another week, since both rewrite "
+            "today's record, and on hold while: " % sp["id"]) in doc["one_liner"]
+    # the gate's blockers the row does not carry hold the step too (N6): the delivered spoofs and the override
+    assert doc["one_liner"].endswith("18 messages from this domain failed authentication but reached a mailbox - a "
+                                     "local override is masking failures external receivers enforce.")
+    assert doc["next_step"]["holds"][0].startswith("spoofing source 203.0.113.66 (800 msgs) saw disposition none")
 
 
 def test_r3_once_the_records_exist_the_step_is_ready(tmp_path):

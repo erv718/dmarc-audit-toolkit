@@ -793,11 +793,17 @@ def unknown_senders(agg, nets, domains):
 def likely_label(s, domains, known_domains=()):
     """Heuristic (label, signals) for one failing source. A guess, not a verdict.
     known_domains: the sending platforms the operator listed (--known, the
-    settings' vendors); only one of those, sending as the domain with a
-    signature that fails, reads as a broken key at our own sender rather than
-    as a forward or a spoof, because the counters alone fit all three."""
+    settings' vendors); one of those, sending as the domain with a signature
+    that fails, reads as a broken key at our own sender rather than as a
+    forward or a spoof, because the counters alone fit all three. One more
+    discriminator the counters carry: a source that also delivers aligned
+    DKIM passes as the domain (the source's dkim_pass) is a system that
+    signs for it with a key that verifies - a forwarder or a spoofer with a
+    forged signature never produces one - so its failing signature is a
+    rotated or mismatched key at our own platform, listed or not."""
     signals = []
     own = all(_under(hf, domains) for hf in s["header_from"]) if domains else True
+    aligned_passes = s.get("dkim_pass") or 0  # messages from this source with an aligned DKIM pass
     unauth = s["no_auth"]
     if unauth * 2 >= s["count"]:
         signals.append(f"no DKIM signature and no SPF pass on any domain ({unauth} of {s['count']} msgs)")
@@ -813,6 +819,13 @@ def likely_label(s, domains, known_domains=()):
                            f"({s['aligned_dkim_failed']} msgs): modified in transit (forwarding, list) or a broken key")
         if fwd:
             signals.append(f"reporter marked {fwd} msgs as forwarded or list traffic")
+        if own and not fwd and s["aligned_dkim_failed"] * 2 >= s["count"] and aligned_passes > 0:
+            # the same source also delivers aligned DKIM passes as the domain: a key of the domain verifies from
+            # it, which no forwarder and no spoofer with a forged signature produces. The failing signature is
+            # a rotated or mismatched key at a platform that signs for us, whether or not it is listed
+            signals.append(f"the same source delivers {aligned_passes} msgs with an aligned DKIM pass as the domain "
+                           "and nothing marks forwarding: a rotated or mismatched DKIM key at a system that signs for it")
+            return "likely_misconfigured", signals
         if s["misaligned_spf"]:
             doms = sorted({d for (d, _, r) in s["spf"] if r == "pass" and d})
             own_key = own and not fwd and s["aligned_dkim_failed"] * 2 >= s["count"] and bool(doms)

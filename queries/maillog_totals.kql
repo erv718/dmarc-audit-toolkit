@@ -19,7 +19,9 @@
 //   delivered_by           = what let a delivered failure in, from its delivered
 //                            failing leg: "org: <OrgLevelPolicy> (<OrgLevelAction>)",
 //                            else "user: <UserLevelPolicy> (<UserLevelAction>)",
-//                            else empty (no override recorded, or not delivered)
+//                            else empty (no override recorded, or not delivered);
+//                            another delivered copy's override counts only when
+//                            no failing copy reached a mailbox (dedupe.delivered_by)
 //   genuine_failures       = pairs that failed on some leg and passed on none
 //   delivered_despite_fail = those of them delivered to a mailbox
 // A From domain with failures under two overrides has two rows, its
@@ -57,12 +59,14 @@ let failures = failing_ids                                   // smaller table on
 | summarize anypass    = max(iff(dmarc =~ "pass", 1, 0)),
             anyfail    = max(iff(dmarc =~ "fail", 1, 0)),
             delivered  = max(iff(on_mailbox, 1, 0)),
+            failing_on = max(iff(on_mailbox and dmarc =~ "fail", 1, 0)),
             by_failing = take_anyif(reason, on_mailbox and dmarc =~ "fail" and isnotempty(reason)),
             by_other   = take_anyif(reason, on_mailbox and isnotempty(reason)),
             fromdom    = min(fromdom)
   by InternetMessageId, rcpt
 | where anyfail > 0 and anypass == 0
-| extend delivered_by = iff(delivered == 1, iff(isnotempty(by_failing), by_failing, by_other), "")
+| extend delivered_by = iff(delivered == 1,
+                            iff(isnotempty(by_failing), by_failing, iff(failing_on == 1, "", by_other)), "")
 | summarize genuine_failures       = count(),
             delivered_despite_fail = countif(delivered == 1)
   by fromdom, delivered_by;

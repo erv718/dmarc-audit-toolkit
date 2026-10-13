@@ -43,17 +43,25 @@ enabled = true
 # "teams" is designed in but not yet verified against a live webhook; keep "slack".
 target = "slack"
 
-# Formal exceptions (docs/methodology.md step 5). A failing sender listed here
-# stops holding the gate until the date passes. All four fields are required;
-# an entry missing one is reported and NOT applied. match is an IP, an IP
-# prefix, an envelope or DKIM signing domain, or a From address. A From address
-# also covers forged copies of it: for a vendor platform, match its envelope
-# domain. A domain covers an aggregate-report stream only when every domain the
-# stream authenticated with, other than the audited ones, is under it.
+# Formal exceptions (docs/methodology.md step 5). A FAILING sender listed here
+# stops holding the gate until the date passes. match, reason, until and
+# removal_criterion are required (owner is optional); an entry missing one is
+# reported and NOT applied. What a match covers depends on its kind: an IP or
+# an IP prefix covers aggregate-report streams by source IP and never a
+# mail-log message; a From address covers mail-log messages with that address,
+# forged copies included, and never a stream; a domain covers mail-log
+# messages whose envelope (MAIL FROM) domain is under it - forged envelopes
+# and a shared platform's other customers too, so the gate's note counts the
+# excepted messages that failed SPF for that envelope when the log says - and
+# aggregate-report streams whose SPF and DKIM domains, other than the audited
+# ones, are all under some domain exception (one entry per domain for a vendor
+# that signs with its own domain through an ESP, or one for its source IP).
+# An exception lifts failures only: a sender that passes on SPF alone is not
+# failing, and the DKIM-before-reject hold on it is never lifted by an entry.
 #
 # [[exceptions]]
-# match = "192.0.2.30"
-# reason = "legacy statements printer, SPF-only by design; the business accepts the loss at reject"
+# match = "203.0.113.40"
+# reason = "the statements printer sends as example.com without DKIM and fails DMARC; replacement ordered"
 # owner = "finance-systems"
 # until = 2026-12-31
 # removal_criterion = "printer replaced, or the vendor enables DKIM signing for example.com"

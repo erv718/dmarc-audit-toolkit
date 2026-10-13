@@ -111,7 +111,7 @@ needs a script.
 | Permission | Where it lives | What the toolkit does with it | Used by | Without it |
 |---|---|---|---|---|
 | `ThreatHunting.Read.All` | Microsoft Graph, Application | runs the advanced hunting queries: 30 days of mail-flow telemetry, deduplicated | `collect.py`, `run_hunting.py`, `discover.py --mailflow` | no tenant data; DNS, saved reports and files still work |
-| `Domain.Read.All` | Microsoft Graph, Application | reads the tenant's verified domain list, so a run with no arguments audits everything you own | `collect.py`, `discover.py`, `audit.py` | list the domains in `audit.toml`, on the command line or in `EXTRA_DOMAINS` (`.env`) |
+| `Domain.Read.All` | Microsoft Graph, Application | reads the tenant's verified domain list, so a run with no arguments audits everything you own | `collect.py`, `discover.py`, `audit.py` | `collect.py`: list the domains in `audit.toml`, on the command line or in `EXTRA_DOMAINS` (`.env`); `discover.py`: the command line or `EXTRA_DOMAINS`; `audit.py`: the command line or `--file` |
 | `Mail.Read`, scoped by an Application Access Policy | Microsoft Graph, Application | reads aggregate (rua) reports out of one mailbox: the outside view | `fetch_rua.py`, `collect.py` | no outside view; save the report files by hand and pass `--rua` |
 | `Exchange.ManageAsApp` (optional) | Office 365 Exchange Online, Application, plus the **Global Reader** directory role on the app and a certificate | lets the three PowerShell auditors run unattended; they read transport rules, bypasses and groups, which Graph does not expose | `audit_rules.ps1`, `audit_bypasses.ps1`, `audit_groups.ps1` through `ToolkitExo.ps1` | run those three yourself after `Connect-ExchangeOnline`, or skip them |
 
@@ -191,7 +191,7 @@ Secrets never go in this file; they stay in `.env`.
 ```
 python src/collect.py                       # tenant domains, tenant data, everything
 python src/collect.py --dry-run             # same, but print the Slack summary instead of posting it
-python src/collect.py example.com --offline --rua samples/rua --maillog samples/sample_maillog.csv --auth-column DMARC
+python src/collect.py example.com --offline --rua samples/rua --maillog samples/sample_maillog.csv --auth-column DMARC --no-notify
 
 python src/dedupe.py samples/sample_maillog.csv --auth-column DMARC    # the deduplication alone, on the same samples
 rows read                   : 93
@@ -209,7 +209,9 @@ logical messages            : 81
 ```
 
 The third line runs entirely from the bundled synthetic samples with no
-credentials and no network, which is the quickest way to see the outputs; the
+credentials and no network (`--no-notify` keeps it that way: an `--offline`
+run still posts the summary when `SLACK_WEBHOOK_URL` is set), which is the
+quickest way to see the outputs; the
 block under it is `dedupe.py`'s own report on those samples, the
 deduplication every run performs. A run verifies the registration, reads the
 domain list (the tenant's, plus `EXTRA_DOMAINS`), measures each audited
@@ -263,7 +265,7 @@ Read them in this order, all under `audit-out/latest/`:
    the mail log recorded one (`delivered_by` in the census,
    `delivered_despite_fail_by` in the counters; the mail log `collect.py`
    pulls carries the override columns), and for an organization
-   whose rows the row budget cut, its full-window totals counted in advanced
+   whose rows the row budget or the API cap cut, its full-window totals counted in advanced
    hunting (`maillog.window_totals`) beside the floor the gate still uses -
    and a "verified vs inferred" split so you always know what
    was measured and what was reasoned. `report.json` is the same as data and
@@ -281,7 +283,7 @@ Read them in this order, all under `audit-out/latest/`:
    audit saw; the Advanced Hunting query to paste into your own Defender
    portal, saved under `queries/` next to it (a shipped query with only its
    `let sender_domain` line set), with the figure the report counted (for an
-   organization the row budget cut, the full-window figure collect.py
+   organization the row budget or the API cap cut, the full-window figure collect.py
    counted, with the report's own as the floor beside it); the
    command that recounts the files the run read; the admin page and the
    read-only cmdlet behind each tenant finding; and for each plan row what
@@ -327,8 +329,11 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   Passing mail as it in those reports means the domain sends: it gets a
   monitoring record, not a park.
 - **One ratchet per domain per week**: `p=none` to `p=quarantine; pct=25`, to
-  `pct=100`, to `p=reject`, then SPF `-all`. A step appears only when the
-  earlier ones are done and a week of reports has flowed.
+  `pct=50`, to `pct=100`, to `p=reject`, then (for an organizational domain)
+  `sp=quarantine` and `sp=reject` as below, then SPF `-all`. The plan reads
+  the next step off the record as it stands today, so a step appears on the
+  run after the earlier one was published; the week of reports between steps
+  is a rule for the person applying it, not something the plan checks.
 - **No mail measured: quarantine now.** A domain the run measured sending
   nothing skips that ramp, which would protect nobody: no mail out in the
   tenant's 30-day mail flow; nothing passing, internal, formally excepted or
@@ -341,11 +346,20 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   called spoofing. A domain whose mail the tenant does not carry - one only
   `EXTRA_DOMAINS` (or a file, or the command line) names, or one whose SPF
   or DKIM points at another platform - needs aggregate reports that cover
-  it; until then it gets the monitoring record or the ramp. The plan
+  it; until then it gets the monitoring record or the ramp. Reports cover it
+  as soon as one report in the run's window is about its record, whatever
+  span they add up to: a sender that mails every few weeks may be unseen,
+  which is what the monthly-sender check on the row is for. The plan
   proposes its `p=quarantine` record (no `pct`) as a priority-1 row, "no
   mail measured: quarantine now", which is not one of the zero-risk rows: it
   waits until no sender that mails less often than monthly (statements,
   renewals) uses the domain, and until the checks it names are confirmed.
+  On an organizational domain the record keeps `sp=none` (unless the record
+  already sets `sp=`), so no subdomain follows it to quarantine unseen. An
+  aggregate-report source a formal exception covers is set aside
+  everywhere: it is not counted as a sender here, so this record will
+  quarantine its mail at receivers - except a source by IP only once you
+  accept that.
   `p=reject` follows after a week of reports still showing nothing passing,
   with no DKIM proof to wait for and the same checks carried over. The
   per-domain lines lead with it, and give the gate's verdict as the one for
@@ -355,8 +369,9 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   `sp=quarantine` once every subdomain that sends or may send - outbound in
   the tenant's mail flow (the same query counts the unaudited names under
   your organizations), passing in the mail log or in the aggregate reports,
-  failing there as our own system does, as an unclear sender or as a
-  formally excepted one, and an audited subdomain whose mail out was not
+  failing in the mail log as our own system does, as an unclear sender or as
+  a formally excepted one (a formally excepted aggregate-report source is
+  set aside, not counted), and an audited subdomain whose mail out was not
   measured - has a `_dmarc` record of its own. It proposes the missing
   monitoring records itself and holds the step, naming them, until they
   exist; with no aggregate report covering the apex's record it says what
@@ -382,15 +397,25 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   measured sending nothing has no sender to prove: its reject row waits on a
   week of reports showing nothing passing instead.)
 - **Formal exceptions.** A failing sender you have explained and accepted can
-  be excepted in `audit.toml` (`[[exceptions]]`: match, reason, owner, until,
-  removal criterion). Entries missing a field are reported and ignored;
-  expired ones block again. An address match covers every message with that
-  From address, forged copies included; for a vendor platform prefer its
-  envelope domain, which a spoof of your From address does not carry. A
-  domain match covers an aggregate-report stream only when every domain the
-  stream authenticated with, other than your audited ones, is under it, so a
-  shared relay that also carries other senders' mail is never lifted by one
-  vendor's exception.
+  be excepted in `audit.toml` (`[[exceptions]]`: match, reason, until and
+  removal criterion are required, owner is optional). Entries missing a
+  required field are reported and ignored; expired ones block again. Each
+  match kind covers different evidence. An IP or an IP prefix covers
+  aggregate-report streams by source IP, never a mail-log message (the log
+  carries no source IP at the deduplicated grain). A From address covers
+  mail-log messages with that address, forged copies included, never a
+  stream. A domain covers mail-log messages whose envelope domain (MAIL FROM)
+  is under it - forged envelopes too, since a spoofer can set any MAIL FROM,
+  and every customer of a shared platform; when the log carries the SPF
+  verdict the gate's note counts the excepted messages that failed SPF for
+  that envelope, which a forged one does - and aggregate-report streams whose
+  SPF and DKIM domains, other than your audited ones, are all under some
+  domain exception: a vendor that signs with its own domain and sends through
+  an ESP needs an exception for each domain, or one for its source IP, and
+  the blocker says which domain is left uncovered. A shared relay that also
+  carries other senders' mail is never lifted by one vendor's exception. An
+  exception lifts failures; it never lifts the DKIM-before-reject hold on an
+  SPF-only sender.
 
 ## Step 5 - put it on a weekly schedule
 
@@ -413,10 +438,22 @@ Linux or macOS, `crontab -e`:
 ```
 
 What accumulates, all local and gitignored (back the folder up; it is the only
-copy): `audit-out/history/<run>/` for the last 12 runs, `metrics.json` and
-`metrics.md` with one line per run from day one, `senders.json` with every
-sender identity ever seen and when, `rua/` with every aggregate report ever
-pulled. The hunting API only ever shows 30 days; the long view is this
+copy): `audit-out/history/<run>/` for the last 12 runs, `metrics.json` with
+one entry per run from day one (`metrics.md` shows the last 12 as a table),
+`senders.json` with every sender identity ever seen and when, `rua/` with
+every aggregate report ever pulled. Each run folder, and its copy in
+`latest/`, holds `report.md`, `report.json` (with `census.json` beside it
+when the sender census is large: report.json then keeps the failing,
+delivered and excepted census rows, every row of a name that is not an
+audited domain with mail of its own, and the busiest clean rows of those
+domains, so `plan.py` and `verify.py` read the same senders from it with or
+without the side file; `next_steps.py` and `notify.py` read the side file
+back whole), `plan.md`,
+`plan.json`, `next_steps.md`, `next_steps.json`, `todo.md`, `verify.md` and
+`queries/`, `summary.txt`, `run.json`, `inventory.json`, `domains.txt`,
+`setup.json` and `maillog.csv` - the raw per-recipient mail log the run
+pulled, with recipient addresses and subject lines: personal data that stays
+on this machine and is never handed to an AI tool. The hunting API only ever shows 30 days; the long view is this
 folder. The first run reads the last 30 days of the report mailbox
 (`fetch_rua.py --since` backfills older history once, if you want it; a long
 backfill stops at `--max` and names the `--since` that continues it), and
@@ -430,7 +467,7 @@ the raw ones (with the overrides that let failing mail in, when the mail log
 recorded them), the worst failing senders from the census, spoofing blocked by
 receivers, newly identified senders (new to the whole history, not just absent
 last week), the week-over-week deltas, and the trend over the last four runs.
-A domain under an organization whose rows the row budget cut shows its count
+A domain under an organization whose rows the row budget or the API cap cut shows its count
 from the rows kept as the floor it is, with its full-window totals counted in
 advanced hunting beside it.
 A delta is withheld, and the message says so, when two runs cannot bear the
@@ -518,7 +555,7 @@ answer.
 | `src/mcp_server.py` | The tools above for any MCP client. |
 | `scripts/register_weekly_task.ps1` | Registers or removes the Windows scheduled task. |
 | `scripts/check_public.py` | Pre-push gate: deny terms, typographic dashes, and credential material never leave the repo. |
-| `queries/` | Nine advanced-hunting queries: deduplicated census and failures, subdomain health, override audit, echo-vs-loss twins, pre-reject DKIM alignment, impersonation, the raw per-leg export that feeds `dedupe.py` (with the override each leg recorded), and the full-window totals `collect.py` counts for an organization its row budget cut. |
+| `queries/` | Nine advanced-hunting queries: deduplicated census and failures, subdomain health, override audit, echo-vs-loss twins, pre-reject DKIM alignment, impersonation, the raw per-leg export that feeds `dedupe.py` (with the override each leg recorded), and the full-window totals `collect.py` counts for an organization its row budget or the API cap cut. |
 | `samples/` | Synthetic mail log, aggregate reports, annotated headers and `owners.csv.example`, so every tool can be tried offline. |
 | `docs/` | The methodology, the app registration walkthrough, the AI workflow guide, and the shape of the generated status document (`docs/templates/next-steps.md`). |
 
@@ -563,19 +600,25 @@ would leave the machine.
   itself (`queries/maillog_totals.kql`, the same deduplicated grain) and
   reports it beside the floor (`maillog.window_totals`, report.md's
   "Full-window totals for cut organizations", the genuine-failure line of
-  `next_steps.md`); the gate, the census, the labels and the plan still use
-  the rows kept. An answer that holds no mail for that organization, or
+  `next_steps.md`); the gate, the census and the labels still use the rows
+  kept, while the plan reads these totals for that organization's
+  quarantine-now decision and its list of sending subdomains. An answer that
+  holds no mail for that organization, or
   counts less than the rows kept, cannot be its whole window: the run sets
   it aside with a note (a degraded step) and shows the floor alone. Raise
   `--max-rows` to keep more.
 - **"needs Python 3.11 or newer"**: the settings file is TOML; upgrade Python
   or pass everything as flags.
 - **The delta or the trend says "not comparable"**: the row budget or the
-  API row cap cut an organization's mail log in one of the two runs (the note
-  names it; raise `--max-rows` if it is the budget), the two runs' mail logs
-  cover very different spans, or one outside view is near-empty. The counts
-  are still in the report; only the comparison is withheld, and it returns
-  once two runs of a similar shape follow each other.
+  API row cap cut an organization's mail log in either run (the note names
+  the run and the cause; raise `--max-rows` if it is the budget), the two
+  runs' mail logs cover very different spans, an organization was audited in
+  one run only, or one outside view is near-empty. The counts are still in
+  the report; only the comparison is withheld. The delta returns once two
+  consecutive runs are not cut - with a budget that cuts every run it never
+  does until `--max-rows` is raised - and the Slack trend, which compares the
+  first and last of the last four runs, once the cut run has left that
+  window.
 - **One of your own platforms shows as `unknown` in the aggregate reports**,
   with "SPF passes for ..., which looks like the forwarding hop": if the
   domains that signal names send for you, list every one of them among the

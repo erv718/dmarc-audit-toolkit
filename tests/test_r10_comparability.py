@@ -466,7 +466,7 @@ def test_collect_records_its_cuts_names_its_run_and_leads_domains_txt_with_the_h
     assert set(cut["delta"]["by_domain"]) == {"shop.example"} and cut["delta"]["genuine_failures"] is None
     summary = (latest / "summary.txt").read_text(encoding="utf-8")
     assert "vs last run" not in next(l for l in summary.splitlines() if "`hr.corp.example`" in l)
-    assert "failure counts not compared: the mail log was cut for corp.example in one of these runs" in summary
+    assert "failure counts not compared: the mail log was cut for corp.example in the last run" in summary
     assert "the row budget cut the mail log for corp.example in this run" in (latest / "next_steps.md").read_text(encoding="utf-8")
     again, run3, latest = run(0)
     assert again["delta"]["maillog_window"]["domains_not_comparable"] == ["corp.example", "hr.corp.example", "pay.corp.example"]
@@ -571,7 +571,7 @@ def test_c21_an_entry_without_the_cut_key_cannot_hide_a_cut_the_other_end_record
                {"genuine_failures": 50, "rua_pass_rate": 0.79, "maillog_hours": 719.0, "maillog_cut_orgs": ["corp.example"]}]
     line = trend_line(notify.summarize({"gate": {}}, history=history))
     assert "(improving)" not in line and "(worsening)" in line  # the pass rate fell: that is the word
-    assert "failure counts not compared: the mail log was cut for corp.example in one of these runs" in line
+    assert "failure counts not compared: the mail log was cut for corp.example in the last run" in line
 
 
 def test_c28_the_word_judges_the_entries_figures_whatever_pair_a_delta_judged():

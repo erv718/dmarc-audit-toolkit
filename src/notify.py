@@ -42,6 +42,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import audit  # the delta's own rules, the recorded cuts, what a quarantine-now row clears, a split census
 import dedupe  # the overrides that let a delivered failure in, in plain words
 import run_hunting
 
@@ -68,7 +69,8 @@ def load(path):
 
 
 def finding_keys(report):
-    return {(f.get("source") or f.get("domain") or "", f.get("id")) for f in report.get("findings") or []}
+    return {(f.get("source") or f.get("domain") or "", f.get("id"))
+            for f in _rows(_d(report).get("findings")) if isinstance(f, dict)}
 
 
 def delta_finding_keys(entries):
@@ -79,11 +81,11 @@ def delta_finding_keys(entries):
 def source_ips(report):
     """Every source IP the outside view saw: rua.source_ips, the plain list
     audit.py keeps when it caps by_source_ip to the busiest rows, else the
-    table itself."""
-    rua = report.get("rua") or {}
+    table itself. An outside view of the wrong shape reads as none."""
+    rua = report.get("rua") if isinstance(report, dict) and isinstance(report.get("rua"), dict) else {}
     ips = rua.get("source_ips") if isinstance(rua.get("source_ips"), list) else None
     if ips is None:
-        ips = [s.get("source_ip") for s in rua.get("by_source_ip") or [] if isinstance(s, dict)]
+        ips = [s.get("source_ip") for s in _rows(rua.get("by_source_ip")) if isinstance(s, dict)]
     return {str(ip) for ip in ips if ip}
 
 
@@ -146,7 +148,7 @@ def unknown_counts(rua):
     are then recounted over every source the outside view saw (rua.source_ips,
     else by_source_ip) that no listed prefix covers, and the signing domains
     are the rest of the table's total."""
-    unk = [u for u in (rua.get("unknown_senders") or []) if u]
+    unk = [u for u in _rows(rua.get("unknown_senders")) if u]
     doms = [u for u in unk if isinstance(u, dict) and u.get("kind") == "dkim_domain"]
     ips = [u for u in unk if not (isinstance(u, dict) and u.get("kind") == "dkim_domain")]
     cut = rua.get("truncated") if isinstance(rua.get("truncated"), dict) else {}
@@ -224,26 +226,59 @@ def _more(shown, total):
     return (" (+%d more)" % (total - shown)) if total > shown else ""
 
 
-def sender_keys(report):
+def sender_keys(report, report_path=None):
     """Sender identities one run saw, as aggregates: rua source IPs and
     mail-log envelope domains, keyed ip:<address> and envelope:<domain>. No
     From addresses, no people - this set is what collect.py remembers in
-    senders.json so 'newly identified' means new to the whole history."""
+    senders.json so 'newly identified' means new to the whole history. A
+    report read from disk whose census was split off (maillog.census_file)
+    is read whole again from the side file next to report_path, so every
+    envelope counts, not only the rows report.json kept."""
+    if report_path and isinstance(report, dict):
+        report = audit.load_census(report, report_path)
     keys = {"ip:" + ip for ip in source_ips(report)}  # every source, not only the busiest rows kept
-    maillog = report.get("maillog") or {}
+    maillog = report.get("maillog") if isinstance(report.get("maillog"), dict) else {}
     census = maillog.get("census") if isinstance(maillog.get("census"), dict) else {}
-    rows = census.get("by_envelope") or []
+    rows = _rows(census.get("by_envelope"))
     if rows:  # the census names every envelope domain seen; the verdicts are no longer in report.json by default
         for r in rows:
             env = str(r.get("envelope_domain") or "").strip().lower() if isinstance(r, dict) else ""
             if env and env != "(blank)" and _sender_envelope(r):
                 keys.add("envelope:" + env)
     else:
-        for v in maillog.get("verdicts") or []:
+        for v in _rows(maillog.get("verdicts")):
             env = (v.get("envelope_domain") or "").strip().lower() if isinstance(v, dict) else ""
             if env:
                 keys.add("envelope:" + env)
     return keys
+
+
+def senders_maybe_missed(report, keys):
+    """The sender identities among keys that the previous run's cut mail log
+    may simply have missed: envelope domains every census stream of which
+    sends as a domain under an organization the previous run cut (the
+    delta's cut_orgs with a previous side), so the 'newly identified' line
+    never contradicts the delta's own note that withholds them. A source IP
+    comes from the aggregate reports, which no cut touches."""
+    dl = report.get("delta") if isinstance(report.get("delta"), dict) else {}
+    mw = dl.get("maillog_window") if isinstance(dl.get("maillog_window"), dict) else {}
+    cut = mw.get("cut_orgs") if isinstance(mw.get("cut_orgs"), dict) else {}
+    families = {dedupe.org_domain(str(org).strip().lower()) for org, sides in cut.items()
+                if isinstance(sides, dict) and sides.get("previous") is not None}
+    if not families:
+        return set()
+    maillog = report.get("maillog") if isinstance(report.get("maillog"), dict) else {}
+    census = maillog.get("census") if isinstance(maillog.get("census"), dict) else {}
+    by_env = {}
+    for r in _rows(census.get("by_sender")):
+        if not isinstance(r, dict):
+            continue
+        env = str(r.get("envelope_domain") or "").strip().lower()
+        dom = str(r.get("domain") or str(r.get("sender") or "").rpartition("@")[2]).strip().lower()
+        if env and dom:
+            by_env.setdefault(env, set()).add(dedupe.org_domain(dom))
+    return {k for k in keys if k.startswith("envelope:") and by_env.get(k[len("envelope:"):])
+            and by_env[k[len("envelope:"):]] <= families}
 
 
 def _sender_envelope(row):
@@ -271,11 +306,23 @@ def _number(value):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+def _finite(value):
+    """A metrics value as a finite float, else None: nan, an infinity and an integer too large to be a float
+    read as unknown (a hand-edited or damaged entry never stops the summary)."""
+    if _number(value) is None:
+        return None
+    try:
+        f = float(value)
+    except OverflowError:
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
 def _spans_alike(hours):
     """Mail-log spans (hours; None unknown) that bear comparing failure counts:
     an unknown span gets the benefit of the doubt, two spans under an hour are
     alike, otherwise neither may be under half of the other."""
-    known = [float(h) for h in hours if _number(h) is not None and 0 <= h < float("inf")]
+    known = [h for h in map(_finite, hours) if h is not None and h >= 0]
     if len(known) < 2 or max(known) < 1:
         return True
     return min(known) / max(known) >= 0.5
@@ -299,9 +346,21 @@ def _views_differ(sizes):
 def _cut_orgs(entry):
     """The orgs a metrics entry says the row budget or the API cap cut, or None
     when it does not say (an entry from before they were recorded, or a value
-    of the wrong type): that gets the benefit of the doubt."""
+    of the wrong type): that gets the benefit of the doubt - a quiet domain's
+    short span is no cut, so no span heuristic stands in. collect.py fills
+    the key in for the previous run's entry from that run's own report
+    (collect.backfill_cut_orgs), so a floor an older run recorded in its
+    report is read here too."""
     orgs = entry.get("maillog_cut_orgs")
     return [str(o) for o in orgs if isinstance(o, str) and o.strip()] if isinstance(orgs, list) else None
+
+
+def _entry_orgs(entry):
+    """The organizations a metrics entry audited (its domains), or None when it does not say."""
+    doms = entry.get("domains")
+    if not isinstance(doms, dict):
+        return None
+    return {dedupe.org_domain(str(d).strip().lower()) for d in doms if isinstance(d, str) and d.strip()}
 
 
 def _names(items, cap=3):
@@ -355,16 +414,21 @@ def trend_judgement(pts):
     cap; else the pass rate, when the first and last runs that carry one have
     outside views of comparable size; else "not comparable". A reason names
     each comparison refused, only when the line shows what it explains."""
-    gf = [_number(h.get("genuine_failures")) for h in pts]
-    pr = [_number(h.get("rua_pass_rate")) for h in pts]
+    gf = [_finite(h.get("genuine_failures")) for h in pts]
+    pr = [_finite(h.get("rua_pass_rate")) for h in pts]
     counted = [i for i, x in enumerate(gf) if x is not None]
     rated = [i for i, x in enumerate(pr) if x is not None]
     why_counts = why_rate = None
     if len(counted) >= 2:
         first, last = pts[counted[0]], pts[counted[-1]]
-        cut = sorted(set(_cut_orgs(first) or []) | set(_cut_orgs(last) or []))
-        if cut:
-            why_counts = "the mail log was cut for %s in one of these runs" % _names(cut)
+        cf, cl = set(_cut_orgs(first) or []), set(_cut_orgs(last) or [])
+        orgs_f, orgs_l = _entry_orgs(first), _entry_orgs(last)
+        if cf or cl:  # which end runs were cut, as the delta says it
+            parts = [("for %s in both runs", cf & cl), ("for %s in the first run", cf - cl),
+                     ("for %s in the last run", cl - cf)]
+            why_counts = "the mail log was cut " + " and ".join(fmt % _names(sorted(s)) for fmt, s in parts if s)
+        elif orgs_f is not None and orgs_l is not None and orgs_f != orgs_l:
+            why_counts = "%s audited in one of these runs only" % _names(sorted(orgs_f ^ orgs_l))
         elif not _spans_alike([first.get("maillog_hours"), last.get("maillog_hours")]):
             why_counts = "the mail-log spans differ"
     if len(rated) >= 2:
@@ -390,58 +454,82 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     absent last week. history: the metrics.json entries, newest last, for
     the trend line over the last TREND_RUNS runs."""
     lines = []
-    gen = report.get("generated_utc", "")
+    gen = str(report.get("generated_utc") or "")
     lines.append("*DMARC audit* %s" % gen[:16].replace("T", " "))
 
     maillog = report.get("maillog") if isinstance(report.get("maillog"), dict) else {}
     by_dom = maillog.get("by_domain") if isinstance(maillog.get("by_domain"), dict) else {}
     dl = report.get("delta") if isinstance(report.get("delta"), dict) else None
-    dl_dom = (dl or {}).get("by_domain") or {}
-    gate = report.get("gate") or {}
-    per = gate.get("domains") or {}
+    if dl is None and isinstance(previous, dict):
+        # the documented --previous use with an audit.py report: the same rules as collect.py's delta (the
+        # recorded cuts, the spans, the unknown-sender check that ran in one run only), never a bare subtraction
+        try:
+            dl = audit.build_delta(report, previous)
+        except Exception:  # a damaged earlier report: no delta, the rest of the message stands
+            dl = None
+    dl_dom = _d(dl).get("by_domain") if isinstance(_d(dl).get("by_domain"), dict) else {}
+    gate = _d(report.get("gate"))
+    per = _d(gate.get("domains"))
+    cuts = audit.maillog_cuts(report)  # the orgs whose mail log this run cut: their counts are a floor
     # a domain the run measured sending nothing: the plan moves it straight to quarantine, skipping the weekly
-    # ramp whose first step the gate judges, so its line leads with the plan and gives the gate's verdict as such
+    # ramp whose first step the gate judges, so its line leads with the plan and gives the gate's verdict as
+    # such - unless the gate's blockers hold that row too
     quiet = {}
     for c in _rows(plan.get("changes")) if isinstance(plan, dict) else []:
         if isinstance(c, dict) and c.get("kind") == "no_mail" and c.get("domain"):
             quiet.setdefault(str(c["domain"]).lower(), c.get("id") or "?")
-    for dom in sorted(per):
-        g = per[dom]
+    for dom in sorted(per, key=str):
+        g = _d(per[dom])
+        policy = g.get("current_policy") if isinstance(g.get("current_policy"), str) else None
+        verdict = g.get("verdict") if isinstance(g.get("verdict"), str) else "?"
         if str(dom).lower() in quiet:
-            line = ("- `%s`: p=%s, next: no mail measured, quarantine now (plan %s); the gate's *%s* is for the weekly "
-                    "ramp this skips" % (dom, g.get("current_policy") or "unknown", quiet[str(dom).lower()],
-                                         g.get("verdict", "?")))
+            left = audit.ramp_blockers_left(report, str(dom).lower())
+            line = "- `%s`: p=%s, next: no mail measured, quarantine now (plan %s); the gate's *%s* %s" % (
+                dom, policy or "unknown", quiet[str(dom).lower()], verdict,
+                "is for the weekly ramp this skips" if not left else "holds that row too: %s" % left[0])
         else:
-            line = "- `%s`: p=%s, gate *%s*, next: %s" % (dom, g.get("current_policy") or "unknown",
-                                                          g.get("verdict", "?"), g.get("next_step", "?"))
+            step = g.get("next_step") if isinstance(g.get("next_step"), str) else "?"
+            if isinstance(plan, dict):  # a name a plan hold says needs a record of its own: one statement, the plan's
+                step = audit.inherited_step(str(dom), step, plan)
+            line = "- `%s`: p=%s, gate *%s*, next: %s" % (dom, policy or "unknown", verdict, step)
         own = by_dom.get(dom)
         # a domain under an org the row budget cut: its own count is the floor the gate decides on, and the
-        # whole window, counted server side, goes beside it
+        # whole window, counted server side, goes beside it when it was counted
         full = full_window_line(maillog.get("window_totals"), dom)
-        if isinstance(own, dict) and own.get("genuine_failures") is not None:
-            line += " - %d genuine failures of its own" % own["genuine_failures"]
+        cut = next((o for o in cuts if isinstance(o, str) and (dom == o or str(dom).endswith("." + o))), None)
+        if isinstance(own, dict) and _number(own.get("genuine_failures")) is not None:
+            line += " - %d genuine failures of its own" % _whole(own.get("genuine_failures"))
             gone = min(_whole(own.get("excepted")), _whole(own.get("genuine_failures")))
             if gone:  # the count holds every one; the share an exception covers is named beside it
                 line += " (%d of them formally excepted in audit.toml)" % gone
-            if full:
-                line += " in the rows kept (a floor; the gate, the census, the labels and the plan count these)"
+            if cut:
+                kept = audit._cut_kept(cuts.get(cut))
+                line += " in the rows kept (%s; a floor: the gate, the census and the labels count these)" % (
+                    kept or "cut by %s" % (audit._cut_cause(cuts.get(cut)) or "an unrecorded cause"))
             d = dl_dom.get(dom)
-            if isinstance(d, dict) and d.get("genuine_failures") is not None:
+            if isinstance(d, dict) and _number(d.get("genuine_failures")) is not None:
                 line += " (%+d vs last run)" % d["genuine_failures"]
         lines.append(line + full)
 
-    summ = report.get("summary") or {}
-    sev = summ.get("by_severity") or {}
-    lines.append("- findings: %d (%s)" % (summ.get("findings", 0),
-                                          ", ".join("%s %d" % (k, v) for k, v in sorted(sev.items())) or "none"))
+    summ = _d(report.get("summary"))
+    sev = _d(summ.get("by_severity"))
+    lines.append("- findings: %d (%s)" % (_whole(summ.get("findings")),
+                                          ", ".join("%s %d" % (k, _whole(v)) for k, v in sorted(sev.items(), key=str)
+                                                    if _number(v) is not None) or "none"))
 
-    ml = maillog.get("counters") or {}
+    ml = _d(maillog.get("counters"))
     if ml:
-        # what let the delivered ones in, when the log recorded the overrides; '' leaves the line as it was
-        by = dedupe.delivered_by_text(ml.get("delivered_despite_fail_by"), ml.get("delivered_despite_fail", 0))
-        lines.append("- mail log: %d genuine failures (%d rows would say so), %d delivered despite failing%s, spoof-like %d"
-                     % (ml.get("genuine_failures", 0), ml.get("raw_failing_rows", 0), ml.get("delivered_despite_fail", 0),
-                        (" (let in by %s)" % by) if by else "", (ml.get("by_likely") or {}).get("likely_spoof", 0)))
+        # what let the delivered ones in, when the log recorded the overrides ('' without the columns leaves the
+        # line as it was), and the share the formal exceptions cover of each count, as next_steps.md names it
+        gone = audit.whole_excepted(report)
+        gf, ddf = _whole(ml.get("genuine_failures")), _whole(ml.get("delivered_despite_fail"))
+        by = dedupe.delivered_by_phrase(ml.get("delivered_despite_fail_by"), ddf)
+        lines.append("- mail log: %d genuine failures%s (%d rows would say so), %d delivered despite failing%s%s, "
+                     "spoof-like %d"
+                     % (gf, (" (%d of them formally excepted in audit.toml)" % gone["failures"]) if 0 < gone["failures"] <= gf else "",
+                        _whole(ml.get("raw_failing_rows")), ddf,
+                        (" (%d of them formally excepted in audit.toml)" % gone["delivered"]) if 0 < gone["delivered"] <= ddf else "",
+                        (" (%s)" % by) if by else "", _whole(_d(ml.get("by_likely")).get("likely_spoof"))))
     census = maillog.get("census")
     if isinstance(census, dict):
         top, failing = census_top(census)
@@ -451,14 +539,14 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
                          + _excepted_tail(gone))
         elif gone:
             lines.append("- top failing senders (census): none left%s" % _excepted_tail(gone))
-    rua = report.get("rua") or {}
-    tot = rua.get("totals") or {}
+    rua = _d(report.get("rua"))
+    tot = _d(rua.get("totals"))
     if tot:
-        disp = tot.get("by_disposition") or {}
+        disp = _d(tot.get("by_disposition"))
         lines.append("- outside view: %d messages, pass rate %.1f%%, spoofing blocked by receivers: %d rejected, %d quarantined"
-                     % (tot.get("messages", 0), 100 * float(tot.get("pass_rate", 0) or 0),
-                        disp.get("reject", 0), disp.get("quarantine", 0)))
-        unk = rua.get("unknown_senders") or []
+                     % (_whole(tot.get("messages")), 100 * (_finite(tot.get("pass_rate")) or 0),
+                        _whole(disp.get("reject")), _whole(disp.get("quarantine"))))
+        unk = _rows(rua.get("unknown_senders"))
         if unk and ip_check_ran(rua):  # without the check the list names every source, the tenant's own too
             # the count is the per-IP check's (ip entries, over the whole table when it was capped); the
             # signing domains not in the known list are a clause of their own
@@ -473,8 +561,8 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
                     n_doms, "" if n_doms == 1 else "s", (" (top: %s)" % top) if top else "")
             lines.append(line)
 
-    if dl or previous:
-        prev_gen = (dl or {}).get("previous_generated_utc") or (previous or {}).get("generated_utc")
+    if dl or isinstance(previous, dict):
+        prev_gen = _d(dl).get("previous_generated_utc") or _d(previous).get("generated_utc")
         if prev_gen:
             lines.append("- previous run: %s" % str(prev_gen)[:16].replace("T", " "))
         if dl:
@@ -484,65 +572,43 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
             now_f, prev_f = finding_keys(report), finding_keys(previous)
             new_f, gone_f = sorted(now_f - prev_f), sorted(prev_f - now_f)
         if new_f:
-            lines.append("- *new findings*: " + ", ".join("%s %s" % (d.replace("dns:", ""), i) for d, i in new_f[:8])
+            lines.append("- *new findings*: " + ", ".join("%s %s" % (str(d).replace("dns:", ""), i) for d, i in new_f[:8])
                          + (" ..." if len(new_f) > 8 else ""))
         if gone_f:
-            lines.append("- resolved: " + ", ".join("%s %s" % (d.replace("dns:", ""), i) for d, i in gone_f[:8]))
+            lines.append("- resolved: " + ", ".join("%s %s" % (str(d).replace("dns:", ""), i) for d, i in gone_f[:8]))
         if dl:
-            pol, gch = dl.get("policy_changes") or {}, dl.get("gate_changes") or {}
-            for dom in sorted(set(pol) | set(gch)):
-                b = per.get(dom) or {}
-                p, v = pol.get(dom) or {}, gch.get(dom) or {}
+            pol, gch = _d(dl.get("policy_changes")), _d(dl.get("gate_changes"))
+            for dom in sorted(set(pol) | set(gch), key=str):
+                b = _d(per.get(dom))
+                p, v = _d(pol.get(dom)), _d(gch.get(dom))
                 lines.append("- `%s` changed: p=%s/%s -> p=%s/%s"
                              % (dom, p.get("from", b.get("current_policy")), v.get("from", b.get("verdict")),
                                 p.get("to", b.get("current_policy")), v.get("to", b.get("verdict"))))
-        else:
-            prev_per = (previous.get("gate") or {}).get("domains") or {}
-            for dom in sorted(per):
-                a, b = prev_per.get(dom, {}), per[dom]
-                if a and (a.get("current_policy") != b.get("current_policy") or a.get("verdict") != b.get("verdict")):
-                    lines.append("- `%s` changed: p=%s/%s -> p=%s/%s" % (dom, a.get("current_policy"), a.get("verdict"),
-                                                                         b.get("current_policy"), b.get("verdict")))
-        if previous and known_senders is None:  # with the history known, senders.json decides what is new
+        if isinstance(previous, dict) and known_senders is None:  # with the history known, senders.json decides
             now_s, prev_s = rua_sources(report), rua_sources(previous)
             new_s = sorted(set(now_s) - set(prev_s))
             if new_s:
                 lines.append("- *newly seen senders*: " + ", ".join(new_s[:6]) + (" ..." if len(new_s) > 6 else ""))
         if dl:
-            if dl.get("genuine_failures") is not None:
+            if _number(dl.get("genuine_failures")) is not None:
                 lines.append("- genuine failures vs last run: %+d" % dl["genuine_failures"])
-            if dl.get("delivered_despite_fail"):
+            if _number(dl.get("delivered_despite_fail")):
                 lines.append("- delivered despite failing vs last run: %+d" % dl["delivered_despite_fail"])
-            new = {"by_sender": dl.get("new_senders") or []}
+            new = {"by_sender": _rows(dl.get("new_senders"))}
             top, failing = census_top(new)
             gone = census_excepted(new)
             if top:
                 lines.append("- *new failing senders*: " + ", ".join(top) + _more(len(top), failing) + _excepted_tail(gone))
             elif gone:
                 lines.append("- new failing senders: none left%s" % _excepted_tail(gone))
-            for note in dl.get("notes") or []:
+            for note in _rows(dl.get("notes")):
                 lines.append("- note: %s" % note)
-        elif previous:
-            pml = (previous.get("maillog") or {}).get("counters") or {}
-            if ml and pml:
-                d = ml.get("genuine_failures", 0) - pml.get("genuine_failures", 0)
-                lines.append("- genuine failures vs last run: %+d" % d)
-        cmp = (dl or {}).get("rua") if isinstance((dl or {}).get("rua"), dict) else None
+        cmp = dl.get("rua") if dl and isinstance(dl.get("rua"), dict) else None
         if cmp and cmp.get("comparable") is False:
             lines.append("- outside view not comparable with last run (%s messages now, %s then): no pass-rate delta"
                          % (cmp.get("now_messages"), cmp.get("previous_messages")))
-        elif cmp and cmp.get("pass_rate_change") is not None:
+        elif cmp and _finite(cmp.get("pass_rate_change")) is not None:
             lines.append("- pass rate vs last run: %+.1f points" % cmp["pass_rate_change"])
-        elif previous:
-            ptot = (previous.get("rua") or {}).get("totals") or {}
-            if tot and ptot:
-                nm, pm = tot.get("messages") or 0, ptot.get("messages") or 0
-                if nm and pm and min(nm, pm) / max(nm, pm) >= 0.1:
-                    d = 100 * (float(tot.get("pass_rate", 0) or 0) - float(ptot.get("pass_rate", 0) or 0))
-                    lines.append("- pass rate vs last run: %+.1f points" % d)
-                elif nm or pm:  # two empty outside views have nothing to compare, and nothing to say
-                    lines.append("- outside view not comparable with last run (%s messages now, %s then): no "
-                                 "pass-rate delta" % (nm, pm))
 
     if known_senders is not None:
         now_keys = sender_keys(report)
@@ -551,19 +617,28 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
                          "from the next run" % len(now_keys))
         else:
             new_s = sorted(k for k in now_keys if k not in known_senders)
-            if new_s:
+            missed = senders_maybe_missed(report, new_s)  # under an org the previous run's cut log may have missed
+            sure = [k for k in new_s if k not in missed]
+            if sure:
                 lines.append("- *newly identified senders* (never seen in an earlier run): "
-                             + ", ".join(_key_label(k) for k in new_s[:6]) + (" ..." if len(new_s) > 6 else ""))
-            else:
+                             + ", ".join(_key_label(k) for k in sure[:6]) + (" ..." if len(sure) > 6 else ""))
+            elif not missed:
                 lines.append("- newly identified senders: none")
+            if missed:
+                held = sorted(missed)
+                lines.append("- %d sender identit%s first recorded this run but not called new: the previous run's "
+                             "cut mail log may simply have missed %s (%s%s)"
+                             % (len(held), "y" if len(held) == 1 else "ies", "it" if len(held) == 1 else "them",
+                                ", ".join(_key_label(k) for k in held[:6]), " ..." if len(held) > 6 else ""))
 
     pts = [h for h in (history or []) if isinstance(h, dict)][-TREND_RUNS:]
     if len(pts) >= 2:
-        gf = [_number(h.get("genuine_failures")) for h in pts]
-        pr = [_number(h.get("rua_pass_rate")) for h in pts]
+        gf = [_finite(h.get("genuine_failures")) for h in pts]
+        pr = [_finite(h.get("rua_pass_rate")) for h in pts]
         parts = []
         if any(x is not None for x in gf):
-            parts.append("genuine failures " + ", ".join("-" if x is None else str(x) for x in gf))
+            parts.append("genuine failures " + ", ".join("-" if x is None else str(int(x)) if x.is_integer() else str(x)
+                                                         for x in gf))
         if any(x is not None for x in pr):
             parts.append("pass rate " + ", ".join("-" if x is None else "%.1f%%" % (100 * x) for x in pr))
         if parts:
@@ -573,16 +648,25 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
             word, why = trend_judgement(pts)
             lines.append("- trend over the last %d runs (%s): %s" % (len(pts), word, "; ".join(parts + why)))
 
-    if plan:
-        ch = plan.get("changes") or []
-        # a no_mail row quarantines a domain the run measured sending nothing: priority 1, but not monitoring
+    if isinstance(plan, dict):
+        ch = [c for c in _rows(plan.get("changes")) if isinstance(c, dict)]
+        # a no_mail row quarantines a domain the run measured sending nothing: priority 1, but not monitoring; a
+        # monitoring record for a name whose own record nobody looked up waits on that lookup
         quiet = sum(1 for c in ch if c.get("kind") == "no_mail")
-        p1 = sum(1 for c in ch if c.get("priority") == 1 and c.get("kind") != "no_mail")
-        lines.append("- plan: %d change(s) waiting, %d are zero-risk monitoring/hygiene%s; %d hold(s)"
-                     % (len(ch), p1, (", %d %s no mail straight to quarantine"
-                                      % (quiet, "moves a domain that sends" if quiet == 1 else "move domains that send"))
-                        if quiet else "", len(plan.get("holds") or [])))
+        p1 = [c for c in ch if c.get("priority") == 1 and c.get("kind") != "no_mail"]
+        looks = sum(1 for c in p1 if any(str(p).startswith("look up _dmarc.") for p in _rows(c.get("prerequisites"))))
+        lines.append("- plan: %d change(s) waiting, %d are zero-risk monitoring/hygiene%s%s; %d hold(s)"
+                     % (len(ch), len(p1),
+                        (" (%d of them after a lookup of the name's own record)" % looks) if looks else "",
+                        (", %d %s no mail straight to quarantine"
+                         % (quiet, "moves a domain that sends" if quiet == 1 else "move domains that send"))
+                        if quiet else "", len(_rows(plan.get("holds")))))
     return "\n".join(lines)
+
+
+def _d(value):
+    """value when it is a dict, else {}: a damaged section reads as an empty one."""
+    return value if isinstance(value, dict) else {}
 
 
 def target_for(webhook):
@@ -643,9 +727,14 @@ def main():
     ap.add_argument("--env-file", help="credentials file (default: <repo root>/.env)")
     args = ap.parse_args()
 
-    report = load(args.report)
-    previous = load(args.previous) if args.previous else None
+    report = audit.load_census(load(args.report), args.report)  # a split census is read whole again
+    previous = audit.load_census(load(args.previous), args.previous) if args.previous else None
     plan = load(args.plan) if args.plan else None
+    for what, doc, given in (("--report", report, True), ("--previous", previous, bool(args.previous)),
+                             ("--plan", plan, bool(args.plan))):
+        if given and not isinstance(doc, dict):
+            die("%s: expected a JSON object (the file audit.py or collect.py writes), got %s"
+                % (what, type(doc).__name__))
     known = history = None
     if args.senders:
         try:

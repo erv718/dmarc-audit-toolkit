@@ -816,7 +816,9 @@ def test_blocker_items_split_the_reduced_count_with_the_reduced_split():
     assert own["by_likely"] == {"likely_spoof": 0, "likely_misconfigured_sender": 5, "unknown": 0}
     assert [s["name"] for s in own["senders"]] == ["app@corp.example", "printer@corp.example"]  # the excepted spoof is gone
     items = next_steps.blocker_items(rep, "corp.example", own)
-    assert len(items) == 1 and items[0]["kind"] == "other" and "5 logical message" in items[0]["text"]
+    # no failure left looks like spoofing: the gap is our own senders', in the gate's words (a plan row's own-sender
+    # condition then covers it, so the hold is not said twice)
+    assert len(items) == 1 and items[0]["kind"] == "own" and "5 logical message" in items[0]["text"]
 
 
 def test_rewords_keep_the_excepted_count_and_the_stand_line_knows_when_there_is_no_gap():

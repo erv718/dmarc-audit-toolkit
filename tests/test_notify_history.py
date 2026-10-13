@@ -202,7 +202,7 @@ def test_the_trend_word_honours_the_cuts_each_run_recorded():
                {"genuine_failures": 700, "rua_pass_rate": 0.69, "maillog_hours": 719.0, "maillog_cut_orgs": ["corp.example"]}]
     text = notify.summarize(report(), history=history)
     assert "(improving)" not in text and "(worsening)" in text
-    assert "failure counts not compared: the mail log was cut for corp.example in one of these runs" in text
+    assert "failure counts not compared: the mail log was cut for corp.example in the last run" in text
     history[1]["maillog_cut_orgs"] = []
     assert "(improving)" in notify.summarize(report(), history=history)
     rep = report()

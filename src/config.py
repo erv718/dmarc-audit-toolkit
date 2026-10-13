@@ -17,11 +17,17 @@ held by it forever. Every exception carries a reason, an expiry (until,
 YYYY-MM-DD) and a written removal criterion; one without all of them is
 reported and NOT applied, and one past its expiry blocks the gate again. The
 match is an IP, an IP prefix, a domain (the envelope or DKIM signing domain of
-the sender), or a From address. An address matches every message with that
-From address, forged copies included; a vendor platform is better matched by
-its envelope domain. A domain covers an aggregate-report stream only when
-every domain the stream authenticated with, other than the audited ones, is
-under it (matches_stream).
+the sender), or a From address. Each kind covers different evidence: an IP
+or a prefix covers aggregate-report streams by source IP and never a mail-log
+message (the log carries no source IP at the dedupe grain); an address covers
+mail-log messages with that From address, forged copies included, and never a
+stream; a domain covers mail-log messages whose MAIL FROM is under it - a
+forged MAIL FROM too, and every customer of a shared platform, so the gate's
+note counts the excepted messages that failed SPF for that envelope when the
+export carries the verdict - and aggregate-report streams whose SPF and DKIM
+domains, other than the audited ones, are all under some domain exception
+(stream_exceptions: a vendor that signs with its own domain and sends through
+an ESP needs an exception for each, or one for the source IP).
 
 Reading TOML needs Python 3.11 or newer (tomllib in the standard library).
 """
@@ -273,12 +279,56 @@ def matches_stream(exc, stream, audited=()):
     return False
 
 
+def _foreign_domains(stream, audited=()):
+    """The SPF and DKIM domains a stream authenticated with that are not audited domains (or under one)."""
+    doms = [str(d).lower() for d in list(stream.get("spf_domains") or []) + list(stream.get("dkim_domains") or []) if d]
+    own = [a for a in (str(a).strip().lower().rstrip(".") for a in audited or ()) if a]
+    return [d for d in doms if not any(_domain_under(d, a) for a in own)]
+
+
+def stream_exceptions(exceptions, stream, audited=()):
+    """The active exceptions that together cover one rua failing stream: an
+    IP or prefix exception matching its source IP covers it alone; domain
+    exceptions cover it together when every domain the stream
+    authenticated with, other than the audited ones, is under one of them
+    and at least one is (a SaaS signing with its own domain through an ESP
+    whose bounce domain differs needs one exception per domain). [] when
+    nothing covers it; a relay carrying another tenant's domain beside the
+    vendor's stays uncovered, so the other senders' failures stay in view."""
+    for e in exceptions or ():
+        if e.get("kind") in ("ip", "prefix") and matches_stream(e, stream, audited):
+            return [e]
+    foreign = _foreign_domains(stream, audited)
+    used = [e for e in exceptions or () if e.get("kind") == "domain"
+            and any(_domain_under(d, e["match"]) for d in foreign)]
+    if used and all(any(_domain_under(d, e["match"]) for e in used) for d in foreign):
+        return used
+    return []
+
+
+def stream_uncovered(exceptions, stream, audited=()):
+    """The stream's domains no domain exception covers, when some domain
+    exception covers part of it: what a second exception (or one for the
+    source IP) would have to name. [] when nothing matched at all, or when
+    the stream is covered."""
+    foreign = _foreign_domains(stream, audited)
+    doms = [e["match"] for e in exceptions or () if e.get("kind") == "domain"]
+    if not any(_domain_under(d, m) for d in foreign for m in doms):
+        return []
+    return sorted({d for d in foreign if not any(_domain_under(d, m) for m in doms)})
+
+
 def matches_verdict(exc, verdict):
     """Does an exception cover one deduplicated mail-log message? An address
-    matches the From address exactly; a domain matches the envelope (MAIL
-    FROM) domain, the sender's own identity - never the From domain, which is
-    the one being spoofed, so a domain match can never except a domain's own
-    spoofs. The mail log carries no source IP at this grain."""
+    matches the From address exactly, forged copies included; a domain
+    matches the envelope (MAIL FROM) domain, the sender's own identity -
+    never the From domain, which is the one being spoofed. A spoofer can set
+    any MAIL FROM, so a domain match covers forged copies that borrow the
+    envelope too, and a shared platform's envelope is carried by all of its
+    customers: the gate's note names how many excepted messages failed SPF
+    for that envelope when the export says (the verdict's spf_pass), which
+    a forged MAIL FROM does and the platform's own mail does not. IPs and
+    prefixes never match: the mail log carries no source IP at this grain."""
     if exc["kind"] == "address":
         return (verdict.get("sender") or "").lower() == exc["match"]
     if exc["kind"] == "domain":

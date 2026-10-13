@@ -151,7 +151,7 @@ def test_g1_an_export_without_the_override_columns_reads_exactly_as_before(tmp_p
     # the columns present but empty: nothing is named, and the evidence reads the same
     empty = dedupe_doc(Log().add("billing@example.com", "Statement #", leg(), times=2).write(tmp_path / "empty.csv"))
     assert {v["delivered_by"] for v in empty["verdicts"]} == {None}
-    assert "delivered_despite_fail_by" not in empty["counters"]
+    assert empty["counters"]["delivered_despite_fail_by"] == {}  # the columns were there: an empty map says so
     assert empty["census"]["by_sender"][0]["delivered_by"] == {}
     assert not finding(empty, "MAILFLOW-002")["evidence"].startswith("let in by")
 
@@ -192,16 +192,19 @@ def test_g1_the_delivered_failing_leg_names_the_override_before_any_other_delive
     inside = leg(dmarc="none", org=ETR, direction="Intra-org")
     log = (Log().add("alerts@example.com", "Alert #", inside, leg(user=SAFE))
            .add("alerts@example.com", "Alert #", leg(user=SAFE), inside)
-           # no failing copy names one: the other delivered copy is the next witness
-           .add("ops@example.com", "Run #", inside, leg()))
+           # the failing copy reached the inbox and names nothing: the inside copy's rule is not what let it in,
+           # so the data shows no cause; the other delivered copy speaks only when no failing copy was delivered
+           .add("ops@example.com", "Run #", inside, leg())
+           .add("ops@example.com", "Run #", inside, leg(where=QUARANTINED)))
     doc = dedupe_doc(log.write(tmp_path / "order.csv"))
     safe = ("alerts@example.com", "user: Safe senders list (Allow)")
     assert [(v["sender"], v["delivered_by"]) for v in doc["verdicts"]] == [
-        safe, safe, ("ops@example.com", "org: Exchange transport rule (Allow)")]
-    # the full-window totals take it the same way: the delivered failing leg first, then any delivered leg
+        safe, safe, ("ops@example.com", None), ("ops@example.com", "org: Exchange transport rule (Allow)")]
+    # the full-window totals take it the same way: the delivered failing leg, else another delivered leg only
+    # when no failing leg reached a mailbox
     body = kql_body((QUERIES / "maillog_totals.kql").read_text(encoding="utf-8"))
     assert 'by_failing = take_anyif(reason, on_mailbox and dmarc =~ "fail" and isnotempty(reason))' in body
-    assert "iff(isnotempty(by_failing), by_failing, by_other)" in body
+    assert 'iff(isnotempty(by_failing), by_failing, iff(failing_on == 1, "", by_other))' in body
 
 
 def test_g1_plain_words_for_the_common_overrides_and_anything_else_verbatim():
@@ -217,7 +220,10 @@ def test_g1_plain_words_for_the_common_overrides_and_anything_else_verbatim():
     assert dedupe.override_kind("org: Connection policy (Allow)") is None
     assert dedupe.delivered_by_text({"org: Exchange transport rule (Allow)": 2, "org: Exchange transport rule (Junk)": 1,
                                      "user: Safe senders list (Allow)": 1}, 6) == (
-        "an Exchange transport rule x3, a user's safe sender list x1; no override recorded for 2")
+        "an Exchange transport rule x2, a user's safe sender list x1, org: Exchange transport rule (Junk) x1; "
+        "no override recorded for 2")  # a Junk action is no allow: that reason keeps its own words
+    assert dedupe.override_kind("org: Exchange transport rule (Junk)") is None
+    assert dedupe.override_words("org: Tenant Allow Block List (Block)") == "org: Tenant Allow Block List (Block)"
     assert dedupe.delivered_by_text({}, 3) == "" and dedupe.delivered_by_text(None) == ""
     assert dedupe.delivered_by_text({"org: x": "two", "": 4, "org: y": True}, 1) == ""  # odd values read as nothing
 
@@ -234,8 +240,8 @@ def test_g1_the_readers_name_the_override_in_plain_words(tmp_path):
         in mail_log_line(notify.summarize(rep))
     doc = next_steps.build(rep)
     assert stand_line(doc, "**Delivered despite failing") == (
-        "**Delivered despite failing: 7** - these only arrive because of our own overrides (%s; no override recorded "
-        "for 1); outside receivers are not as forgiving (alerts@example.com x3, billing@example.com x3, "
+        "**Delivered despite failing: 7** - let in by %s (outside receivers do not have these overrides); no override "
+        "recorded for 1 (the log names nothing that let them in) (alerts@example.com x3, billing@example.com x3, "
         "legacy@example.com x1)" % named)
     assert doc["stand"]["delivered_despite_fail_by"] == rep["maillog"]["counters"]["delivered_despite_fail_by"]
     todo = actions(doc)
@@ -244,8 +250,9 @@ def test_g1_the_readers_name_the_override_in_plain_words(tmp_path):
         "outside receivers do not have it")
     assert todo["alerts@example.com - 3 messages reached inboxes despite failing"] == (
         "delivered because of a user's safe sender list (2), and the log names no override for the other 1: ask the "
-        "mailbox owners to take the sender off their safe sender lists; find what let the other 1 in (a transport "
-        "rule, an allow list or a safe sender list); outside receivers do not have them")
+        "mailbox owners to take the sender off their safe sender lists; for the other 1, look for what the log does "
+        "not record (a mailbox rule, a connector, a filter in front of the tenant); outside receivers do not have "
+        "them")
     assert todo["legacy@example.com - 1 message reached inboxes despite failing"] == (
         'delivered because of "org: Connection policy (Allow)": find that override and make it conditional on '
         "authentication; outside receivers do not have it")
@@ -269,8 +276,10 @@ def test_g1_an_excepted_sender_keeps_its_override_off_the_work_list_with_or_with
         assert todo["legacy@example.com - 1 message reached inboxes despite failing"].startswith(
             'delivered because of "org: Connection policy (Allow)": '), keep
         line = stand_line(doc, "**Delivered despite failing")
-        assert line.startswith("**Delivered despite failing: 7** (3 of them formally excepted in audit.toml) - these "
-                               "only arrive because of our own overrides (an Exchange transport rule x3, "), keep
+        # the excepted sender's transport rule is not credited to the senders left (N37)
+        assert line.startswith("**Delivered despite failing: 7** (3 of them formally excepted in audit.toml) - let in "
+                               "by a user's safe sender list x2, org: Connection policy (Allow) x1 (outside "), keep
+        assert "an Exchange transport rule" not in line and "no override recorded for 1" in line, keep
 
 
 # ------------------------------------------------------------------ G2: the mail flow of every audited name
@@ -577,7 +586,7 @@ def test_g2_the_report_and_the_document_say_per_domain_what_was_measured(tmp_pat
             "1 of 3 sent or received mail") in rep["verified_vs_inferred"]["verified"]
     doc = next_steps.build(rep)
     out = next_steps.render_md(doc)
-    step = "publish a monitoring-only DMARC record so reports start (no policy could be read)"
+    step = "read the policy first: run online, or supply aggregate reports that cover it"
     assert "| Domain | Policy today | Gate | Next step | Mail flow |" in out
     assert "| `example.com` | unknown | needs more data | %s | sends: 100 out, 20 in (30 days, tenant) |" % step in out
     # subdomains share a row only when their mail flow reads the same
@@ -813,8 +822,9 @@ def test_g3_the_readers_put_the_full_window_beside_the_floor(tmp_path):
     block = md.split("\nFull-window totals for cut organizations ", 1)[1].split("\n\n## ", 1)[0].splitlines()
     assert block[0] == ("(counted in advanced hunting over the whole 30 days, at the same (Message-ID, recipient) "
                         "grain): the counts above keep only the rows the row budget or the API cap left, a floor. "
-                        "Logical messages and passing here are Kusto estimates. The gate, the census, the labels and "
-                        "the plan keep using the deduplicated rows above.")
+                        "Logical messages and passing here are Kusto estimates. The gate, the census and the labels "
+                        "keep using the deduplicated rows above; the plan reads these totals for a cut "
+                        "organization's quarantine-now decision and its list of sending subdomains.")
     assert block[2:] == [
         "- corp.example (newest 41 hours kept in the rows above): about 7875 logical messages, about 7715 passing, "
         "160 genuine failures, 15 delivered despite failing (let in by an Exchange transport rule x12; no override "
@@ -832,15 +842,16 @@ def test_g3_the_readers_put_the_full_window_beside_the_floor(tmp_path):
         "**Genuine failures: %d** (raw row counts agree: no relay echoes), over the mail log's 38-minute span "
         "(2026-10-07 00:01 to 2026-10-07 00:39 UTC); the log export was cut short (row budget kept only the newest 41h "
         "for corp.example), so this count is a floor; over the full 30 days, counted in Advanced Hunting: 160 genuine "
-        "failures, 15 delivered despite failing under corp.example (the gate, the census, the labels and the plan "
-        "still use the rows kept)" % gf)
+        "failures, 15 delivered despite failing under corp.example, whose rows kept are the %d above (the gate, the "
+        "census and the labels still rest on the rows kept; the plan reads these totals for its quarantine-now and "
+        "sp= decisions)" % (gf, gf))
     assert doc["stand"]["window_totals"] == {"orgs": ["corp.example"], "hours": 720.0, "span": "30 days",
-                                             "genuine_failures": 160, "delivered_despite_fail": 15}
+                                             "genuine_failures": 160, "delivered_despite_fail": 15, "floor": gf}
     lines = {l.split("`")[1]: l for l in notify.summarize(rep).splitlines() if l.startswith("- `")}
     assert lines["corp.example"].endswith(
-        " - 3 genuine failures of its own in the rows kept (a floor; the gate, the census, the labels and the plan "
-        "count these); over the full 30 days, counted in Advanced Hunting: 150 genuine failures, 15 delivered despite "
-        "failing")
+        " - 3 genuine failures of its own in the rows kept (newest 41 hours kept; a floor: the gate, the census and the "
+        "labels count these); over the full 30 days, counted in Advanced Hunting: 150 genuine failures, 15 delivered "
+        "despite failing")
     assert lines["hr.corp.example"].endswith("; over the full 30 days, counted in Advanced Hunting: 10 genuine failures, "
                                              "0 delivered despite failing")
     assert "Advanced Hunting" not in lines["shop.example"] and "rows kept" not in lines["shop.example"]
@@ -1072,7 +1083,9 @@ def test_collect_measures_mail_flow_once_per_run_and_counts_a_cut_orgs_whole_win
     assert "window_totals_rejected" not in report["maillog"]
     assert "- corp.example (newest " in text["report.md"] and "160 genuine failures, 15 delivered" in text["report.md"]
     assert ("over the full 30 days, counted in Advanced Hunting: 160 genuine failures, 15 delivered despite failing "
-            "under corp.example (the gate, the census, the labels and the plan still use the rows kept)") in text["next_steps.md"]
+            "under corp.example, whose rows kept ") in text["next_steps.md"]
+    assert ("(the gate, the census and the labels still rest on the rows kept; the plan reads these totals for its "
+            "quarantine-now and sp= decisions)") in text["next_steps.md"]
     corp = next(l for l in text["summary.txt"].splitlines() if l.startswith("- `corp.example`"))
     assert corp.endswith("; over the full 30 days, counted in Advanced Hunting: 150 genuine failures, 15 delivered "
                          "despite failing")
