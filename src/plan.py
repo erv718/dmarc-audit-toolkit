@@ -2163,6 +2163,8 @@ def main():
     try:
         report = json.loads(Path(args.report).read_text(encoding="utf-8-sig"))
         inventory = json.loads(Path(args.inventory).read_text(encoding="utf-8-sig")) if args.inventory else None
+        import audit  # here, not at the top: audit.py imports this module
+        report = audit.load_census(report, args.report)  # a split census (census.json beside it) is read whole again
     except OSError as err:
         die("cannot read input: %s" % err)
     except json.JSONDecodeError as err:

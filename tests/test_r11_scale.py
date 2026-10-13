@@ -4,11 +4,20 @@ blockers become one line, the source tables' rows stay small, and a spoofer's
 throwaway envelope domain is not a sender identity. No network."""
 
 import json
+import sys
+
+import pytest
 
 import audit
 import collect
 import next_steps
 import notify
+
+def sample_report():
+    from conftest import ROOT
+    return audit.build_report(domains=["example.com"], maillog=str(ROOT / "samples" / "sample_maillog.csv"),
+                              rua_paths=[str(ROOT / "samples" / "rua")], offline=True, auth_column="DMARC")
+
 
 TOTALS_ROW = {"fromdom": "corp.example", "logical_messages": 7000, "passing": 6800, "delivered_by": "",
               "genuine_failures": 150, "delivered_despite_fail": 12}
@@ -143,3 +152,43 @@ def test_a_plan_rows_many_source_prerequisites_fold_into_one_condition():
     doc = next_steps.build(rep, plan=plan)
     assert doc["one_liner"].count("203.0.113.") == 3 and len(doc["one_liner"]) < 700
     assert sum(1 for q in doc["open_questions"] if q.get("kind") == "prerequisite") == 2
+
+
+def test_delivered_spoof_sources_become_one_line_too():
+    rep = gate_with_streams(0)
+    rep["gate"]["domains"]["corp.example"]["reasons"] = [
+        "spoof stream 203.0.113.%d (%d msgs) saw disposition none - receivers delivered it; the current policy is not "
+        "catching it" % (i, 200 - i) for i in range(1, 8)]
+    items = next_steps.blocker_items(rep, "corp.example")
+    assert [i["kind"] for i in items] == ["spoof-delivered"]
+    assert items[0]["text"] == ("7 spoofing sources (1372 msgs) saw disposition none at receivers (203.0.113.1 (199 msgs), "
+                                "203.0.113.2 (198 msgs), 203.0.113.3 (197 msgs); 4 more in report.md) - the current "
+                                "policy is not catching them")
+    rep["gate"]["domains"]["corp.example"]["reasons"] = rep["gate"]["domains"]["corp.example"]["reasons"][:1]
+    one = next_steps.blocker_items(rep, "corp.example")[0]
+    assert one["text"] == ("spoofing source 203.0.113.1 (199 msgs) saw disposition none - receivers delivered it; the "
+                           "current policy is not catching it")  # one source keeps the gate's own sentence
+
+
+def test_plan_and_verify_read_a_split_census_whole_again(monkeypatch, tmp_path):
+    import plan
+    import verify
+    calls = []
+    real = audit.load_census
+
+    def spy(report, path):
+        calls.append(str(path))
+        return real(report, path)
+    monkeypatch.setattr(audit, "load_census", spy)
+    rep = sample_report()
+    rep["maillog"]["census_file"] = "census.json"
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(rep), encoding="utf-8")
+    (tmp_path / "census.json").write_text(json.dumps(rep["maillog"]["census"]), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["plan.py", str(path), "--json"])
+    with pytest.raises(SystemExit):
+        plan.main()
+    monkeypatch.setattr(sys, "argv", ["verify.py", str(path), "--out", str(tmp_path / "v")])
+    with pytest.raises(SystemExit):
+        verify.main()
+    assert calls == [str(path), str(path)]

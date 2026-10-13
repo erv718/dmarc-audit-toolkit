@@ -2241,7 +2241,7 @@ def main(argv=None):
     ap.add_argument("--plan", metavar="JSON", help="plan.json from src/plan.py or src/collect.py")
     ap.add_argument("--out", metavar="DIR", required=True, help="write verify.md and queries/ here")
     args = ap.parse_args(argv)
-    report = _read(args.report, "report")
+    report = audit.load_census(_read(args.report, "report"), args.report)  # a split census is read whole again
     if not isinstance(report.get("gate"), dict) and not report.get("inputs"):
         die("%s does not look like an audit report (no gate and no inputs section)" % audit.repo_path(args.report))
     plan = _read(args.plan, "--plan") if args.plan else None

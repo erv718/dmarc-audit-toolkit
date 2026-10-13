@@ -154,6 +154,8 @@ STREAM_RX = re.compile(r"^(\S+) fails DMARC on (\d+)/(\d+) msgs \(([^)]*)\)(.*)$
 # the gate's hint on a stream a domain exception covers only in part: which domains are left uncovered
 STREAM_HINT_RX = re.compile(r"\((a domain exception covers part of it; .*?)\)$")
 STREAM_NAMES = 3  # sources named in that line; the rest are counted and left to report.md
+# the gate's blocker for one spoofing source receivers delivered under the policy (audit._shared_blockers)
+SPOOF_STREAM_RX = re.compile(r"^spoof stream (\S+) \((\d+) msgs\) saw disposition none")
 # Plan prerequisites written as observations, reworded as the condition that clears them.
 PREREQ_REWORDS = (
     (re.compile(r"^(\d+) message\(s\) in the mail log failed from a sender that looks like your own "
@@ -1703,7 +1705,13 @@ def blocker_items(report, domain, own=None):
     unsplit = bool(own) and not own.get("excepted_reduced", True)  # the split and names still hold the excepted
     policy = current_policy(report, domain)
     streams = []  # the gate names every failing outside-view source; the reader gets one line for all of them
+    delivered_spoofs, spoof_at = [], None  # and every spoofing source receivers delivered under the policy: one line too
     for r in blockers:
+        d = SPOOF_STREAM_RX.match(r)
+        if d:
+            spoof_at = len(out) if spoof_at is None else spoof_at  # the line takes the first one's place
+            delivered_spoofs.append((int(d.group(2)), d.group(1), r))
+            continue
         s = STREAM_RX.match(r)
         if s:
             hint = STREAM_HINT_RX.search(s.group(5).strip())
@@ -1749,6 +1757,16 @@ def blocker_items(report, domain, own=None):
                                                       (" and %d more in report.md" % more) if more > 0 else "",
                                                       "it" if len(streams) == 1 else "them",
                                                       (" (%s)" % hints) if hints else "")})
+    if len(delivered_spoofs) == 1:  # one source keeps the gate's own sentence
+        out.insert(spoof_at, {"kind": "spoof-delivered", "text": plain(delivered_spoofs[0][2])})
+    elif delivered_spoofs:
+        delivered_spoofs.sort(key=lambda s: (-s[0], s[1]))
+        total = sum(n for n, _, _ in delivered_spoofs)
+        top = ", ".join("%s (%d msgs)" % (ip, n) for n, ip, _ in delivered_spoofs[:STREAM_NAMES])
+        more = len(delivered_spoofs) - STREAM_NAMES
+        out.insert(spoof_at, {"kind": "spoof-delivered", "text": "%d spoofing sources (%d msgs) saw disposition none at "
+                    "receivers (%s%s) - the current policy is not catching them" % (
+                        len(delivered_spoofs), total, top, ("; %d more in report.md" % more) if more > 0 else "")})
     if verdict == "no_go" and not out:  # the gate holds the step even when its words were not recognised
         out.append({"kind": "other", "text": "the audit's gate says not yet (report.md lists why)"})
     return out
