@@ -6,7 +6,11 @@
 // organization whose pull the row budget or the API cap cut and stores the
 // answer as report.json maillog.window_totals, beside the floor.
 // Same grain as src/dedupe.py: one logical message = (Message-ID, recipient),
-// over Inbound and Intra-org legs, per From domain under the organization.
+// over Inbound and Intra-org legs, per From domain under the organization,
+// and the same reading of a DMARC verdict: a pass when it contains "pass"
+// ("bestguesspass" too, which Exchange records for a From domain with no
+// DMARC record whose mail would have passed), a failure when it contains
+// "fail" - dedupe.leg_auth, word for word, so the two counts agree.
 // The expensive part is kept small the way the portal query that covers 30
 // days does it: first the distinct Message-IDs that have a failing leg, then
 // the per-(Message-ID, recipient) summary for those only. Logical messages
@@ -39,10 +43,10 @@ let base = EmailEvents
 | extend rcpt = tolower(RecipientEmailAddress), fromdom = tolower(SenderFromDomain);
 let totals = base
 | summarize logical_messages = dcount(strcat(InternetMessageId, "|", rcpt)),
-            passing          = dcountif(strcat(InternetMessageId, "|", rcpt), dmarc =~ "pass")
+            passing          = dcountif(strcat(InternetMessageId, "|", rcpt), dmarc contains "pass")
   by fromdom;
 let failing_ids = base
-| where dmarc =~ "fail"
+| where dmarc contains "fail"
 | summarize by InternetMessageId;
 let failures = failing_ids                                   // smaller table on the left, the Kusto rule for join
 | join kind=inner base on InternetMessageId
@@ -56,11 +60,11 @@ let failures = failing_ids                                   // smaller table on
 | extend reason = case(isnotempty(org_policy),  strcat("org: ", org_policy, iff(isnotempty(org_action), strcat(" (", org_action, ")"), "")),
                        isnotempty(user_policy), strcat("user: ", user_policy, iff(isnotempty(user_action), strcat(" (", user_action, ")"), "")),
                                                 "")
-| summarize anypass    = max(iff(dmarc =~ "pass", 1, 0)),
-            anyfail    = max(iff(dmarc =~ "fail", 1, 0)),
+| summarize anypass    = max(iff(dmarc contains "pass", 1, 0)),
+            anyfail    = max(iff(dmarc contains "fail", 1, 0)),
             delivered  = max(iff(on_mailbox, 1, 0)),
-            failing_on = max(iff(on_mailbox and dmarc =~ "fail", 1, 0)),
-            by_failing = take_anyif(reason, on_mailbox and dmarc =~ "fail" and isnotempty(reason)),
+            failing_on = max(iff(on_mailbox and dmarc contains "fail", 1, 0)),
+            by_failing = take_anyif(reason, on_mailbox and dmarc contains "fail" and isnotempty(reason)),
             by_other   = take_anyif(reason, on_mailbox and isnotempty(reason)),
             fromdom    = min(fromdom)
   by InternetMessageId, rcpt

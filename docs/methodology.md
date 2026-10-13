@@ -88,14 +88,26 @@ passing as it in the mail log or the aggregate reports, nothing failing that
 looks like your own system, and a mail log that examined all the mail that
 came in as it - the ramp protects nobody, and the plan proposes
 `p=quarantine` straight away, then `p=reject` once a week of reports still
-shows nothing passing. Confirm first that no sender mailing less often than
-monthly (statements, renewals) uses the domain, and check what the row names:
-messages the heuristic cannot call spoofing, and, when no aggregate report
-covers the domain, a third party sending as it straight to outside
-recipients. A domain whose mail the tenant does not carry (one only
-`EXTRA_DOMAINS` names, or one whose SPF or DKIM points at another platform)
-needs aggregate reports that cover it first: the tenant's zero says nothing
-about it.
+shows nothing passing. Confirm first that no sender mailing monthly or less
+often (statements, renewals) uses the domain, and check what the row names:
+messages the heuristic cannot call spoofing on a strong sign (a failure
+called spoofing on its envelope or a billing word alone - invoice, payment
+and payroll are a vendor's daily vocabulary, so only the lures phishing
+leans on count, such as urgent, password or voicemail - and report rows a
+vendor signing with its own domain would produce the same way), and, when
+no aggregate report covers the domain, a third party sending as it straight
+to outside recipients. A domain that sends carries the same check on each
+step of its ramp. A mail log from another period, one that ends before the
+newest message the mail flow counted, examined none of that mail: the ramp
+stays. The record keeps `sp=none`, so the names below the domain move only
+with the `sp=` step; where they inherit quarantine today (a record at
+`p=quarantine` with a `pct`), the ones that send get records of their own
+at that policy first. A domain whose mail the tenant does not carry (one
+only `EXTRA_DOMAINS` names, or one whose SPF or DKIM points at another
+platform) needs aggregate reports that cover it first: the tenant's zero
+says nothing about it, and when the reports about its record span less
+than 30 days the row says so (each report's own dates; one mailbox serves
+many brands, so the whole mailbox's span says nothing about one record).
 
 Subdomains go the same way, in order: every subdomain that sends gets a
 record of its own first, then the apex's `sp=` moves to quarantine, even
@@ -104,7 +116,17 @@ subdomains still without a record, audited or not - including one whose
 mail fails in a way the heuristic cannot pin on spoofing, and an audited
 one whose mail out was not measured. Whether a subdomain has a record is a
 DNS lookup, never what an old aggregate report says was published there. The
-move to reject and the `sp=` step rewrite the same record: one a week.
+`sp=` row also asks about the subdomains whose failing mail the heuristic
+cannot call spoofing (a vendor sending as one of them unaligned fails the
+same way), about subdomains that mail less often than the run's evidence
+reaches back, and names the span of the reports about the record it rests
+on; a reject row whose subdomains follow `p=` asks the same. The move to
+reject and the `sp=` step rewrite the same record: one a week. An apex at
+quarantine with no `sp=` moves to reject with `sp=quarantine` added when
+sending subdomains have no record of their own, so they stay where they are
+instead of following `p=` to reject; at `sp=quarantine` the step to
+`sp=reject` proposes those subdomains' records at quarantine, where `sp=`
+has them today, and waits until they exist.
 
 The weekly run answers that question for you. `src/audit.py` gives the
 verdict per domain, and `next_steps.md` carries it in the "Per domain" table

@@ -24,7 +24,11 @@ The rules are the methodology, encoded (docs/methodology.md):
                        organization, a new record too, waits on the
                        external-destination record that address's domain
                        must publish. Two records at one name get collapsed
-                       - after an ownership check.
+                       - after an ownership check. A first record of its
+                       own for a name that inherits one today keeps that
+                       record's reporting and alignment tags (rua, ruf, fo,
+                       adkim, aspf), so the mailboxes that see the name's
+                       mail today keep seeing it.
   SPF hygiene          no terminator or +all/?all becomes ~all; over the
                        lookup limit is a fix-first; at the limit is a freeze;
                        an include that does not resolve (the count is a lower
@@ -37,21 +41,41 @@ The rules are the methodology, encoded (docs/methodology.md):
                        domain count no passing mail as it; otherwise the
                        row names the checks still open. Passing mail as it
                        in those reports means something sends: not parked.
+                       A failed MX lookup is no answer: the domain is held,
+                       never parked on it.
   no mail measured     a domain the run measured sending nothing (no mail
                        out in 30 days of tenant mail flow, nothing passing,
                        internal, excepted or failing as our own system in
                        its mail-log rows, which examined all the mail that
-                       came in as it, no passing volume in the aggregate
-                       reports) skips the ramp: p=quarantine now, priority
-                       1, and p=reject after a week of reports still showing
-                       nothing passing, with no DKIM proof to wait for.
-                       Failing inbound mail that looks like spoofing is what
-                       enforcement stops; what the labels cannot call
-                       spoofing is a check named on the row. A domain whose
+                       came in as it - a log from another period, one that
+                       ends before the newest message the mail flow counted,
+                       examined none of it - no passing volume in the
+                       aggregate reports) skips the ramp: p=quarantine now,
+                       priority 1, and p=reject after a week of reports
+                       still showing nothing passing, with no DKIM proof to
+                       wait for. Failing inbound mail that looks like
+                       spoofing on a sign a vendor does not share (a lure
+                       word phishing leans on in the subject - urgent,
+                       password, voicemail - never a billing word a vendor's
+                       own mail carries; in the reports, no signature and no
+                       SPF pass at all) is what enforcement stops; what the
+                       labels cannot call spoofing on such a sign - a failure
+                       called spoofing on its envelope or a billing word
+                       alone, a report row a vendor signing with its own
+                       domain would produce the same way - is a check named
+                       on the row, and so it is on the ramp's steps for a
+                       domain that sends. The record keeps sp=none on any
+                       domain, so the names below it move only with the sp=
+                       step; where they inherit quarantine today (the record
+                       at p=quarantine with a pct, no sp=), the ones that
+                       send get records of their own at that policy first,
+                       so the move lowers nothing that sends. A domain whose
                        mail the tenant does not carry (not a tenant domain,
                        or SPF or DKIM naming another platform) needs
-                       aggregate reports that cover it. The parked rule
-                       comes first when it applies.
+                       aggregate reports that cover it, and the row names
+                       the span the reports about its record reach back
+                       when that is under 30 days. The parked rule comes
+                       first when it applies.
   DKIM before reject   a domain that sends without a DKIM selector gets a
                        signing task before any enforcement step.
   one ratchet at a time
@@ -74,7 +98,22 @@ The rules are the methodology, encoded (docs/methodology.md):
                        policy an aggregate report says it saw. A name nobody
                        looked up, or whose lookup failed (an audited one's
                        too: DMARC-007), is named as not checked and its
-                       record waits on a lookup first.
+                       record waits on a lookup first. The sp= step also
+                       names the subdomains whose failing mail the run
+                       cannot call spoofing (a vendor sending as one of
+                       them fails the same way), the subdomains that mail
+                       less often than its evidence reaches back, and the
+                       span of the reports about this record it rests on
+                       (each report's own dates, a 1970 date ignored; a
+                       week of them at least) - a check a reject row whose
+                       subdomains follow p= carries too. An apex at
+                       quarantine with no sp= moves to reject with
+                       sp=quarantine when subdomains that send have no
+                       record of their own: they stay where the record has
+                       them today instead of following p= to reject. At
+                       sp=quarantine the step to sp=reject proposes such
+                       subdomains' records at p=quarantine, where sp= has
+                       them today, and holds until they exist.
   evidence holds       a mail log or aggregate reports showing a legitimate
                        sender still failing holds that domain's next
                        enforcement step, and says why - unless the gate
@@ -97,16 +136,20 @@ rollback so the human can apply and revert it.
   python src/plan.py audit-out/report.json --out audit-out
   python src/plan.py report.json --inventory exports/inventory.json --rua mailto:reports@example.com
 
-Without --rua, new records take the rua most existing records use, and no
-record gets an address appended: the run has no report address of its own.
+Without --rua, new records take the rua most existing records use (plan.md
+says so), and no record gets an address appended: the run has no report
+address of its own.
 """
 
 import argparse
 import collections
+import datetime
 import json
 import re
 import sys
 from pathlib import Path
+
+import dedupe
 
 DEFAULT_TTL = 3600
 RUA_PLACEHOLDER = "mailto:<your aggregate reports address>"
@@ -121,10 +164,26 @@ def die(msg):
 # --------------------------------------------------------------------------
 # helpers over the report
 
+def _text(value):
+    """value when it is text, else '': a record the report holds as anything else is a damaged value, never a
+    record."""
+    return value if isinstance(value, str) else ""
+
+
+def tag_key(part):
+    """The tag name of one 'k=v' part of a DMARC record, as dmarc_tags reads it: lower-cased, whitespace around
+    '=' ignored (RFC 7489 allows it, so 'p = none' is the p tag); '' for a part with no '='."""
+    return part.split("=", 1)[0].strip().lower() if "=" in part else ""
+
+
+def _parts(record):
+    return [p.strip() for p in _text(record).split(";") if p.strip()]
+
+
 def dmarc_tags(record):
     """'v=DMARC1; p=none; rua=mailto:a' -> {'v': 'DMARC1', 'p': 'none', ...}"""
     tags = {}
-    for part in (record or "").split(";"):
+    for part in _parts(record):
         if "=" in part:
             k, v = part.split("=", 1)
             tags[k.strip().lower()] = v.strip()
@@ -137,17 +196,16 @@ def rua_of(record):
 
 def with_rua(record, rua):
     """The same record with rua added or replaced, tag order preserved."""
-    parts = [p.strip() for p in (record or "").split(";") if p.strip()]
     out, done = [], False
-    for p in parts:
-        if p.lower().startswith("rua="):
+    for p in _parts(record):
+        if tag_key(p) == "rua":
             out.append("rua=" + rua)
             done = True
         else:
             out.append(p)
     if not done:
         # rua goes right after the policy tags, before ruf if present
-        idx = next((i for i, p in enumerate(out) if p.lower().startswith("ruf=")), len(out))
+        idx = next((i for i, p in enumerate(out) if tag_key(p) == "ruf"), len(out))
         out.insert(idx, "rua=" + rua)
     return "; ".join(out) + ";"
 
@@ -205,33 +263,69 @@ def add_rua(record, address):
 
 
 def set_tag(record, key, value):
-    """Set or replace one tag (p, sp, pct) in a DMARC record string."""
-    parts = [p.strip() for p in (record or "").split(";") if p.strip()]
+    """Set or replace one tag (p, sp, pct) in a DMARC record string. The tag is found by its parsed name, so a
+    record written 'p = none' gets its p tag replaced, never a second one beside it."""
     out, done = [], False
-    for p in parts:
-        if p.lower().startswith(key + "="):
+    for p in _parts(record):
+        if tag_key(p) == key:
             out.append("%s=%s" % (key, value))
             done = True
         else:
             out.append(p)
     if not done:
-        idx = 1 if out and out[0].lower().startswith("v=") else 0
+        idx = 1 if out and tag_key(out[0]) == "v" else 0
         if key == "sp":
-            idx = next((i + 1 for i, p in enumerate(out) if p.lower().startswith("p=")), idx)
+            idx = next((i + 1 for i, p in enumerate(out) if tag_key(p) == "p"), idx)
         elif key == "pct":
-            idx = next((i + 1 for i, p in enumerate(out) if p.lower().startswith(("sp=", "p="))), idx)
+            idx = next((i + 1 for i, p in enumerate(out) if tag_key(p) in ("sp", "p")), idx)
         out.insert(idx, "%s=%s" % (key, value))
     return "; ".join(out) + ";"
 
 
 def drop_tag(record, key):
-    """The same record without one tag (pct), tag order preserved."""
-    parts = [p.strip() for p in (record or "").split(";") if p.strip()]
-    return "; ".join(p for p in parts if not p.lower().startswith(key + "=")) + ";"
+    """The same record without one tag (pct), tag order preserved; the tag is found by its parsed name."""
+    return "; ".join(p for p in _parts(record) if tag_key(p) != key) + ";"
+
+
+# the tags a first record of its own keeps from the record the name inherits today: where its reports go, its
+# failure reports and its alignment - never the policy tags, which the new record sets itself
+CARRIED_TAGS = ("rua", "ruf", "fo", "adkim", "aspf")
+
+
+def new_record(policy, rua_addr, parent=None, report_addr=None):
+    """A first DMARC record of its own for a name: 'v=DMARC1; p=<policy>;' with the run's rua address - or, for a
+    name that inherits a record today (parent: that record's text), the reporting and alignment tags of that
+    record (CARRIED_TAGS, in their order), so the mailboxes that see the name's mail today keep seeing it, with
+    the run's report address (report_addr, a mailto: URI; None when the run has none) appended after the
+    addresses already there when it is missing. A parent with no rua gets the run's address like any new
+    record."""
+    out = ["v=DMARC1", "p=%s" % policy]
+    seen = set()
+    if _text(parent).lower().startswith("v=dmarc1"):
+        for p in _parts(parent):
+            k = tag_key(p)
+            if k in CARRIED_TAGS and k not in seen:
+                seen.add(k)
+                out.append(p)
+    value = "; ".join(out) + ";"
+    if not rua_of(value):
+        return with_rua(value, rua_addr)
+    if report_addr and not has_address(value, report_addr):
+        return add_rua(value, report_addr)
+    return value
+
+
+def inherited_order(parent, report_addr):
+    """The prerequisites of a first record of its own that appends the run's report address after the addresses
+    the record it inherits today already lists (rua_order: receivers need send to the first two only); [] when
+    nothing is appended, or after fewer than two."""
+    if not report_addr or not _text(parent).lower().startswith("v=dmarc1") or has_address(parent, report_addr):
+        return []
+    return [p for p in [rua_order(parent, report_addr)] if p]
 
 
 def spf_with_terminator(record, terminator):
-    parts = (record or "").split()
+    parts = _text(record).split()
     if parts and parts[-1].lower().lstrip("+-~?") == "all":
         parts[-1] = terminator
     else:
@@ -241,19 +335,24 @@ def spf_with_terminator(record, terminator):
 
 def spf_sends(spf_record):
     """True when the SPF record authorizes any sender (more than v=spf1 and a terminator)."""
-    parts = [p for p in (spf_record or "").split() if p]
+    parts = [p for p in _text(spf_record).split() if p]
     return any(not p.lower().startswith("v=") and p.lower().lstrip("+-~?") != "all" for p in parts)
 
 
+def _dict(value):
+    """value when it is a dict, else {}: a damaged report section reads as an empty one."""
+    return value if isinstance(value, dict) else {}
+
+
 def finding_ids(dns_doc):
-    return {f.get("id") for f in (dns_doc or {}).get("findings", []) if f.get("id")}
+    return {f.get("id") for f in _rows(_dict(dns_doc).get("findings")) if isinstance(f, dict) and f.get("id")}
 
 
 def derive_rua(dns_docs):
     """The rua address most of your existing records already use."""
     counts = collections.Counter()
-    for d in dns_docs.values():
-        rua = rua_of(d.get("dmarc"))
+    for d in _dict(dns_docs).values():
+        rua = rua_of(_dict(d).get("dmarc"))
         if rua:
             counts[rua] += 1
     return counts.most_common(1)[0][0] if counts else None
@@ -322,8 +421,8 @@ def lookup_first(name):
 
 def _audited(report):
     """The audited names, as the gate keys them."""
-    names = {str(x).lower() for x in ((report.get("inputs") or {}).get("domains") or [])}
-    names |= {str(x).lower() for x in ((report.get("gate") or {}).get("domains") or {})}
+    names = {str(x).lower() for x in _rows(_dict(report.get("inputs")).get("domains"))}
+    names |= {str(x).lower() for x in _dict(_dict(report.get("gate")).get("domains"))}
     return names
 
 
@@ -421,7 +520,10 @@ def unused_note(outbound, inbound, days, reports_cover):
     span = ("%d day%s" % (days, "" if days == 1 else "s")) if days else "an unknown span"
     open_checks = []
     if outbound is None:
-        open_checks.append("no outbound mail in 30 days (discover.py --mailflow)")
+        # discover.py --mailflow counts only the subdomains its answer holds, never an unused name: only a
+        # collect.py run with the app registration measures every audited domain, zeros included
+        open_checks.append("no outbound mail in 30 days (this run did not measure it: a collect.py run with the app "
+                           "registration does)")
     elif days is None or days < UNUSED_DAYS:
         open_checks.append("no outbound mail in 30 days (the tenant measured %s)" % (span + " only" if days else span))
     if inbound:
@@ -454,8 +556,125 @@ def _full_window(report, domain):
 
 
 # The mail flow's counts are advanced hunting estimates (dcount, a percent or two either way): a domain's
-# mail-log rows that fall this share short of its inbound count still examined all of it.
-ESTIMATE_SHARE = 0.02
+# mail-log rows that fall this share (in percent) short of its inbound count still examined all of it.
+ESTIMATE_PERCENT = 2
+# A mail log may end this long before the newest message the mail flow counted and still have examined it
+# (ingestion lag between the two queries); one that ends earlier is from another period.
+LOG_SLACK_HOURS = 6
+# A step that rests on aggregate reports wants a week of them at least (one ratchet a week).
+REPORT_WEEK = 7
+
+
+def _slack(n):
+    """How far an estimated count may fall short of n and still cover it; integer arithmetic, so an absurd count
+    never overflows."""
+    return n * ESTIMATE_PERCENT // 100
+
+
+def _when(value):
+    """A timestamp the report carries (ISO 8601; a trailing Z or an offset, else read as UTC) as a datetime,
+    None for anything else."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
+
+
+def _days(n):
+    return "%d day%s" % (n, "" if n == 1 else "s")
+
+
+def log_reaches(report, last_seen):
+    """False when the mail log this run read ends before the newest message the tenant's mail flow counted as
+    the domain (last_seen, from the same 30-day measurement): a log from another period - an older export, a
+    previous run's maillog.csv - examined none of that mail, whatever its rows add up to. True with no window
+    (maillog.window) or no last_seen to compare, and when the log reaches it, LOG_SLACK_HOURS allowed."""
+    window = _dict(_dict(report.get("maillog")).get("window"))
+    end, newest = _when(window.get("to")), _when(last_seen)
+    if end is None or newest is None:
+        return True
+    return end + datetime.timedelta(hours=LOG_SLACK_HOURS) >= newest
+
+
+def _totals_span(report, days):
+    """True when the full-window totals (maillog.window_totals) cover the mail flow's span: their hours reach
+    days * 24. collect.py counts both over the same window unless --days shortened the log's; a shorter count
+    leaves mail the flow counted outside it, and a count with no hours says nothing."""
+    hours = _measured(_dict(_dict(report.get("maillog")).get("window_totals")).get("hours"))
+    return days is not None and hours is not None and hours >= days * 24
+
+
+def _full_messages(full, examined, ids):
+    """The full-window totals' count at the mail flow's grain (distinct messages): their message count when
+    they carry one (messages, or message_ids), else their logical messages - (Message-ID, recipient) pairs -
+    scaled by the fan-out the rows kept show (examined pairs over ids distinct messages), the pairs as they
+    are when the rows show none. 2 messages to 5 recipients each are 10 pairs, which never stand for 10
+    messages. None when the totals carry no count."""
+    n = _measured(full.get("messages"))
+    if n is None:
+        n = _measured(full.get("message_ids"))
+    if n is not None:
+        return n
+    pairs = _measured(full.get("logical_messages"))
+    if pairs is None:
+        return None
+    if ids and examined and examined > ids:
+        return pairs * ids // examined
+    return pairs
+
+
+DMARC_FLOOR = 1325376000  # 2012-01-01T00:00:00Z: no aggregate report predates DMARC itself
+
+
+def _record_of(domain, dns_doc):
+    """The name whose _dmarc record applies to the domain: its own, or the one it inherits (dmarc_source is
+    _dmarc.<name>); the domain itself when the audit names no source."""
+    source = _name(_dict(dns_doc).get("dmarc_source"))
+    return source[len("_dmarc."):] if source.startswith("_dmarc.") else domain
+
+
+def _report_entries(report, name):
+    """The per-report entries of rua.sources.reports about one record (name: the domain whose _dmarc record the
+    report is about, its policy_published; every entry with None). [] when the doc carries no such list (an
+    older report.json)."""
+    entries = _rows(_dict(_dict(_dict(report.get("rua")).get("sources"))).get("reports"))
+    return [r for r in entries if isinstance(r, dict) and (name is None or _name(r.get("domain")) == name)]
+
+
+def _date(epoch):
+    try:
+        return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%d")
+    except (OverflowError, OSError, ValueError):
+        return "?"
+
+
+def report_span(report, name=None):
+    """(days, 'first .. last') for the span the aggregate reports about one record cover - name: the domain
+    whose _dmarc record they are about (policy_published), None for every report the run read: the earliest
+    begin and the latest end among the reports with plausible dates (inside DMARC's lifetime and not after the
+    run: a report with none, or with a 1970 date, says nothing), whole days rounded up. One mailbox serves
+    many brands, so the run's whole set says nothing about one record's reach. One entry per report in
+    rua.sources.reports; a doc without that list (an older report.json) gives its totals' span for every
+    record. (None, None) without reports about the record, or without usable dates."""
+    entries = _report_entries(report, name)
+    if not entries and not _report_entries(report, None):
+        totals = _dict(_dict(report.get("rua")).get("totals"))
+        entries = [totals] if totals else []
+    run = _when(report.get("generated_utc"))
+    latest = run.timestamp() + 86400 if run else None
+    spans = []
+    for r in entries:
+        begin, end = _measured(r.get("begin")), _measured(r.get("end"))
+        if begin is not None and end is not None and DMARC_FLOOR <= begin <= end and (latest is None or end <= latest):
+            spans.append((begin, end))
+    if not spans:
+        return None, None
+    begin, end = min(b for b, _ in spans), max(e for _, e in spans)
+    return max(1, -(-(end - begin) // 86400)), "%s .. %s" % (_date(begin), _date(end))
 
 
 def _cut(report, domain):
@@ -480,27 +699,142 @@ def _own_rows(report, domain):
     return by_dom.get(domain) if isinstance(by_dom.get(domain), dict) else None
 
 
-def _unclear_senders(report, domain, cap=3):
-    """[(sender, n)] for the census streams sending as the domain whose
-    messages the labels do not call spoofing (failures labelled unknown,
-    messages with no DMARC verdict), most first, at most cap of them."""
-    ml = report.get("maillog") if isinstance(report.get("maillog"), dict) else {}
-    census = ml.get("census") if isinstance(ml.get("census"), dict) else {}
-    out = {}
+# dedupe's lure words that phishing leans on and no vendor's automated mail carries in its subject: a failure with
+# one of them is spoofing on a strong sign. The rest of dedupe.LURE_WORDS (invoice, payment, payroll, remittance,
+# overdue ...) are the daily vocabulary of billing and payroll vendors as well, so a stream carrying one of them is
+# named as a check, with its sender, never called spoofing (the census keeps no subject-template count, which
+# would tell an automated stream from a campaign; until it does the billing words count for nothing)
+STRONG_LURES = ("urgent", "password", "voicemail", "docusign", "wire")
+WEAK_SPOOF_SIGN = "called spoofing on the envelope or a billing word alone"
+
+
+def lure(subject):
+    """True when the subject carries one of the lure words phishing leans on (STRONG_LURES, among dedupe.py's):
+    the sign that makes a failure's likely_spoof label a strong one. Without it the label rests on the envelope
+    alone (a domain that is neither the sender's nor a known platform) or on a billing word a vendor's own mail
+    carries as well, which is how a vendor sending unaligned from its own envelope looks."""
+    text = str(subject or "")
+    return any(re.search(r"\b" + re.escape(w) + r"s?\b", text, re.I) for w in STRONG_LURES if w in dedupe.LURE_WORDS)
+
+
+def _census_rows(report, domain):
+    """The census streams (maillog.census.by_sender) sending as the domain, each as (row, spoof, sure): the
+    failures labelled likely_spoof among the ones no exception covers, and those of them whose sample subject
+    carries a lure word phishing leans on (lure). An older census carries no likely_counts: its stream's
+    majority label stands for all its failures."""
+    census = _dict(_dict(report.get("maillog")).get("census"))
+    out = []
     for r in _rows(census.get("by_sender")):
         if not isinstance(r, dict) or _name(r.get("domain")) != domain:
             continue
         counts = r.get("likely_counts") if isinstance(r.get("likely_counts"), dict) else None
         spoof = (_measured(counts.get("likely_spoof")) if counts is not None
                  else (_measured(r.get("genuine_failures")) if r.get("likely") == "likely_spoof" else 0)) or 0
-        n = (_measured(r.get("messages")) or 0) - spoof
+        out.append((r, spoof, spoof if lure(r.get("sample_subject")) else 0))
+    return out
+
+
+def _spoof_split(report, domain, spoof):
+    """(sure, envelope_only) over the domain's spoof-labelled failures (spoof, from maillog.by_domain): the ones
+    the census shows with a lure word phishing leans on in the subject, and the rest, called spoofing on the
+    envelope or a billing word alone. With no census streams for the domain (an older report) every one counts
+    as sure, as before."""
+    rows = _census_rows(report, domain)
+    if not rows:
+        return spoof, 0
+    envelope_only = max(sum(s for _, s, _ in rows) - sum(sure for _, _, sure in rows), 0)
+    envelope_only = min(envelope_only, spoof)
+    return spoof - envelope_only, envelope_only
+
+
+def _unclear_senders(report, domain, cap=3):
+    """[(sender, n)] for the census streams sending as the domain whose
+    messages the labels do not call spoofing on a strong sign (failures
+    labelled unknown, messages with no DMARC verdict, failures called
+    spoofing on the envelope or a billing word alone), most first, at most
+    cap of them."""
+    out = {}
+    for r, _, sure in _census_rows(report, domain):
+        n = (_measured(r.get("messages")) or 0) - sure
         if n > 0:
             name = str(r.get("sender") or "?")
             out[name] = out.get(name, 0) + n
     return sorted(out.items(), key=lambda kv: (-kv[1], kv[0]))[:cap]
 
 
-def quiet_evidence(report, domain, outbound, inbound, days, passing):
+def stream_floor(report):
+    """The volume under which rua_parse labels no source (its --min-volume; 20 unless the run said otherwise)."""
+    n = _measured(_dict(_dict(report.get("rua")).get("filters")).get("min_volume"))
+    return n if n else 20
+
+
+def report_doubt(report, domain, held=False):
+    """The messages the aggregate reports count failing as the domain (rua.by_header_from) that nothing marks
+    as spoofing: not from a stream labelled likely_spoof, and not from a source with no DKIM signature and no
+    SPF pass on most of its mail (the sign rua_parse's own labels read as spoofing). A source under the stream
+    floor carries no label at all, and a vendor signing with its own domain, or passing SPF for its own
+    envelope, fails there the same way a spoof does: what is left is a check for a person, never called
+    spoofing. With held, a stream labelled our own system or unknown is left out as well: such a stream holds
+    the step already (evidence_for), so it is not named twice. 0 with no reports, or none failing as the
+    domain."""
+    rua = _dict(report.get("rua"))
+    failing = sum(_measured(h.get("fail")) or 0 for h in _rows(rua.get("by_header_from"))
+                  if isinstance(h, dict) and _name(h.get("domain")) == domain)
+    if not failing:
+        return 0
+    streams = [f for f in _rows(rua.get("failing_streams")) if isinstance(f, dict)]
+    marks = ("likely_spoof",) + (OWN_LABELS + (UNCLEAR_LABEL,) if held else ())
+    labelled = {str(f.get("source_ip")) for f in streams if f.get("likely") in marks}
+    spoof = 0
+    sources = [s for s in _rows(rua.get("by_source_ip")) if isinstance(s, dict)]
+    if sources:
+        for s in sources:
+            as_domain = sum(_measured(h.get("count")) or 0 for h in _rows(s.get("header_from"))
+                            if isinstance(h, dict) and _name(h.get("domain")) == domain)
+            count, fail, no_auth = (_measured(s.get(k)) or 0 for k in ("count", "fail", "no_auth"))
+            if as_domain and (str(s.get("source_ip")) in labelled or (count and no_auth * 2 >= count)):
+                spoof += min(as_domain, fail)
+    else:  # an older report without the per-source table: the labelled streams alone
+        for f in streams:
+            if f.get("likely") in marks and domain in {_name(h) for h in _rows(f.get("header_from"))}:
+                spoof += _measured(f.get("fail")) or 0
+    return max(failing - spoof, 0)
+
+
+def doubts_for(report, name, held=False):
+    """[what this run cannot call spoofing] for one From domain: in the mail log, failures labelled likely_spoof
+    on a sign a vendor shares (the envelope alone, or a billing word in the subject: no lure word phishing leans
+    on); in the aggregate reports, failing volume outside a stream labelled likely_spoof and outside a source
+    with no authentication at all (report_doubt; with held, outside a stream the step is held for as well). A
+    vendor sending as the name unaligned fails both ways. [] when there is nothing."""
+    out = []
+    n = sum(s - sure for _, s, sure in _census_rows(report, name))
+    if n > 0:
+        out.append("%d failing in the mail log %s" % (n, WEAK_SPOOF_SIGN))
+    n = report_doubt(report, name, held)
+    if n > 0:
+        out.append("%d failing in the aggregate reports with no spoof sign" % n)
+    return out
+
+
+def doubtful_names(report):
+    """{name: [what the run cannot call spoofing]} for every From domain whose failing mail this run cannot
+    call spoofing on a strong sign (doubts_for), in the mail log's census or the aggregate reports' header
+    From rows. The sp= step names such a name below the apex before it moves, and the ramp's steps name the
+    apex's own."""
+    out = {}
+    census = _dict(_dict(report.get("maillog")).get("census"))
+    names = {_dns_name(r.get("domain")) for r in _rows(census.get("by_sender")) if isinstance(r, dict)}
+    names |= {_dns_name(h.get("domain")) for h in _rows(_dict(report.get("rua")).get("by_header_from"))
+              if isinstance(h, dict)}
+    for name in sorted(n for n in names if n):
+        texts = doubts_for(report, name)
+        if texts:
+            out[name] = texts
+    return out
+
+
+def quiet_evidence(report, domain, outbound, inbound, days, passing, last_seen=None):
     """What the run MEASURED about the mail sent as the domain when that is
     nothing legitimate, so a weekly ramp would protect nobody; None
     otherwise (the ramp stays). Every condition: the tenant's mail flow over
@@ -511,30 +845,38 @@ def quiet_evidence(report, domain, outbound, inbound, days, passing):
     labelled as our own system and none a formal exception covers (an
     explained sender of ours); no aggregate-report stream as it looks like
     our own system; and the mail log examined the mail that came in with it
-    as the From domain: its rows hold at least the mail flow's inbound
-    messages (distinct Message-IDs, the mail flow's grain, when the report
-    counts them) and its organization's log was not cut - or the full-window
-    totals cover them. A run whose mail log examined only part of that mail
-    (the row budget or the API cap cut it, a shorter window, no log)
-    verifies nothing: what it did not see may pass. Inbound mail that fails
-    and looks like spoofing is no reason to wait: it is what enforcement
-    stops. What the labels cannot call spoofing is counted for the row to
-    name, never called spoofing:
+    as the From domain: it reaches the newest message the mail flow counted
+    (last_seen; a log from another period examined none of them), its rows
+    hold at least the mail flow's inbound messages (distinct Message-IDs,
+    the mail flow's grain, when the report counts them) and its
+    organization's log was not cut - or the full-window totals cover them,
+    over the mail flow's whole span and at its grain. A run whose mail log
+    examined only part of that mail (the row budget or the API cap cut it,
+    a shorter window, no log) verifies nothing: what it did not see may
+    pass. Inbound mail that fails and looks like spoofing on a strong sign
+    (a lure word phishing leans on in the subject) is no reason to wait: it
+    is what enforcement stops. What the labels cannot call spoofing on such
+    a sign is counted for the row to name, never called spoofing:
     {"inbound", "examined" (the logical messages the rows hold), "spoof",
     "unclear" (the rest: failures labelled unknown, messages with no DMARC
-    verdict), "unclear_senders" [(sender, n)], "outside" (about how many came
-    in outside the rows kept, counted only over the full window), "full"
-    (the full-window totals cover the inbound mail, the rows do not)}."""
+    verdict, failures called spoofing on the envelope or a billing word
+    alone), "envelope_only" (those last), "unclear_senders" [(sender, n)], "outside"
+    (about how many came in outside the rows kept, counted only over the
+    full window), "full" (the full-window totals cover the inbound mail, the
+    rows do not), "report_unclear" (messages the reports count failing as
+    the domain that nothing marks as spoofing: report_doubt)}."""
     if outbound != 0 or inbound is None or days is None or days < UNUSED_DAYS or passing:
         return None
     full = _full_window(report, domain)
     if (_measured(full.get("passing")) or 0) > 0 or _own_streams(report, domain):
         return None
-    ev = {"inbound": inbound, "examined": 0, "spoof": 0, "unclear": 0, "unclear_senders": [], "outside": 0,
-          "full": False}
+    ev = {"inbound": inbound, "examined": 0, "spoof": 0, "unclear": 0, "envelope_only": 0, "unclear_senders": [],
+          "outside": 0, "full": False, "report_unclear": report_doubt(report, domain)}
     own = _own_rows(report, domain)
     if own is None:
         return None if inbound else ev  # nothing came in either: there is nothing for a mail log to tell apart
+    if inbound and not log_reaches(report, last_seen):
+        return None  # a log from another period: none of the mail that came in was examined
     by = own.get("by_likely") if isinstance(own.get("by_likely"), dict) else {}
     counts = [_measured(own.get(k, 0)) for k in ("logical_messages", "passing_messages", "internal_messages",
                                                  "excepted")]
@@ -545,22 +887,24 @@ def quiet_evidence(report, domain, outbound, inbound, days, passing):
     spoof, ours = labels
     if passed or internal or ours or excepted:
         return None
-    slack = int(inbound * ESTIMATE_SHARE)
-    full_n = _measured(full.get("logical_messages"))
+    slack = _slack(inbound)
     # the rows' distinct messages, the mail flow's grain (a logical message is one per recipient), when counted
     ids = _measured(own.get("message_ids"))
     seen = examined if ids is None else ids
+    full_n = _full_messages(full, examined, ids)  # the totals at the same grain
     if inbound and (_cut(report, domain) or seen + slack < inbound):
         # the rows kept are a floor (the row budget or the API cap cut the organization) or hold less than came
-        # in (a shorter window): only the full-window totals can cover the rest
-        if full_n is None or full_n + slack < inbound:
+        # in (a shorter window): only the full-window totals can cover the rest, and only when they span the
+        # mail flow's whole window
+        if full_n is None or full_n + slack < inbound or not _totals_span(report, days):
             return None
         ev["full"] = True
-    if full_n is not None and full_n > examined + int(full_n * ESTIMATE_SHARE):
-        ev["outside"] = full_n - examined  # never labelled: the full window counts them, the rows kept do not
+    if full_n is not None and full_n > seen + _slack(full_n):
+        ev["outside"] = full_n - seen  # never labelled: the full window counts them, the rows kept do not
     spoof = min(spoof, examined)
-    ev.update(examined=examined, spoof=spoof, unclear=examined - spoof,
-              unclear_senders=_unclear_senders(report, domain) if examined > spoof else [])
+    sure, envelope_only = _spoof_split(report, domain, spoof)
+    ev.update(examined=examined, spoof=sure, unclear=examined - sure, envelope_only=envelope_only,
+              unclear_senders=_unclear_senders(report, domain) if examined > sure else [])
     return ev
 
 
@@ -568,23 +912,27 @@ def quiet_evidence(report, domain, outbound, inbound, days, passing):
 # domain whose SPF or DKIM names any other sender can send through a platform the tenant's mail flow never sees.
 TENANT_SPF = ("include:spf.protection.outlook.com",)
 TENANT_SELECTORS = ("selector1", "selector2")
-# the inventory sources that put a domain in the tenant (discover.py): listed by it, or seen in its mail flow
-TENANT_SOURCES = ("tenant", "default", "mailflow")
+# the inventory sources that put a domain in the tenant (discover.py): listed by it. The "mailflow" tag is not
+# one: discover's --mailflow expansion tags every name its mail-flow answer holds, inbound sightings included, and
+# on the quiet path (no mail out) that is all it can mean - mail that came IN as the name, which says nothing
+# about where its own mail goes
+TENANT_SOURCES = ("tenant", "default")
 
 
 def foreign_senders(dns_doc):
     """What the domain's DNS authorizes to send as it beyond the tenant's
     own platform: SPF mechanisms other than Microsoft 365's include (a
     redirect too, whose target is not read here) and DKIM selectors other
-    than its two. [] when only the tenant sends as it."""
+    than its two. [] when only the tenant sends as it. dkim_selectors is
+    read only as a list of names; anything else reads as no selectors."""
     out = []
-    for part in str((dns_doc or {}).get("spf") or "").split():
+    for part in _text(_dict(dns_doc).get("spf")).split():
         p = part.lower().lstrip("+-~?")
         if p.startswith(("v=", "exp=")) or p == "all" or p in TENANT_SPF:
             continue
         out.append("SPF " + part)
-    out += ["DKIM selector %s" % s for s in ((dns_doc or {}).get("dkim_selectors") or [])
-            if str(s).lower() not in TENANT_SELECTORS]
+    out += ["DKIM selector %s" % s for s in _rows(_dict(dns_doc).get("dkim_selectors"))
+            if isinstance(s, str) and s.lower() not in TENANT_SELECTORS]
     return out
 
 
@@ -621,6 +969,29 @@ def _dns_name(value):
     """A name a sending check may list: a domain, never a placeholder like '(other)' or '(no header_from)'."""
     name = _name(value)
     return name if name and "." in name and not name.startswith("(") else None
+
+
+def evidence_covers(report, domain):
+    """True when the evidence this run read has rows for the domain, as the
+    gate judges it (audit.py's no-rows rule): mail-log rows of its own
+    (maillog.by_domain), or aggregate-report rows naming it - a policy seen
+    for it, header-From rows, a failing or SPF-only stream sending as it.
+    Evidence about other domains says nothing about this one. Also True
+    when the run read no evidence that attributes rows per domain (an older
+    report), since then nothing says the domain has none."""
+    ml = report.get("maillog") if isinstance(report.get("maillog"), dict) else None
+    if ml is not None and not isinstance(ml.get("by_domain"), dict):
+        return True
+    own = _own_rows(report, domain)
+    if own is not None and (_measured(own.get("logical_messages")) or 0) > 0:
+        return True
+    rua = _dict(report.get("rua"))
+    names = {_name(s.get("domain")) for s in _rows(_dict(rua.get("policy_check")).get("seen")) if isinstance(s, dict)}
+    names |= {_name(h.get("domain")) for h in _rows(rua.get("by_header_from")) if isinstance(h, dict)}
+    for s in _rows(rua.get("failing_streams")) + _rows(rua.get("spf_only_senders")):
+        if isinstance(s, dict):
+            names |= {_name(h) for h in _rows(s.get("header_from"))}
+    return domain in names
 
 
 SAID_OWN = "failing in the mail log from what looks like our own system"
@@ -789,14 +1160,16 @@ def subdomain_context(report, inventory_rows, dns_docs):
     names whose own record DNS answered for: an audited name unless its own
     _dmarc lookup failed - DMARC-006, or DMARC-007, where the audit assumed
     it inherits - and an unaudited one whose lookup found a record or none),
-    extra (the dns_extra answers), audited, and unmeasured (the audited
+    extra (the dns_extra answers), audited, unmeasured (the audited
     names whose mail out this run did not measure: no mail flow for them,
     whatever else the run read - the mail log carries no outbound leg, and
     mail to receivers that send no reports shows nowhere else - so they may
-    send, and count as if they did)."""
+    send, and count as if they did), and doubtful (doubtful_names: the
+    names whose failing mail the run cannot call spoofing on a strong
+    sign)."""
     audited = {_name(d) for d in dns_docs}
     own = {_name(d) for d, doc in dns_docs.items()
-           if isinstance(doc, dict) and doc.get("dmarc") and not doc.get("inherited")}
+           if isinstance(doc, dict) and _text(doc.get("dmarc")) and not doc.get("inherited")}
     extra = {n: x for n, x in dns_extra(report).items() if n not in audited}  # DNS decides for an audited name
     own |= {n for n, x in extra.items() if has_own_record(n, x)}
     blind = {_name(d) for d, doc in dns_docs.items() if isinstance(doc, dict) and own_lookup_failed(doc)}
@@ -804,7 +1177,7 @@ def subdomain_context(report, inventory_rows, dns_docs):
     unmeasured = {d for d in audited
                   if _measured(mailflow_of(report, (inventory_rows or {}).get(d), d).get("outbound")) is None}
     return {"senders": sending_names(report, inventory_rows), "own": own, "checked": checked, "extra": extra,
-            "audited": audited, "unmeasured": unmeasured}
+            "audited": audited, "unmeasured": unmeasured, "doubtful": doubtful_names(report)}
 
 
 def missing_records(apex, ctx):
@@ -829,56 +1202,61 @@ def evidence_for(report, domain):
     ev = {"legit_failing": [], "spf_only": [], "has_maillog": False, "has_rua": False,
           "outbound_seen": None, "dkim_evidence": False}
     audited = _audited(report)
-    gate_exc = (report.get("gate") or {}).get("exceptions") or {}
-    excepted_ips = set(gate_exc.get("excepted_streams") or [])
-    ml = report.get("maillog") or {}
+    gate = _dict(report.get("gate"))
+    gate_exc = _dict(gate.get("exceptions"))
+    excepted_ips = {str(x) for x in _rows(gate_exc.get("excepted_streams"))}
+    ml = _dict(report.get("maillog"))
     if ml:
         ev["has_maillog"] = True
-        scope = (ml.get("sender_domain") or "").lower()
+        scope = _name(ml.get("sender_domain"))
         if not scope or domain == scope or domain.endswith("." + scope):
-            by_dom = ml.get("by_domain") if isinstance(ml.get("by_domain"), dict) else {}
+            by_dom = _dict(ml.get("by_domain"))
             own = by_dom.get(domain) if isinstance(by_dom.get(domain), dict) else None
             if own is not None:
                 # the report attributes the log per domain: this domain's own rows, and the
                 # exceptions the gate applied to them - the same numbers the status document shows
-                by = own.get("by_likely") or {}
-                gate_dom = ((report.get("gate") or {}).get("domains") or {}).get(domain) or {}
+                by = _dict(own.get("by_likely"))
+                gate_dom = _dict(_dict(gate.get("domains")).get(domain))
                 if "excepted_by_likely" in gate_dom:  # the gate's split: only excepted own-sender failures count here
-                    excepted = (gate_dom.get("excepted_by_likely") or {}).get("likely_misconfigured_sender", 0)
+                    excepted = _measured(_dict(gate_dom.get("excepted_by_likely")).get("likely_misconfigured_sender")) or 0
                 else:  # a gate from before the split: every excepted failure counts
-                    excepted = gate_dom.get("excepted_failures") or 0
+                    excepted = _measured(gate_dom.get("excepted_failures")) or 0
             else:
                 # a report from before the attribution: the whole log, less everything excepted
-                by = (ml.get("counters") or {}).get("by_likely") or {}
-                excepted = gate_exc.get("excepted_maillog_failures") or 0
-            n = by.get("likely_misconfigured_sender", 0)
+                by = _dict(_dict(ml.get("counters")).get("by_likely"))
+                excepted = _measured(gate_exc.get("excepted_maillog_failures")) or 0
+            n = _measured(by.get("likely_misconfigured_sender")) or 0
             remaining = n - min(excepted, n)
             if remaining > 0:  # only what the gate did not formally except holds the step
                 ev["legit_failing"].append("%d message(s) in the mail log failed from a sender that looks like your own misconfigured system, not a spoof%s"
                                            % (remaining, " (%d more are excepted in the gate)" % excepted if excepted else ""))
-        if (ml.get("alignment") or {}).get("available"):
+        if _dict(ml.get("alignment")).get("available"):
             ev["dkim_evidence"] = True
-        for s in ml.get("spf_only_senders") or []:
+        for s in _rows(ml.get("spf_only_senders")):
+            if not isinstance(s, dict):
+                continue
             if _home(s.get("domain"), audited) == domain:  # attributed as the gate does: an audited subdomain is its own
-                d = (s.get("domain") or "").lower()
-                ev["spf_only"].append("%s (mail log, %d msgs)" % (s.get("sender") or d, s.get("spf_only") or 0))
-    rua = report.get("rua") or {}
+                d = _name(s.get("domain"))
+                ev["spf_only"].append("%s (mail log, %d msgs)" % (s.get("sender") or d, _measured(s.get("spf_only")) or 0))
+    rua = _dict(report.get("rua"))
     if rua:
         ev["has_rua"] = True
-        if (rua.get("totals") or {}).get("messages"):
+        if _measured(_dict(rua.get("totals")).get("messages")):
             ev["dkim_evidence"] = True
-        for s in rua.get("failing_streams") or []:
-            if s.get("source_ip") in excepted_ips:
+        for s in _rows(rua.get("failing_streams")):
+            if not isinstance(s, dict) or str(s.get("source_ip")) in excepted_ips:
                 continue
-            froms = [h.lower() for h in s.get("header_from") or []]
+            froms = [_name(h) for h in _rows(s.get("header_from"))]
             # rua_parse labels these likely_misconfigured; older reports said likely_misconfigured_sender.
             # Anything not labelled a spoof is a sender to fix or except before p= moves (the gate rule).
             if domain in froms and s.get("likely") != "likely_spoof":
-                ev["legit_failing"].append("aggregate reports: %s sends %d message(s) as %s and fails (%s; %s)"
-                                           % (s.get("source_ip"), s.get("count"), domain, s.get("likely") or "unlabelled",
-                                              "; ".join(s.get("likely_signals") or [])[:120]))
-        for s in rua.get("spf_only_senders") or []:
-            froms = [h.lower() for h in (s.get("header_from") or [])] if isinstance(s, dict) else []
+                n = _measured(s.get("count"))
+                ev["legit_failing"].append("aggregate reports: %s sends %s message(s) as %s and fails (%s; %s)"
+                                           % (s.get("source_ip"), n if n is not None else "?", domain,
+                                              s.get("likely") or "unlabelled",
+                                              "; ".join(str(x) for x in _rows(s.get("likely_signals")))[:120]))
+        for s in _rows(rua.get("spf_only_senders")):
+            froms = [_name(h) for h in _rows(s.get("header_from"))] if isinstance(s, dict) else []
             if not froms or any(_home(h, audited) == domain for h in froms):  # the gate's attribution, mirrored
                 ev["spf_only"].append(str(s.get("source_ip", s)) if isinstance(s, dict) else str(s))
     return ev
@@ -1003,8 +1381,16 @@ def _summary(change):
             return ("Move %s to quarantine for %s the mail that fails checks, so spoofed mail starts landing in "
                     "junk while reports confirm no legitimate sender is caught." % (domain, _share(new.get("pct"))))
         if new.get("p") == "reject" and old.get("p") != "reject":
-            return ("Move %s to reject so mail that fails checks is refused instead of junked; subdomains are a "
-                    "separate later step." % domain)
+            # where the subdomains without a record of their own go: with sp= they stay (sp=quarantine added by this
+            # change, or whatever sp= the record already set); with none they follow p= to reject
+            if new.get("sp") == "quarantine" and not old.get("sp"):
+                subs = ("subdomains without a record of their own stay at quarantine, where they are today (the "
+                        "same change adds sp=quarantine), as a separate later step")
+            elif not new.get("sp"):
+                subs = "subdomains without a record of their own move to reject with it (the record has no sp=)"
+            else:
+                subs = "subdomains are a separate later step"
+            return "Move %s to reject so mail that fails checks is refused instead of junked; %s." % (domain, subs)
         if new.get("pct") and new.get("pct") != old.get("pct"):
             return ("Raise the %s quarantine share from %s to %s percent of failing mail; mail that passes is "
                     "untouched." % (domain, old.get("pct", "100"), new["pct"]))
@@ -1037,6 +1423,11 @@ def next_step_for(plan, domain):
 # --------------------------------------------------------------------------
 # the rules
 
+# the DNS document's values a plan reads as text; one that is anything else is a damaged report, never a record
+DNS_TEXT = ("dmarc", "dmarc_source", "dmarc_status", "effective_policy", "spf", "spf_status", "spf_terminator",
+            "dkim_status", "mx_status")
+
+
 def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domains, subs=None, report_addr=None):
     """Changes and next steps for one domain. Returns (changes, holds).
     subs: subdomain_context() for the run (build_plan passes it): what the
@@ -1044,6 +1435,15 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     report_addr: the run's report address (a mailto: URI), which the
     domain's own record must carry in its rua; None when the run has none."""
     changes, holds = [], []
+    if not isinstance(dns_doc, dict):
+        holds.append({"domain": domain, "reason": "the report's DNS entry for %s is not an object - re-run the audit "
+                                                  "before planning this domain" % domain})
+        return changes, holds
+    damaged = [k for k in DNS_TEXT if dns_doc.get(k) is not None and not isinstance(dns_doc.get(k), str)]
+    if damaged:  # never plan on a value the report cannot be trusted to hold
+        holds.append({"domain": domain, "reason": "the report's DNS entry for %s is damaged (%s not text) - re-run the "
+                                                  "audit before planning this domain" % (domain, ", ".join(damaged))})
+        return changes, holds
     ids = finding_ids(dns_doc)
     dmarc = dns_doc.get("dmarc")
     tags = dmarc_tags(dmarc)
@@ -1052,13 +1452,14 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     spf = dns_doc.get("spf")
     spf_status = dns_doc.get("spf_status")
     term = (dns_doc.get("spf_terminator") or "").lower()
-    lookups = dns_doc.get("spf_lookups") or 0
     dkim_status = dns_doc.get("dkim_status")
-    selectors = dns_doc.get("dkim_selectors") or []
+    selectors = _rows(dns_doc.get("dkim_selectors"))
     mx_null = bool(dns_doc.get("mx_null"))
     has_mx = bool(dns_doc.get("mx")) and not mx_null
-    zone = (inventory_row or {}).get("zone") or org_domain(domain)
-    zone_host = (inventory_row or {}).get("zone_host") or "unknown"
+    # a failed MX lookup is no answer: the domain may receive mail, so nothing here reads it as parked
+    mx_unknown = dns_doc.get("mx_status") == "error" and not has_mx
+    zone = str(_dict(inventory_row).get("zone") or org_domain(domain))
+    zone_host = str(_dict(inventory_row).get("zone_host") or "unknown")
     mailflow = mailflow_of(report, inventory_row, domain)  # measured on every collect run with a token
     outbound, inbound = _measured(mailflow.get("outbound")), _measured(mailflow.get("inbound"))
     if outbound is None or inbound is None:  # not measured, or damaged: never read as nothing sent
@@ -1067,7 +1468,7 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     ev = evidence_for(report, domain)
     hostname = "_dmarc." + domain
     subdomains = sorted(d for d in all_domains if d != domain and d.endswith("." + domain))
-    subs = subs if subs is not None else subdomain_context(report, {}, report.get("dns") or {})
+    subs = subs if subs is not None else subdomain_context(report, {}, _dict(report.get("dns")))
     # the names below this domain that send (or that nothing measured) and have no record of their own; one whose
     # own record nobody saw (no lookup, or one that failed - an audited name's too) is named as not checked
     sending_subs, unmeasured_subs = missing_records(domain, subs)
@@ -1086,6 +1487,15 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     first = [lookup_first(domain)] if blind else []
     pct = int(tags.get("pct", "100") or 100) if tags.get("pct", "100").isdigit() else 100
     sp_tag = (tags.get("sp") or "").strip().lower() or None
+    # the record this name inherits today: a first record of its own keeps reporting where that one does
+    parent = dmarc if inherited else None
+    order = inherited_order(parent, report_addr)  # the run's address appended after the ones it already lists
+    # how far back the aggregate reports about the record that applies here reach (one mailbox serves many
+    # brands: the run's whole set says nothing about this record)
+    record = _record_of(domain, dns_doc)
+    span_days, span = report_span(report, record)
+    # what the names below this domain inherit today: none with no record of its own here, else its sp= or p=
+    inherit_today = (sp_tag or policy) if (dmarc and not inherited) else None
 
     def add(kind, priority, record, host, value, current, rollback, why, prereqs=(), fids=(), name=None):
         d = name or domain
@@ -1101,31 +1511,48 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
         c["human_summary"] = human_summary(c)
         changes.append(c)
 
-    def monitor_unaudited():
-        """p=none records for the subdomains below this domain that send and
-        are not audited (no row of their own covers them): the record that
-        shields each from this domain's sp= change. A name whose own _dmarc
-        lookup (report.dns_extra) showed none gets it outright; one nobody
-        looked up, or whose lookup failed, gets it with a lookup first: a
-        second record would leave it with no policy at all."""
-        for n in sending_subs:
-            if n in subs["audited"]:
+    def monitor_unaudited(keep=None):
+        """Records of their own for the subdomains below this domain that
+        send and have none, so this domain's record can move without them:
+        p=none for the names that inherit none today, which shields each
+        from this domain's sp= change - the unaudited ones only, since an
+        audited one's own row proposes its monitoring record - or, with
+        keep (what moves, named in the row), the policy they inherit today
+        (quarantine at p=reject; sp=quarantine, or this record's quarantine
+        with its pct), audited or not, since nothing else proposes a record
+        for a name that inherits quarantine: each stays where the record has
+        it while this one moves. Reporting where the record that applies to
+        them today (this domain's) reports. A name whose own _dmarc lookup
+        (report.dns_extra) showed none gets it outright; one nobody looked
+        up, or whose lookup failed, gets it with a lookup first: a second
+        record would leave it with no policy at all."""
+        stays = keep is not None
+        policy_below = inherit_today if stays else "none"
+        value = new_record(policy_below, rua_addr, dmarc, report_addr)
+        if stays and pct < 100:
+            value = set_tag(value, "pct", str(pct))
+        today = "p=%s%s" % (policy_below, ", pct=%d" % pct if stays and pct < 100 else "")
+        appended = inherited_order(dmarc, report_addr)
+        for n in (missing if stays else sending_subs):
+            if n in subs["audited"] and not stays:
                 continue  # an audited subdomain's own row proposes its record
-            seen = "; ".join(subs["senders"].get(n) or ["?"])
+            seen = "; ".join(subs["senders"].get(n) or ["its mail out was not measured, so it may send"])
+            if stays:
+                shields = ("it inherits %s from %s today, and this record keeps it there while %s" % (today, domain, keep))
+            else:
+                shields = "an explicit record shields it from the apex's sp= change on %s" % domain
             if n not in unchecked:  # DNS answered with no record at its own name
-                add("new", 1, "TXT", "_dmarc." + n, "v=DMARC1; p=none; rua=%s;" % rua_addr, "none", "delete the record",
-                    "sending subdomain without a record of its own: an explicit record shields it from the apex's sp= "
-                    "change on %s (seen sending: %s); DNS shows no record at _dmarc.%s" % (domain, seen, n), (), (),
-                    name=n)
+                add("new", 1, "TXT", "_dmarc." + n, value, "none", "delete the record",
+                    "sending subdomain without a record of its own: %s (seen sending: %s); DNS shows no record at "
+                    "_dmarc.%s" % (shields, seen, n), appended, (), name=n)
                 continue
             failed = (subs.get("extra", {}).get(n) or {}).get("status") == "error"
-            add("new", 1, "TXT", "_dmarc." + n, "v=DMARC1; p=none; rua=%s;" % rua_addr,
+            add("new", 1, "TXT", "_dmarc." + n, value,
                 "not checked (%s)" % ("its lookup failed in this run" if failed else "not an audited domain"),
                 "delete the record",
-                "sending subdomain whose own record this run %s: an explicit record shields it from the apex's sp= "
-                "change on %s if it has none (seen sending: %s)" % ("could not look up" if failed else "did not look up",
-                                                                     domain, seen),
-                [lookup_first(n)], (), name=n)
+                "sending subdomain whose own record this run %s: %s if it has none (seen sending: %s)"
+                % ("could not look up" if failed else "did not look up", shields, seen),
+                [lookup_first(n)] + appended, (), name=n)
 
     # Not verified: do not plan against a guess.
     if dns_doc.get("dmarc_status") == "error" or spf_status == "error":
@@ -1139,44 +1566,79 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     # passing mail as it in the aggregate reports is a sender too: a third party mailing outside recipients
     # as the domain never passes through the tenant, so its mail flow cannot show it
     sends = spf_sends(spf) or bool(selectors) or (outbound or 0) > 0 or passing > 0
-    parked_candidate = (not has_mx) and not sends
+    parked_candidate = (not has_mx) and not sends and not mx_unknown
     parked_note = unused_note(outbound, inbound, mailflow_days(report), reports_cover)
     needs_record = not dmarc or "DMARC-001" in ids or (inherited and policy in (None, "none"))
+    if mx_unknown and not sends:  # it would read as parked on a lookup that answered nothing
+        holds.append({"domain": domain, "reason": "the MX lookup for %s failed in this run, so whether it receives mail "
+                                                  "is unknown: not parked on that (p=reject and v=spf1 -all wait for a "
+                                                  "lookup that answers) - re-run before parking it" % domain})
 
     # --- no mail measured: the ramp protects nobody, so quarantine now ---------
     # the run measured that nothing legitimate is sent as the domain; the parked logic, when it applies, comes first
     days = mailflow_days(report)
     carried = tenant_carries(report, domain, dns_doc)
-    qev = quiet_evidence(report, domain, outbound, inbound, days, passing)
+    qev = quiet_evidence(report, domain, outbound, inbound, days, passing, mailflow.get("last_seen"))
     if qev is not None and not carried and not reports_cover:
         qev = None  # the tenant sees none of its own mail: only aggregate reports that cover it can say none passes
     quiet = qev is not None and not (parked_candidate and needs_record) and "DMARC-005" not in ids
-    # an organizational domain whose sending subdomains have no record of their own keeps them where they are
-    # (always, not only when this run saw a sending subdomain: one that mails less often would otherwise follow
-    # the apex to quarantine unseen; the subdomains move with the sp= step and its own checks)
-    pin = quiet and domain == org_domain(domain) and not (dmarc and not inherited and sp_tag)
+    # a quarantine-now record keeps the names below it where they are: sp=none always, not only when this run saw
+    # a sending subdomain (one that mails less often would otherwise follow the record to quarantine unseen), and
+    # on any domain, not only an organizational one (a receiver that finds the record by walking up the tree, as
+    # dns_audit does, applies it to the names below); they move with the sp= step and its own checks
+    pin = quiet and not (dmarc and not inherited and sp_tag)
+    # the names below inherit quarantine today (this record at p=quarantine with a pct, no sp=): sp=none would
+    # lower the ones that send, so they get records of their own at that policy first, and the row says so
+    lowers = pin and inherit_today == "quarantine"
     # what the run could not settle itself, each a check for a person before the record moves
-    quiet_checks = ["no sender that mails less often than monthly (statements, renewals) uses this domain"]
+    quiet_checks = ["no sender that mails monthly or less often (statements, renewals) uses this domain"]
+    if quiet and not carried and reports_cover and (span_days is None or span_days < UNUSED_DAYS):
+        # the tenant's zero says nothing about this domain: the reports are the only evidence, and they reach back
+        # as far as the ones about its record reach, which here is less than the 30 days the mail flow would have
+        # covered - or is unknown, when none of them carries usable dates
+        reach = ("span only %s (%s), and a sender that mails less often than that shows nowhere in them"
+                 % (_days(span_days), span) if span_days is not None else
+                 "carry no usable dates, so how far back they reach is unknown")
+        quiet_checks.append("aggregate reports that cover %s over %d days show nothing passing as it: the ones this "
+                            "run read about %s's record %s" % (domain, UNUSED_DAYS, record, reach))
     if quiet and not reports_cover:
         quiet_checks.append("no third party sends as %s straight to outside recipients: no aggregate report in "
                             "this run covers it, and only those would show such mail" % domain)
     if quiet and qev["unclear"]:
         names = "; ".join("%s x%d" % kv for kv in qev["unclear_senders"])
-        quiet_checks.append("the %d message(s) that came in as %s and that the mail log cannot call spoofing (a "
-                            "failure labelled unknown, or no DMARC verdict at all%s) are spoofs rather than a sender "
-                            "of ours" % (qev["unclear"], domain, (": " + names) if names else ""))
+        kinds = "a failure labelled unknown, or no DMARC verdict at all"
+        if qev["envelope_only"]:
+            kinds += (", or one %s - no lure word phishing leans on in the subject, and a vendor sending unaligned "
+                      "from its own envelope, or about its invoices and payroll, looks the same" % WEAK_SPOOF_SIGN)
+        quiet_checks.append("the %d message(s) that came in as %s and that the mail log cannot call spoofing (%s%s) "
+                            "are spoofs rather than a sender of ours"
+                            % (qev["unclear"], domain, kinds, (": " + names) if names else ""))
     if quiet and qev["outside"]:
         quiet_checks.append("the about %d message(s) that came in as %s outside the mail-log rows kept are spoofs "
                             "rather than a sender of ours: the full window, counted in advanced hunting, shows none "
                             "of them passing, but only the rows kept carry labels" % (qev["outside"], domain))
+    if quiet and qev["report_unclear"]:
+        quiet_checks.append("the %d message(s) as %s that failed in the aggregate reports outside a stream labelled "
+                            "likely_spoof (a source under %d messages carries no label, and a vendor signing with its "
+                            "own domain, or passing SPF for its own envelope, fails there the same way) are spoofs "
+                            "rather than a sender of ours" % (qev["report_unclear"], domain, stream_floor(report)))
     quiet_prereqs = quiet_checks + ev["legit_failing"]
+    if lowers and missing:
+        quiet_prereqs.append("every subdomain that sends has its own _dmarc record: %s %s none yet (the records above "
+                             "keep each at p=quarantine%s, where this record has it today, so sp=none here lowers "
+                             "nothing that sends)" % (missing_text, "has" if len(missing) == 1 else "have",
+                                                      ", pct=%d" % pct if pct < 100 else ""))
 
     def quiet_value(base):
         """The quarantine-now record: p=quarantine (no pct, so 100 percent), the record's own rua or the
-        run's, and sp=none while its sending subdomains still need records of their own."""
-        v = drop_tag(set_tag(base, "p", "quarantine"), "pct") if base else "v=DMARC1; p=quarantine;"
-        if not rua_of(v):
-            v = with_rua(v, rua_addr)
+        run's - a first record of its own reports where the one it inherits does - and sp=none while its
+        subdomains still need records of their own."""
+        if base:
+            v = drop_tag(set_tag(base, "p", "quarantine"), "pct")
+            if not rua_of(v):
+                v = with_rua(v, rua_addr)
+        else:
+            v = new_record("quarantine", rua_addr, parent, report_addr)
         return set_tag(v, "sp", "none") if pin and "sp" not in dmarc_tags(v) else v
 
     def quiet_why():
@@ -1211,9 +1673,20 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
         if carried:
             parts.append("the aggregate reports count none passing as it" if reports_cover
                          else "no aggregate report in this run covers it (see the checks)")
+        if reports_cover and qev["report_unclear"]:
+            parts.append("%d failing as it there that they cannot call spoofing, named in the checks"
+                         % qev["report_unclear"])
         why = ("quarantine now: %s, so a weekly ramp would protect nobody; reject follows once a week of reports "
                "still shows nothing passing" % "; ".join(parts))
-        if pin and missing:
+        if lowers:
+            # the names below inherit quarantine (at the record's pct) today: sp=none takes them out of it, which is
+            # not where they are - said so, and the ones that send keep the policy through records of their own
+            why += ("; sp=none takes the names below it out of this record's quarantine (they inherit p=quarantine%s "
+                    "today) until the sp= step moves them with its own checks%s"
+                    % (" at pct=%d" % pct if pct < 100 else "",
+                       "; the ones that send (%s) keep that policy through records of their own, published first "
+                       "(above)" % missing_text if missing else ", and none of them was seen sending"))
+        elif pin and missing:
             why += ("; sp=none keeps its subdomains where they are until the ones that send (%s) have records of "
                     "their own" % missing_text)
         elif pin:
@@ -1228,13 +1701,13 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     elif needs_record:
         fids = ids & {"DMARC-001", "DMARC-002", "DMARC-007"}
         if parked_candidate:
-            add("park", 1, "TXT", hostname, "v=DMARC1; p=reject; rua=%s;" % rua_addr, unseen,
+            add("park", 1, "TXT", hostname, new_record("reject", rua_addr, parent, report_addr), unseen,
                 "delete the record", "parked domain: nothing sends as it, so reject spoofing outright and keep rua to see attempts",
-                first + [parked_note], fids)
+                first + [parked_note] + order, fids)
         elif quiet:
             fast = True
             add("no_mail", 1, "TXT", hostname, quiet_value(None), unseen, "delete the record", quiet_why(),
-                first + quiet_prereqs, fids)
+                first + quiet_prereqs + order, fids)
         else:
             if blind:
                 why = ("subdomain whose own _dmarc lookup failed in this run (DMARC-007): if it has no record of its "
@@ -1245,8 +1718,8 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
                        "starts its own reporting and shields it from the apex's sp= change" % dns_doc.get("dmarc_source"))
             else:
                 why = "no DMARC record: no policy and no reporting - monitoring starts here"
-            add("new", 1, "TXT", hostname, "v=DMARC1; p=none; rua=%s;" % rua_addr, unseen, "delete the record", why,
-                first, fids)
+            add("new", 1, "TXT", hostname, new_record("none", rua_addr, parent, report_addr), unseen,
+                "delete the record", why, first + order, fids)
     elif quiet and not inherited and (policy == "none" or (policy == "quarantine" and pct < 100)):
         fast = True
         add("no_mail", 1, "TXT", hostname, quiet_value(dmarc), dmarc, "publish the current string verbatim", quiet_why(),
@@ -1255,7 +1728,7 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
         add("modify", 1, "TXT", hostname, with_rua(dmarc, rua_addr), dmarc, "publish the current string verbatim",
             "the record has no rua - failures are invisible until reports flow", (), {"DMARC-003"})
     if fast and pin:
-        monitor_unaudited()
+        monitor_unaudited("%s's record moves to quarantine at 100 percent with sp=none" % domain if lowers else None)
 
     # --- SPF hygiene --------------------------------------------------------
     # dns_audit's SPF ids: 001 no record, 002 the lookup failed (held above), 003 a weak terminator, 004 over the
@@ -1309,17 +1782,72 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
         gate_note = "no failure evidence in this run - supply --maillog and/or --rua before applying any enforcement step"
     else:
         gate_note = None
+    # the gate's per-domain rule: evidence about other domains says nothing about this one, so a step on it rests
+    # on nothing - a sender of ours failing as it could not show - until rows that cover it arrive
+    rows_note = None if gate_note or evidence_covers(report, domain) else (
+        "a mail log or aggregate reports that cover %s are supplied: the evidence this run read has no rows for it (no "
+        "mail-log rows of its own, none in the aggregate reports with it as the From domain), so a sender of ours "
+        "failing as it could not show" % domain)
+    step_note = gate_note or rows_note
 
     # the subdomains this run knows of below the domain: audited ones, and the ones it saw sending
     known = subdomains or [n for n in subs["senders"] if n.endswith("." + domain)]
     sp_now = sp_tag == "none" and bool(known)  # the sp= step is on offer (sp_step)
 
+    def rarer():
+        """A subdomain step's checks on the subdomains that mail less often than this run's evidence reaches
+        back (a quarterly newsletter, a yearly renewal): such a sender shows nowhere in it. The check names the
+        span the aggregate reports about this record cover, and a second one asks for a week of them at least."""
+        reach = ("the aggregate reports this run read about %s's record span %s (%s), the mail flow and the mail "
+                 "log 30 days at most" % (domain, span, _days(span_days)) if span else
+                 "the mail flow and the mail log reach back 30 days at most, and no dated aggregate report about %s's "
+                 "record in this run says what lies beyond" % domain)
+        out = ["no subdomain without a record of its own mails less often than this run's evidence reaches back (a "
+               "quarterly newsletter, a yearly renewal): %s, and such a sender shows nowhere in it" % reach]
+        if span_days is not None and span_days < REPORT_WEEK:
+            out.append("a week of aggregate reports about %s's record at least: the ones this run read span only %s "
+                       "(%s)" % (domain, _days(span_days), span))
+        return out
+
+    # this domain's own failing mail the run cannot call spoofing (a vendor sending as it unaligned fails the same
+    # way): a check on each of the ramp's steps, as the quiet row names it; a stream the step is held for already
+    # (evidence_for) is left out, so nothing is named twice
+    own_doubt = doubts_for(report, domain, held=True) if not quiet else []
+
+    def doubt_check(effect):
+        """The ramp's check on that mail: (effect) is what the step does to it."""
+        if not own_doubt:
+            return []
+        return ["the mail as %s this run cannot call spoofing sends nothing of ours: %s - a vendor sending as it "
+                "unaligned fails the same way, and %s its mail" % (domain, "; ".join(own_doubt), effect)]
+
+    def doubts(effect):
+        """A subdomain step's check on the subdomains below this domain whose failing mail the run cannot call
+        spoofing on a strong sign (subdomain_context's doubtful) and that have no record of their own, the ones
+        already named as sending apart: neither a sender to give a record nor a spoof to leave to sp=, until a
+        person says which. An audited one is left out: its own rows carry that check (the quiet row, or the
+        ramp's steps). (hold text, prerequisite) or (None, None)."""
+        doubt = {n: v for n, v in sorted(_dict(subs.get("doubtful")).items())
+                 if n.endswith("." + domain) and n not in subs["own"] and n not in missing
+                 and n not in subs["audited"]}
+        if not doubt:
+            return None, None
+        names = _listed(["%s (%s)" % (n, "; ".join(v)) for n, v in doubt.items()])
+        return ("subdomains whose failing mail this run cannot call spoofing: %s - a vendor sending as one of them "
+                "unaligned fails the same way, and %s its mail; decide whether each sends for you, and give it a "
+                "record of its own first, before sp= moves" % (names, effect),
+                "the subdomains whose failing mail this run cannot call spoofing send nothing of ours: %s - a vendor "
+                "sending as one of them unaligned fails the same way, and %s its mail, so give such a name a record "
+                "of its own first" % (names, effect))
+
     def sp_step():
         """sp=quarantine on this domain's record (the apex at quarantine with pct 100, or at reject), once
         every subdomain that sends has a record of its own; the sending ones without one get their
-        monitoring records and a hold naming them. A run that read no mail log and no aggregate reports
-        says so, and one whose reports do not cover this record says what only they would show. False
-        when sp= is not none or no subdomain is known."""
+        monitoring records and a hold naming them. The row also names the subdomains whose failing mail the
+        run cannot call spoofing (held too), the ones that mail less often than its evidence reaches back and
+        the span of the aggregate reports it rests on; a run that read no mail log and no aggregate reports
+        says so, and one whose reports do not cover this record says what only they would show. False when
+        sp= is not none or no subdomain is known."""
         if not sp_now:
             return False
         monitor_unaudited()
@@ -1331,6 +1859,11 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
                    "above)" % (missing_text, "has" if len(missing) == 1 else "have")]
         else:
             pre = ["every subdomain that sends has its own _dmarc record (this run saw none sending without one)"]
+        hold, check = doubts("sp=quarantine junks")
+        if hold:
+            holds.append({"domain": domain, "reason": hold})
+            pre.append(check)
+        pre += rarer()
         if gate_note:
             pre.append(gate_note)
         elif not reports_cover:
@@ -1343,10 +1876,22 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
         return True
 
     # what happens to sp= when the apex moves to reject
+    reject_value = set_tag(dmarc, "p", "reject") if dmarc else None
+    sp_pre = []  # the checks a move that carries the subdomains along with it needs
     if sp_now:
         sp_words = "; sp=none stays as is: the sp= step for this record is offered beside this one, one change a week"
+    elif sp_tag is None and missing:
+        # with no sp= the subdomains without a record of their own follow p=, and the ones that send would have their
+        # failing mail refused: sp=quarantine keeps them where the record has them today, so this step moves the apex
+        # alone and the subdomains move with a later sp= step and its own checks
+        reject_value = set_tag(reject_value, "sp", "quarantine")
+        sp_words = ("; sp=quarantine keeps the subdomains without a record of their own at quarantine, where the record "
+                    "has them today: the ones that send (%s) would otherwise follow p= to reject; they move with a "
+                    "later sp= step" % missing_text)
     elif sp_tag is None and known:
+        # the subdomains follow p= to reject: the sp= step's checks on what the evidence cannot reach apply here
         sp_words = "; the record has no sp=, so its subdomains without a record of their own move to reject with it"
+        sp_pre = rarer()
     elif sp_tag:
         sp_words = "; sp stays as is"
     else:
@@ -1357,44 +1902,61 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
             add("ratchet", 3, "TXT", hostname, set_tag(set_tag(dmarc, "p", "quarantine"), "pct", "25"), dmarc,
                 "publish the current string verbatim",
                 "first enforcement step: quarantine a quarter of failing mail while reports confirm no legitimate sender is in the failing set",
-                [p for p in ["every legitimate sender proven with an aligned DKIM header", gate_note] if p] + hold_reasons,
+                [p for p in ["every legitimate sender proven with an aligned DKIM header", step_note] if p]
+                + doubt_check("p=quarantine at pct=25 junks a quarter of") + hold_reasons,
                 {"DMARC-002"})
         elif policy == "quarantine" and pct < 100:
             nxt = next((s for s in PCT_STEPS if s > pct), 100)
             add("ratchet", 3, "TXT", hostname, set_tag(dmarc, "pct", str(nxt)), dmarc, "publish the current string verbatim",
                 "raise the quarantine sample from %d to %d percent" % (pct, nxt),
-                [p for p in ["deduplicated failure check at the current step shows only spoofing", gate_note] if p] + hold_reasons)
+                [p for p in ["deduplicated failure check at the current step shows only spoofing", step_note] if p]
+                + doubt_check("p=quarantine at pct=%d junks %s" % (nxt, _share(nxt))) + hold_reasons)
         elif policy == "quarantine" and pct >= 100:
-            if sp_tag is None and missing:  # no sp=: the subdomains without a record follow p= to reject
-                holds.append({"domain": domain, "reason": "subdomains that send have no record of their own and follow "
-                              "p= (the record has no sp=): %s - moving to reject would reject their failing mail too; "
-                              "give each its own record, or add sp=, before that move%s" % (missing_text, look_first)})
             if quiet:  # no sender to prove with DKIM: reports that keep showing nothing passing are the evidence
                 # the checks the quarantine-now row carried stay open: a week at quarantine settles none of them
                 week = ("a week at p=quarantine with the aggregate reports still showing nothing passing as %s" % domain
                         if reports_cover else
                         "a week at p=quarantine with aggregate reports that cover %s showing nothing passing as it "
                         "(none in this run covers it yet)" % domain)
-                add("ratchet", 3, "TXT", hostname, set_tag(dmarc, "p", "reject"), dmarc, "publish the current string verbatim",
+                add("ratchet", 3, "TXT", hostname, reject_value, dmarc, "publish the current string verbatim",
                     "quarantine at 100 percent is stable and no mail is measured as the domain: reject refuses failing "
                     "mail instead of junking it, and with no sender there is no DKIM proof to wait for" + sp_words,
-                    [week] + quiet_checks + [p for p in [gate_note] if p] + legit + spf_hold)
+                    [week] + quiet_checks + sp_pre + [p for p in [gate_note] if p] + legit + spf_hold)
             else:
-                add("ratchet", 3, "TXT", hostname, set_tag(dmarc, "p", "reject"), dmarc, "publish the current string verbatim",
+                add("ratchet", 3, "TXT", hostname, reject_value, dmarc, "publish the current string verbatim",
                     "quarantine at 100 percent is stable: reject refuses failing mail instead of junking it" + sp_words,
                     [p for p in ["every legitimate sender proven with an aligned DKIM header within 7 days",
                                  "no list or forwarder path for your own senders still failing (delivered_twin.kql; a canary post)",
-                                 "SPF at 9 lookups or fewer", gate_note] if p] + hold_reasons)
+                                 "SPF at 9 lookups or fewer", step_note] if p]
+                    + doubt_check("p=reject refuses") + sp_pre + hold_reasons)
             sp_step()
         elif policy == "reject":
             stepped = sp_step()  # the subdomains come first: sp=quarantine, then sp=reject, then SPF -all
             if not stepped and sp_tag == "quarantine":
+                pre = ["a week of subdomain reports at sp=quarantine showing only spoofing"]
+                if missing:
+                    # at sp=reject the failing mail of a sending subdomain without a record of its own bounces: each
+                    # gets a record of its own at quarantine, where sp= has it today, and the step waits for them
+                    monitor_unaudited("%s's sp= moves to reject" % domain)
+                    holds.append({"domain": domain, "reason": "subdomains that send have no record of their own: %s - "
+                                  "at sp=reject their failing mail is refused instead of junked; publish their records "
+                                  "(above, at p=quarantine, where sp= has them today) before sp= moves to reject%s"
+                                  % (missing_text, look_first)})
+                    pre.append("every subdomain that sends has its own _dmarc record: %s %s none yet (the records "
+                               "above, at p=quarantine), and at sp=reject their failing mail is refused%s"
+                               % (missing_text, "has" if len(missing) == 1 else "have", look_first))
+                hold, check = doubts("sp=reject refuses")
+                if hold:
+                    holds.append({"domain": domain, "reason": hold})
+                    pre.append(check)
+                pre += rarer() + [p for p in [step_note] if p]
                 add("ratchet", 4, "TXT", hostname, set_tag(dmarc, "sp", "reject"), dmarc, "publish the current string verbatim",
-                    "final subdomain step", ["a week of subdomain reports at sp=quarantine showing only spoofing"])
+                    "final subdomain step", pre)
             elif not stepped and term == "~all" and spf_sends(spf):
                 add("ratchet", 5, "TXT", domain, spf_with_terminator(spf, "-all"), spf, "publish the current string verbatim",
                     "last hardening: SPF hard fail, only after reject has been stable and every sender is DKIM-signed",
-                    ["reject stable for 30 days", "every sender DKIM-signed and aligned (SPF -all breaks SPF-only senders on forwarding)"])
+                    ["reject stable for 30 days", "every sender DKIM-signed and aligned (SPF -all breaks SPF-only senders on forwarding)"]
+                    + [p for p in [step_note] if p])
     if "SPF-005" in ids:
         holds.append({"domain": domain, "reason": "SPF is at the 10-lookup limit: no new include for any reason; new senders authenticate with DKIM"})
 
@@ -1452,23 +2014,36 @@ def build_plan(report, inventory=None, rua=None, ttl=DEFAULT_TTL):
     rua lacks it gets it appended - when it is one address (address_note
     says why not otherwise). Without it, new records take the rua most
     existing records use and nothing is appended."""
-    dns_docs = report.get("dns") or {}
+    if not isinstance(report, dict):
+        raise ValueError("the report is not a JSON object (report.json from src/audit.py)")
+    dns_docs = report.get("dns")
+    if dns_docs is not None and not isinstance(dns_docs, dict):
+        raise ValueError("the report's DNS section is not an object (report.json from src/audit.py)")
     if not dns_docs:
         raise ValueError("the report has no DNS section (run audit.py without --offline, or with domains)")
+    if inventory is not None and not isinstance(inventory, (dict, list)):
+        raise ValueError("the inventory is not a JSON object or list (inventory.json from src/discover.py)")
     inv_rows = {}
-    for row in (inventory or {}).get("domains", []) if isinstance(inventory, dict) else (inventory or []):
-        inv_rows[row["domain"]] = row
+    for row in _rows(inventory.get("domains")) if isinstance(inventory, dict) else _rows(inventory):
+        name = _name(row.get("domain")) if isinstance(row, dict) else ""  # a damaged row names no domain
+        if name:
+            inv_rows[name] = row
     report_addr = report_uri(rua)  # a derived address is no report address: nothing is appended without one
-    rua_addr = report_addr or rua or derive_rua(dns_docs) or RUA_PLACEHOLDER
-    all_domains = sorted(dns_docs)
+    derived = derive_rua(dns_docs) if not (report_addr or rua) else None
+    rua_addr = report_addr or rua or derived or RUA_PLACEHOLDER
+    all_domains = sorted(str(d) for d in dns_docs)
     subs = subdomain_context(report, inv_rows, dns_docs)
+    planned = [(domain, plan_domain(domain, dns_docs[domain], report, inv_rows.get(domain), rua_addr, ttl, all_domains,
+                                    subs, report_addr)) for domain in all_domains]
+    # a record a parent proposes for a name below it (an unaudited one's, or an audited one's that inherits
+    # quarantine today) is one row, however many parents propose it, and never a second beside a row the name's
+    # own plan proposes for that hostname
+    own_hosts = {c["hostname"] for domain, (c_list, _) in planned for c in c_list if c["domain"] == domain}
     changes, holds, proposed = [], [], set()
-    for domain in all_domains:
-        c, h = plan_domain(domain, dns_docs[domain], report, inv_rows.get(domain), rua_addr, ttl, all_domains, subs,
-                           report_addr)
-        for change in c:  # an unaudited subdomain's record, proposed by two audited parents, is one row
+    for domain, (c, h) in planned:
+        for change in c:
             if change["domain"] != domain:
-                if change["hostname"] in proposed:
+                if change["hostname"] in proposed or change["hostname"] in own_hosts:
                     continue
                 proposed.add(change["hostname"])
             changes.append(change)
@@ -1481,7 +2056,7 @@ def build_plan(report, inventory=None, rua=None, ttl=DEFAULT_TTL):
     for c in changes:
         by_host.setdefault(c["zone_host"], []).append(c)
     return {"rua": rua_addr, "rua_is_placeholder": rua_addr == RUA_PLACEHOLDER, "report_address": report_addr,
-            "ttl": ttl, "domains": all_domains, "changes": changes, "holds": holds,
+            "rua_derived": bool(derived), "ttl": ttl, "domains": all_domains, "changes": changes, "holds": holds,
             "by_zone_host": {k: [c["id"] for c in v] for k, v in by_host.items()},
             "source_report": report.get("generated_utc")}
 
@@ -1508,6 +2083,12 @@ def render_md(plan):
     if plan["rua_is_placeholder"]:
         L.append("**Set the reporting address.** No existing record carried a rua, so new records use the placeholder "
                  "`%s`. Re-run with `--rua mailto:...` (your aggregate reporting tool's address, or a mailbox you own)." % RUA_PLACEHOLDER)
+        L.append("")
+    elif plan.get("rua_derived"):
+        L.append("**Check the reporting address.** The run had no report address of its own, so new records use `%s`, "
+                 "the rua most existing records already use - which may be a reporting service's mailbox the toolkit "
+                 "never reads. If it is not a mailbox you read, re-run with `--rua mailto:...` (collect.py passes its "
+                 "report mailbox, or `--rua-address`); no record gets an address appended until then." % plan["rua"])
         L.append("")
     L.append("## Summary")
     L.append("")
@@ -1592,6 +2173,9 @@ def main():
         plan = build_plan(report, inventory, args.rua, args.ttl)
     except ValueError as err:
         die(str(err))
+    except (TypeError, AttributeError, KeyError, OverflowError) as err:  # a damaged value the guards did not name
+        die("cannot plan from this report or inventory: a value has the wrong shape (%s: %s) - re-run the audit"
+            % (type(err).__name__, err))
     if args.out:
         md, js = write(plan, args.out)
         print("wrote %s and %s" % (md, js), file=sys.stderr)

@@ -1706,10 +1706,34 @@ def reword_for_reject(findings, gate):
     return findings
 
 
+def _cut_words(cuts):
+    """What the mail-log line says of the organizations collect.py cut
+    (maillog_cuts): the rows kept are a floor for one the row budget cut,
+    and incomplete for one with an hour at the API cap (a truncated hour
+    keeps an arbitrary part of its legs, so its failures are not
+    verified); '' when nothing was cut."""
+    said = []
+    for org, info in sorted(_dict(cuts).items()):
+        info = _dict(info)
+        if info.get("api_cap_hours"):
+            said.append(f"incomplete for {org} (an hour at the API cap: {', '.join(str(h) for h in info['api_cap_hours'])}"
+                        "; its failures are not verified)")
+        elif info.get("reason") == "row budget":
+            kept = info.get("kept_hours")
+            said.append(f"a floor for {org} (the row budget kept the newest {kept}h only)" if kept
+                        else f"a floor for {org} (the row budget cut its pull)")
+        elif info.get("reason") == "not pulled":
+            said.append(f"missing {org} (its pull failed)")
+    return ("; the rows kept are " + ", ".join(said)) if said else ""
+
+
 def verified_vs_inferred(report):
     """The split AGENTS.md rule 11 asks for in every summary: what was measured
     (live DNS, parsed reports, parsed headers, dedupe counts) against what was
-    inferred (heuristic labels, gate reasoning, unverified findings)."""
+    inferred (heuristic labels, gate reasoning, unverified findings). The
+    mail-log line names the organizations collect.py cut (the rows kept are
+    a floor, or incomplete at the API cap), and the full-window line says
+    what rests on which count."""
     verified, inferred = [], []
     dns_reports = report["dns"] or {}
     if dns_reports:
@@ -1728,7 +1752,7 @@ def verified_vs_inferred(report):
         c = report["maillog"]["counters"]
         verified.append(f"mail log: {c['raw_rows']} rows deduplicated to {c['logical_messages']} logical "
                         f"messages, {c['genuine_failures']} genuine failures, "
-                        f"{c['delivered_despite_fail']} delivered despite fail")
+                        f"{c['delivered_despite_fail']} delivered despite fail" + _cut_words(maillog_cuts(report)))
         bd = report["maillog"].get("by_domain") or {}
         if bd:
             named = [d for d in bd if d != OTHER]
@@ -1742,7 +1766,9 @@ def verified_vs_inferred(report):
             verified.append(f"full-window totals for {org}, counted in advanced hunting over "
                             f"{_hours_text(_window_hours(wt))} (maillog.window_totals): "
                             f"{tot['genuine_failures']} genuine failures, {tot['delivered_despite_fail']} delivered "
-                            "despite failing; its logical messages and passing are Kusto estimates")
+                            "despite failing; its logical messages and passing are Kusto estimates. The gate, the "
+                            "census and the labels rest on the rows kept; the plan's no-mail check and its list of "
+                            "sending subdomains read these totals too")
     mf = report.get("mailflow")
     measured = {d: c for d, c in _dict(_dict(mf).get("domains")).items() if isinstance(c, dict)}
     if measured:
@@ -2176,13 +2202,20 @@ FLOOR_ESTIMATE_SHARE = 0.9
 FLOOR_FAILURE_SLACK = 3
 
 
-def window_totals_below_floor(window_totals, verdicts):
+def window_totals_below_floor(window_totals, verdicts, cuts=None):
     """{org: why} for each organization whose full-window totals
     (collect.py's maillog_totals.kql answer) count less than the rows kept
     from that window: fewer logical messages than the deduplicated verdicts
     of its From domains, beyond the estimate's error, or fewer genuine
     failures, beyond a few that straddle the cut. Such an answer cannot be
-    the whole window, so it is set aside rather than shown beside the floor."""
+    the whole window, so it is set aside rather than shown beside the floor.
+    cuts: what collect.py cut per organization (maillog.cuts). An hour kept
+    at the API row cap holds an arbitrary part of that hour's legs, so a
+    failure whose passing copy was dropped reads as genuine in the rows
+    kept: for such an organization ("api_cap_hours") the failures kept are
+    an overcount, not a floor, and only the logical-message test applies -
+    the whole-window answer is the count that corrects them."""
+    capped = {_norm_name(o): bool(_dict(i).get("api_cap_hours")) for o, i in _dict(cuts).items() if isinstance(o, str)}
     out = {}
     for org, info in sorted(_dict(_dict(window_totals).get("orgs")).items()):
         org = _norm_name(org)
@@ -2196,7 +2229,7 @@ def window_totals_below_floor(window_totals, verdicts):
         if full["logical_messages"] < kept_lm * FLOOR_ESTIMATE_SHARE:
             out[org] = ("about %d logical messages over the whole window, fewer than the %d in the rows kept"
                         % (full["logical_messages"], kept_lm))
-        elif full["genuine_failures"] + max(FLOOR_FAILURE_SLACK, kept_gf // 100) < kept_gf:
+        elif not capped.get(org) and full["genuine_failures"] + max(FLOOR_FAILURE_SLACK, kept_gf // 100) < kept_gf:
             out[org] = ("%d genuine failures over the whole window, fewer than the %d in the rows kept"
                         % (full["genuine_failures"], kept_gf))
     return out
@@ -2304,7 +2337,8 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
     }
     if maillog_doc and isinstance(window_totals, dict) and isinstance(window_totals.get("orgs"), dict):
         # the cut organizations' whole window, counted server side; an answer below the rows kept is set aside
-        below = window_totals_below_floor(window_totals, maillog_doc.get("verdicts"))
+        # (an hour at the API cap overcounts failures in the rows kept, so there only the message test applies)
+        below = window_totals_below_floor(window_totals, maillog_doc.get("verdicts"), maillog_cuts)
         kept = {org: info for org, info in window_totals["orgs"].items() if _norm_name(org) not in below}
         if kept:
             maillog_doc["window_totals"] = dict(window_totals, orgs=kept)
@@ -2324,9 +2358,9 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
                          "actionable": sum(1 for f in findings if f["severity"] in ("major", "blocking")),
                          "worst": worst_severity(findings), "exit_code": code,
                          "gate": report["gate"]["verdict"], "next_step": report["gate"]["next_step"]}
-    report["verified_vs_inferred"] = verified_vs_inferred(report)
     if maillog_doc and isinstance(maillog_cuts, dict):
         maillog_doc["cuts"] = dict(maillog_cuts)  # what collect.py cut: the delta reads it, and so does the next run's
+    report["verified_vs_inferred"] = verified_vs_inferred(report)  # after the cuts: its mail-log line names them
     if previous_report:
         try:
             delta = build_delta(report, previous_report)

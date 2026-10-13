@@ -222,6 +222,19 @@ def alternative(other, host="_dmarc.corp.example"):
             "one and let the next run propose the rest from the new value" % (host, other))
 
 
+# the sp= step's checks on what the run's evidence cannot reach (round 11): the subdomains that mail less often than
+# it reaches back, with the span the aggregate reports about the apex's record cover (the synthetic reports above
+# span one day), and a week of reports at least
+RARER = ("no subdomain without a record of its own mails less often than this run's evidence reaches back (a quarterly "
+         "newsletter, a yearly renewal): %s, and such a sender shows nowhere in it")
+RARER_DAY = RARER % ("the aggregate reports this run read about corp.example's record span 2026-09-21 .. 2026-09-22 "
+                     "(1 day), the mail flow and the mail log 30 days at most")
+RARER_NONE = RARER % ("the mail flow and the mail log reach back 30 days at most, and no dated aggregate report about "
+                      "corp.example's record in this run says what lies beyond")
+WEEK_OF_REPORTS = ("a week of aggregate reports about corp.example's record at least: the ones this run read span only "
+                   "1 day (2026-09-21 .. 2026-09-22)")
+
+
 # ------------------------------------------------------------------ R1: EXTRA_DOMAINS
 
 def test_r1_discover_adds_the_env_domains_as_their_own_source_and_notes_bad_entries():
@@ -371,7 +384,7 @@ def test_r2_a_domain_that_sends_nothing_goes_straight_to_quarantine(tmp_path):
     assert brand["priority"] == 1 and brand["hostname"] == "_dmarc.brand.example"
     assert brand["value"] == "v=DMARC1; p=quarantine; sp=none; rua=%s;" % RUA and brand["current"] == "none"
     assert brand["prerequisites"] == [
-        "no sender that mails less often than monthly (statements, renewals) uses this domain",
+        "no sender that mails monthly or less often (statements, renewals) uses this domain",
         "no third party sends as brand.example straight to outside recipients: no aggregate report in this run "
         "covers it, and only those would show such mail",
         # its new record reports to corp.example's mailbox, in another organization (RFC 7489 7.1)
@@ -386,7 +399,7 @@ def test_r2_a_domain_that_sends_nothing_goes_straight_to_quarantine(tmp_path):
     spoofed = one(by["spoofed.example"], "no_mail")
     assert spoofed["value"] == "v=DMARC1; p=quarantine; sp=none; rua=%s;" % RUA
     assert spoofed["current"] == "v=DMARC1; p=none; rua=%s;" % RUA
-    assert spoofed["prerequisites"] == ["no sender that mails less often than monthly (statements, renewals) uses "
+    assert spoofed["prerequisites"] == ["no sender that mails monthly or less often (statements, renewals) uses "
                                         "this domain"]  # the reports cover it and show nothing passing
     assert ("none of the 30 message(s) that came in with it as the From domain passed, and the mail log examined "
             "every one: 30 logical message(s), 30 look like spoofing, which quarantine stops; the aggregate reports "
@@ -394,7 +407,8 @@ def test_r2_a_domain_that_sends_nothing_goes_straight_to_quarantine(tmp_path):
     assert not [c for c in by["spoofed.example"] if c["kind"] == "ratchet"]
     # legacy.corp.example: a silent subdomain with SPF, only spoofed; its own record, straight at quarantine
     legacy = one(by["legacy.corp.example"], "no_mail")
-    assert legacy["value"] == "v=DMARC1; p=quarantine; rua=%s;" % RUA
+    # sp=none on any domain (round 11): the names below it move only with the sp= step
+    assert legacy["value"] == "v=DMARC1; p=quarantine; sp=none; rua=%s;" % RUA
     # the parked rule comes first where it applies: old.corp.example and the registrar-only parked.example
     for d in ("old.corp.example", "parked.example"):
         assert {c["kind"] for c in by[d]} == {"park"}
@@ -438,7 +452,7 @@ def test_r2_the_plan_md_row_the_table_and_todo_say_it_in_plain_words(tmp_path):
     do_now = todo.split("## 2. Do now", 1)[1].split("## 3.", 1)[0]
     assert ("- %s brand.example: TXT at `_dmarc.brand.example` = `v=DMARC1; p=quarantine; sp=none; rua=%s;` (current: `none`) "
             "- quarantine now: " % (brand["id"], RUA)) in do_now
-    assert do_now.count("  - before applying: no sender that mails less often than monthly (statements, renewals) "
+    assert do_now.count("  - before applying: no sender that mails monthly or less often (statements, renewals) "
                         "uses this domain") == 3
     stands = todo.split("## Where each domain stands", 1)[1].split("## 1.", 1)[0]
     assert ("- brand.example: p=unknown, next step: no mail measured, quarantine now (%s, section 2); the gate's no_go "
@@ -470,7 +484,13 @@ def quiet_report(**over):
            "rua": {"totals": {"messages": 10, "domains": ["brand.example"]},
                    "policy_check": {"seen": [{"domain": "brand.example", "p": "none"}]},
                    "by_header_from": [{"domain": "brand.example", "count": 10, "pass": 0, "fail": 10}],
-                   "failing_streams": [], "spf_only_senders": []}}
+                   # the 10 failing come from a stream labelled likely_spoof (no signature, no SPF pass): spoofing on
+                   # a strong sign, which the plan never names as a check
+                   "failing_streams": [{"source_ip": "203.0.113.5", "count": 10, "pass": 0, "fail": 10,
+                                        "header_from": ["brand.example"], "likely": "likely_spoof",
+                                        "likely_signals": ["no DKIM signature and no SPF pass on any domain (10 of 10 "
+                                                           "msgs)"]}],
+                   "spf_only_senders": []}}
     for path, value in over.items():
         *keys, last = path.split("/")
         node = rep
@@ -533,7 +553,7 @@ def test_r2_quarantine_drops_the_pct_and_reject_follows_without_a_dkim_proof():
     # the quarantine-now row's check stays open: a week at quarantine shows no sender that mails monthly
     assert step["prerequisites"] == ["a week at p=quarantine with the aggregate reports still showing nothing "
                                      "passing as brand.example",
-                                     "no sender that mails less often than monthly (statements, renewals) uses this "
+                                     "no sender that mails monthly or less often (statements, renewals) uses this "
                                      "domain"]
     assert not any("DKIM" in x for x in step["prerequisites"])
     # no subdomain is known, so the row says nothing about sp=, and nothing about a step that never comes
@@ -545,7 +565,7 @@ def test_r2_quarantine_drops_the_pct_and_reject_follows_without_a_dkim_proof():
     assert one(plan_of(unseen)["changes"], "ratchet")["prerequisites"] == [
         "a week at p=quarantine with aggregate reports that cover brand.example showing nothing passing as it (none "
         "in this run covers it yet)",
-        "no sender that mails less often than monthly (statements, renewals) uses this domain",
+        "no sender that mails monthly or less often (statements, renewals) uses this domain",
         "no third party sends as brand.example straight to outside recipients: no aggregate report in this run "
         "covers it, and only those would show such mail"]
     # the same domain with a sender keeps the DKIM proof before reject
@@ -585,7 +605,7 @@ def test_r2_a_failure_the_labels_cannot_call_spoofing_is_a_check_never_spoofing(
             "one: 3 logical message(s), 2 look like spoofing, which quarantine stops, and 1 it cannot call spoofing, "
             "named in the checks") in row["why"]
     assert row["prerequisites"] == [
-        "no sender that mails less often than monthly (statements, renewals) uses this domain",
+        "no sender that mails monthly or less often (statements, renewals) uses this domain",
         "the 1 message(s) that came in as brand.example and that the mail log cannot call spoofing (a failure "
         "labelled unknown, or no DMARC verdict at all: billing@brand.example x1) are spoofs rather than a sender of "
         "ours"]
@@ -734,7 +754,7 @@ def test_r2_a_quiet_domain_with_no_record_leads_the_document_with_quarantine_now
     assert doc["one_liner"].startswith("brand.example has no DMARC policy this run could determine.")
     assert doc["one_liner"].endswith(
         "The next safe step is to move straight to p=quarantine (no mail measured), ready when no sender that mails "
-        "less often than monthly (statements, renewals) uses this domain; no third party sends as brand.example "
+        "monthly or less often (statements, renewals) uses this domain; no third party sends as brand.example "
         "straight to outside recipients: no aggregate report in this run covers it, and only those would show such "
         "mail; and reports.example publishes brand.example._report._dmarc.reports.example, so receivers send "
         "brand.example's aggregate reports to agg@reports.example.")
@@ -755,7 +775,8 @@ def test_r3_the_sp_step_at_quarantine_names_every_sending_subdomain_without_a_re
     assert sp["value"] == "v=DMARC1; p=quarantine; sp=quarantine; rua=%s;" % RUA and sp["current"] == APEX
     missing = "e.corp.example, m.corp.example, mail.corp.example and t.corp.example"
     assert sp["prerequisites"] == ["every subdomain that sends has its own _dmarc record: %s have none yet (the "
-                                   "monitoring records above)" % missing, alternative(reject["id"])]
+                                   "monitoring records above)" % missing, RARER_DAY, WEEK_OF_REPORTS,
+                                   alternative(reject["id"])]
     assert {"domain": "corp.example", "reason": "subdomains that send have no record of their own: %s - publish "
             "their monitoring records (above) before sp= moves to quarantine" % missing} in p["holds"]
     # the reject step is still the apex's own: sp stays as is there, and the two rows are this week's alternatives
@@ -799,7 +820,7 @@ def test_r3_once_the_records_exist_the_step_is_ready(tmp_path):
     sp = next(c for c in rows_by(p)["corp.example"] if c["priority"] == 4)
     reject = next(c for c in rows_by(p)["corp.example"] if c["priority"] == 3)
     assert sp["prerequisites"] == ["every subdomain that sends has its own _dmarc record (this run saw none "
-                                   "sending without one)", alternative(reject["id"])]
+                                   "sending without one)", RARER_DAY, WEEK_OF_REPORTS, alternative(reject["id"])]
     assert not [h for h in p["holds"] if h["domain"] == "corp.example"]
     assert not [c for c in p["changes"] if c["domain"] in ("m.corp.example", "t.corp.example", "e.corp.example")]
 
@@ -845,11 +866,13 @@ def test_r3_where_the_sp_step_appears_and_what_counts_as_sending():
     assert "x.corp.example" in next(h["reason"] for h in p["holds"])
     assert "60 failing in the aggregate reports from what looks like our own system" in \
         one(p["changes"], "new", "_dmarc.x.corp.example")["why"]
-    # no sp= at quarantine 100: the sending subdomains follow p= to reject, so the reject step is held for them
+    # no sp= at quarantine 100: the sending subdomains without a record of their own would follow p= to reject, so
+    # the reject row adds sp=quarantine, which keeps them where the record has them today (round 11), and no hold
     p = plan_of(apex_report("v=DMARC1; p=quarantine; rua=%s;" % RUA, ("a.corp.example",),
                             dict(quiet_subs, **{"a.corp.example": flow(40)})))
-    assert any(h["reason"].startswith("subdomains that send have no record of their own and follow p= (the record "
-                                      "has no sp=): a.corp.example") for h in p["holds"])
+    reject = one(p["changes"], "ratchet", "_dmarc.corp.example")
+    assert reject["value"] == "v=DMARC1; p=reject; sp=quarantine; rua=%s;" % RUA
+    assert not [h for h in p["holds"] if h["domain"] == "corp.example"]
 
 
 def test_r3_a_subdomain_whose_failures_may_be_ours_counts_as_sending(tmp_path):
@@ -966,13 +989,13 @@ def test_r3_the_sp_step_says_what_the_run_could_not_see():
 
     sp, reject = sp_row(apex_report(APEX, ("a.corp.example",), quiet_subs))
     assert sp["prerequisites"] == ["every subdomain that sends has its own _dmarc record (this run saw none sending "
-                                   "without one)", "no failure evidence in this run - supply --maillog and/or --rua "
-                                   "before applying any enforcement step", alternative(reject["id"])]
+                                   "without one)", RARER_NONE, "no failure evidence in this run - supply --maillog "
+                                   "and/or --rua before applying any enforcement step", alternative(reject["id"])]
     # a mail log, but no aggregate report about the apex's record
     rep = apex_report(APEX, ("a.corp.example",), quiet_subs)
     rep["maillog"] = dict(log_doc)
     sp, reject = sp_row(rep)
-    assert sp["prerequisites"][1] == ("no third party sends as a subdomain without a record of its own straight to "
+    assert sp["prerequisites"][2] == ("no third party sends as a subdomain without a record of its own straight to "
                                       "outside recipients: no aggregate report in this run covers corp.example's "
                                       "record, and only those would show such mail")
     # reports about the record: the row is ready on the evidence
@@ -980,7 +1003,7 @@ def test_r3_the_sp_step_says_what_the_run_could_not_see():
            "spf_only_senders": [], "policy_check": {"seen": [{"domain": "corp.example", "p": "quarantine"}]}}
     sp, reject = sp_row(apex_report(APEX, ("a.corp.example",), quiet_subs, rua))
     assert sp["prerequisites"] == ["every subdomain that sends has its own _dmarc record (this run saw none sending "
-                                   "without one)", alternative(reject["id"])]
+                                   "without one)", RARER_NONE, alternative(reject["id"])]  # the reports carry no dates
 
 
 # ------------------------------------------------------------------ R4: the round-10 leftovers
