@@ -1600,6 +1600,57 @@ def prerequisite_steps(change, report):
         text, kind = str(item.get("text") or ""), str(item.get("kind") or "")
         if re.search(r"SPF-only|no aligned-DKIM evidence", text):
             kind = "dkim_proof"
+        if "send nothing of ours" in text and _ok(domain):
+            # the sp= step: subdomains whose failing mail the run cannot call spoofing on a strong sign - a vendor
+            # sending as one of them unaligned fails the same way, so a person says which sends for you
+            once("doubt", [kql_step("subdomain_health", org_of(domain), "every subdomain the check names shows only "
+                                    "failures you can name as spoofs: compare the envelope and signing domains behind "
+                                    "them (the census, and the by_source_ip table of the aggregate reports) with your "
+                                    "vendors', since a vendor sending as the subdomain unaligned fails the same way; "
+                                    "one that sends for you gets a record of its own before sp= moves.")])
+            continue
+        if "failed in the aggregate reports outside a stream labelled likely_spoof" in text:
+            # a quiet domain: failing report volume nothing marks as spoofing (under the stream floor, or
+            # authenticated for another domain), which a vendor would produce the same way
+            rows = len(_l(_d(report.get("rua")).get("by_source_ip")))
+            once("report_doubt", [step("command", "Re-read the aggregate reports: in the by_source_ip table every "
+                                                  "source that fails as %s is one you can name as a spoof - no DKIM "
+                                                  "signature and no SPF pass on its mail - and not a vendor signing with "
+                                                  "its own domain or passing SPF for its own envelope." % domain,
+                                       rua_command(report, rows) or "python src/rua_parse.py audit-out/rua")])
+            continue
+        if re.search(r"mails less often than this run's evidence reaches back|a week of aggregate reports about", text):
+            # a subdomain that mails quarterly or yearly shows nowhere in 30 days of evidence, or in a few days of
+            # reports about the record: only a longer span, or the sending platforms themselves, can show it
+            once("longer", [step("command", "Read a longer span than this run's: every aggregate report in the archive "
+                                            "about %s's record (no --since; the span the check names is theirs, not "
+                                            "the whole mailbox's), and the sending platforms' own logs; a subdomain "
+                                            "that mails quarterly or yearly shows there or nowhere, and gets a record "
+                                            "of its own before the subdomains move." % domain,
+                                 "python src/rua_parse.py audit-out/rua")])
+            continue
+        if text.startswith("the mail as ") and "cannot call spoofing sends nothing of ours" in text and _ok(domain):
+            # the ramp: this domain's own failures the run cannot call spoofing on a strong sign (a vendor sending as
+            # it unaligned fails the same way), which the step would junk or refuse: a person names each source first
+            rows = len(_l(_d(report.get("rua")).get("by_source_ip")))
+            once("own_doubt", [kql_step("sender_census", domain, "every envelope domain with genuine_failures above 0 "
+                                                                 "is a source you can name as a spoof, not a vendor "
+                                                                 "sending as %s unaligned (its invoices, statements or "
+                                                                 "payroll from its own envelope); %s."
+                                        % (domain, window_note(report, domain, 30))),
+                               step("command", "Re-read the aggregate reports: in the by_source_ip table every source "
+                                               "that fails as %s is one you can name as a spoof - no DKIM signature and "
+                                               "no SPF pass on its mail - and not a vendor signing with its own domain "
+                                               "or passing SPF for its own envelope." % domain,
+                                    rua_command(report, rows) or "python src/rua_parse.py audit-out/rua")])
+            continue
+        if "has no rows for it" in text and _ok(domain):
+            # the gate's no-rows rule, carried on the row: nothing this run read is about the domain
+            once("rows", [step("command", "Supply evidence that covers %s: pull its mail log (collect.py, or "
+                                          "queries/raw_maillog.kql with sender_domain set to it) and read the aggregate "
+                                          "reports its rua= receives; the gate judged it insufficient_data on the same "
+                                          "absence." % domain, "python src/collect.py %s" % domain)])
+            continue
         if re.search(r"cannot call spoofing|outside the mail-log rows kept", text) and _ok(domain):
             # mail that came in as a quiet domain which the labels cannot call spoofing, or that the rows kept
             # missed: a person names each source before the record moves

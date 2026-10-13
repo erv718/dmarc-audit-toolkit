@@ -335,21 +335,38 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   failing like our own system in its own mail-log rows, and those rows
   examined all the mail that came in as it (a mail log the row budget or a
   shorter window cut verifies nothing, unless the full-window totals cover
-  it); no passing volume as it in the aggregate reports. Mail that comes in
-  as it and fails looking like spoofing is no reason to wait; mail the
-  heuristic cannot call spoofing is named on the row as a check, never
-  called spoofing. A domain whose mail the tenant does not carry - one only
-  `EXTRA_DOMAINS` (or a file, or the command line) names, or one whose SPF
-  or DKIM points at another platform - needs aggregate reports that cover
-  it; until then it gets the monitoring record or the ramp. The plan
-  proposes its `p=quarantine` record (no `pct`) as a priority-1 row, "no
-  mail measured: quarantine now", which is not one of the zero-risk rows: it
-  waits until no sender that mails less often than monthly (statements,
-  renewals) uses the domain, and until the checks it names are confirmed.
-  `p=reject` follows after a week of reports still showing nothing passing,
-  with no DKIM proof to wait for and the same checks carried over. The
-  per-domain lines lead with it, and give the gate's verdict as the one for
-  the weekly ramp it skips. The parked rule comes first where it applies.
+  it over the mail flow's whole span and at its grain; a log from another
+  period, one that ends before the newest message the mail flow counted,
+  verifies nothing either); no passing volume as it in the aggregate
+  reports. Mail that comes in as it and fails looking like spoofing on a
+  strong sign (a lure word phishing leans on in the subject - urgent,
+  password, voicemail - never a billing word a vendor's own mail carries,
+  such as invoice or payroll; in the reports, no signature and no SPF pass
+  at all) is no reason to wait; mail the heuristic cannot call spoofing on
+  such a sign - a failure called spoofing on its envelope or a billing word
+  alone, report rows a vendor signing with its own domain would produce the
+  same way - is named on the row as a check, never called spoofing, and a
+  domain that sends carries the same check on each step of its ramp. A
+  domain whose mail the tenant does not carry - one only `EXTRA_DOMAINS`
+  (or a file, or the command line) names, or one whose SPF or DKIM points
+  at another platform - needs aggregate reports that cover it; until then
+  it gets the monitoring record or the ramp, and when the reports about
+  its record span less than 30 days (each report's own dates: one mailbox
+  serves many brands, so the whole mailbox's span says nothing about one
+  record) the row says so and asks about senders rarer than that. The plan
+  proposes its `p=quarantine` record (no `pct`; `sp=none` on any domain,
+  so the names below it move only with the `sp=` step - where they inherit
+  quarantine today, from a record at `p=quarantine` with a `pct` and no
+  `sp=`, the ones that send get records of their own at that policy first,
+  and the row waits for them) as a priority-1 row, "no mail measured:
+  quarantine now", which is not one of the zero-risk rows: it waits until
+  no sender that mails monthly or less often (statements, renewals) uses
+  the domain, and until the checks it names are confirmed. `p=reject`
+  follows after a week of reports still showing nothing passing, with no
+  DKIM proof to wait for and the same checks carried over. The per-domain
+  lines lead with it, and give the gate's verdict as the one for the weekly
+  ramp it skips. The parked rule comes first where it applies; a failed MX
+  lookup never parks a domain (the row is held until a lookup answers).
 - **Subdomains: their own records first, then `sp=`.** With the apex at
   `p=quarantine` (pct 100) or `p=reject` and `sp=none`, the plan proposes
   `sp=quarantine` once every subdomain that sends or may send - outbound in
@@ -360,7 +377,18 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   measured - has a `_dmarc` record of its own. It proposes the missing
   monitoring records itself and holds the step, naming them, until they
   exist; with no aggregate report covering the apex's record it says what
-  only those would show. Only DNS says a subdomain has a record:
+  only those would show. The row also names the subdomains whose failing
+  mail the run cannot call spoofing on a strong sign (a vendor sending as
+  one of them unaligned fails the same way: such a name gets a record of
+  its own first, and the step is held), the subdomains that mail less often
+  than the run's evidence reaches back, and the span of the aggregate
+  reports about this record it rests on (each report's own dates, a 1970
+  date ignored; a week of them at least) - a reject row whose subdomains
+  follow `p=` (no `sp=`, and none of them seen sending) carries the same
+  check. A first record of its own keeps the reporting and alignment tags
+  of the record the name inherits today (`rua`, `ruf`, `fo`, `adkim`,
+  `aspf`), with the run's report address added. Only DNS says a subdomain
+  has a record:
   `collect.py` looks up the `_dmarc` record of every unaudited one it sees
   sending (the busiest 50 a run); the policy an aggregate report says it saw
   proves nothing, since those reports can be months old. A name nobody
@@ -368,7 +396,13 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   named as not checked, and its record waits on a lookup: a second record
   would leave it with no policy at all. At quarantine the move to reject and
   the `sp=` step both rewrite the apex's record, so each row names the
-  other: one a week.
+  other: one a week. An apex at quarantine with no `sp=` moves to reject
+  with `sp=quarantine` added when subdomains that send have no record of
+  their own: they stay where the record has them today instead of following
+  `p=` to reject, and move with a later `sp=` step. At `sp=quarantine` the
+  step to `sp=reject` names the sending subdomains still without a record
+  (their failing mail would bounce), proposes each one's record at
+  `p=quarantine`, where `sp=` has it today, and holds until they exist.
 - **Deduplicated failure gate.** A legitimate sender still failing holds the
   next step and the hold says who. Spoofs that receivers already reject do not
   hold anything: enforcement is what stops them. Each domain is judged on its

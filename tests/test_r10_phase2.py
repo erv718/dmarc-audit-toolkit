@@ -200,7 +200,7 @@ def test_g1_the_delivered_failing_leg_names_the_override_before_any_other_delive
         safe, safe, ("ops@example.com", "org: Exchange transport rule (Allow)")]
     # the full-window totals take it the same way: the delivered failing leg first, then any delivered leg
     body = kql_body((QUERIES / "maillog_totals.kql").read_text(encoding="utf-8"))
-    assert 'by_failing = take_anyif(reason, on_mailbox and dmarc =~ "fail" and isnotempty(reason))' in body
+    assert 'by_failing = take_anyif(reason, on_mailbox and dmarc contains "fail" and isnotempty(reason))' in body
     assert "iff(isnotempty(by_failing), by_failing, by_other)" in body
 
 
@@ -405,7 +405,7 @@ def dns_doc(domain, **over):
 
 RECORD = "v=DMARC1; p=none; rua=mailto:reports@example.com;"
 VERIFIED = "verified unused: no outbound mail in 30 days, no passing aggregate volume"
-UNVERIFIED = ("verify unused first: no outbound mail in 30 days (discover.py --mailflow), no passing volume in "
+UNVERIFIED = ("verify unused first: no outbound mail in 30 days (this run did not measure it: a collect.py run with the app registration does), no passing volume in "
               "aggregate reports, no owner objects")
 
 
@@ -474,7 +474,7 @@ def test_g2_the_plan_calls_a_domain_unused_only_when_every_check_was_made():
     # nothing measured: the notes as they always were, or just the mail-flow check when the reports cover it
     assert park_notes(parked_report(None))[0]["old.example.com"] == [UNVERIFIED]
     assert park_notes(parked_report(covered))[0]["old.example.com"] == [
-        "verify unused first: no outbound mail in 30 days (discover.py --mailflow), no owner objects"]
+        "verify unused first: no outbound mail in 30 days (this run did not measure it: a collect.py run with the app registration does), no owner objects"]
     # mail that came in with it as the From domain: a vendor or a spoof, which only a person can tell apart
     assert park_notes(parked_report(covered), {"old.example.com": zeros(messages=240, inbound=240)})[0][
         "old.example.com"] == ["verify unused first: the 240 inbound message(s) from it in 30 days are spoofs rather "
@@ -507,7 +507,7 @@ def test_g2_a_damaged_mail_flow_count_is_never_read_as_nothing_sent():
             flows = {"old.example.com": zeros(**{key: bad})}
             notes, _ = park_notes(parked_report(covered), flows)  # never a TypeError
             assert notes["old.example.com"] == [
-                "verify unused first: no outbound mail in 30 days (discover.py --mailflow), no owner objects"], (key, bad)
+                "verify unused first: no outbound mail in 30 days (this run did not measure it: a collect.py run with the app registration does), no owner objects"], (key, bad)
             rep = parked_report(covered, {"days": 30, "domains": flows})  # the same through report.mailflow
             assert park_notes(rep)[0]["old.example.com"][0].startswith("verify unused first"), (key, bad)
     odd_days = parked_report(covered, {"days": "x", "domains": {"old.example.com": zeros()}})
@@ -632,11 +632,11 @@ def test_g3_the_totals_query_keeps_the_expensive_part_to_the_failing_ids():
     assert 'let sender_domain = "corp.example";' in kql and "let window_start  = ago(720h);" in kql
     body = kql_body(kql)
     # first the distinct Message-IDs with a failing leg, then the per-(Message-ID, recipient) summary for those only
-    ids = body.index("let failing_ids = base\n| where dmarc =~ \"fail\"\n| summarize by InternetMessageId;")
+    ids = body.index("let failing_ids = base\n| where dmarc contains \"fail\"\n| summarize by InternetMessageId;")
     pairs = body.index("let failures = failing_ids")
     assert ids < pairs < body.index("  by InternetMessageId, rcpt\n| where anyfail > 0 and anypass == 0")
     assert "dcount(strcat(InternetMessageId, \"|\", rcpt))" in body  # logical messages and passing: every pair
-    assert "dcountif(strcat(InternetMessageId, \"|\", rcpt), dmarc =~ \"pass\")" in body
+    assert "dcountif(strcat(InternetMessageId, \"|\", rcpt), dmarc contains \"pass\")" in body  # as dedupe reads it
     for column in ("OrgLevelPolicy", "OrgLevelAction", "UserLevelPolicy", "UserLevelAction"):
         assert 'column_ifexists("%s", "")' % column in body
     last = [l for l in body.splitlines() if l.strip()][-2]
@@ -767,8 +767,9 @@ def test_g3_build_report_keeps_the_totals_beside_the_floor_and_changes_no_verdic
     no_log = audit.build_report(domains=["corp.example"], offline=True, rua_paths=["samples/rua"], window_totals=totals)
     assert no_log["maillog"] is None  # totals with no mail log: nowhere to keep them
     assert ("full-window totals for corp.example, counted in advanced hunting over 30 days (maillog.window_totals): "
-            "160 genuine failures, 15 delivered despite failing; its logical messages and passing are Kusto estimates"
-            ) in rep["verified_vs_inferred"]["verified"]
+            "160 genuine failures, 15 delivered despite failing; its logical messages and passing are Kusto estimates. "
+            "The gate, the census and the labels rest on the rows kept; the plan's no-mail check and its list of "
+            "sending subdomains read these totals too") in rep["verified_vs_inferred"]["verified"]
 
 
 def test_g3_totals_below_the_rows_kept_are_set_aside_and_never_shown(tmp_path):

@@ -530,9 +530,9 @@ def pull_window_totals(tok, orgs, days=30):
         return None, notes
     try:
         template = TOTALS_QUERY.read_text(encoding="utf-8-sig")
-    except OSError as err:
+    except (OSError, UnicodeDecodeError) as err:  # unreadable, or saved as UTF-16 (PowerShell's > and Out-File)
         return None, ["mail log: full-window totals not counted: cannot read %s (%s)"
-                      % (TOTALS_QUERY.name, err.strerror or err)]
+                      % (TOTALS_QUERY.name, getattr(err, "strerror", None) or err)]
     for org in sorted(orgs):
         try:
             res = graph_client.hunting(tok, kql_for_domain(template, org, days * 24), _timespan(days * 24))
@@ -1109,6 +1109,7 @@ def main():
     volumes = {}  # internal mail per org domain, from the sizing calls: the headline signal
     cuts = {}  # the orgs whose pull the row budget or the API cap cut: the report records them for the delta
     window_totals = None  # what the hunting service counts for those orgs over the full window
+    counted_notes = []  # the counts, said once the audit has kept them: an answer it sets aside is not shown
     if tok and not maillog:
         maillog, mnotes = pull_maillog(tok, orgs, run_dir / "maillog.csv", days, args.max_rows, volumes, cuts)
         for n in mnotes:
@@ -1121,6 +1122,9 @@ def main():
         if maillog and cuts:
             window_totals, tnotes = pull_window_totals(tok, cuts, days)
             for n in tnotes:
+                if ", counted in Advanced Hunting:" in n:
+                    counted_notes.append(n)
+                    continue
                 note(n)
                 if " not counted" in n:
                     degraded.append(n)
@@ -1194,8 +1198,14 @@ def main():
                                                        audit.make_resolver(args.resolver))
         for n in xnotes:
             note(n)
-    # full-window totals the audit set aside: fewer than the rows kept, so not the whole window
-    for org, why in sorted(((report.get("maillog") or {}).get("window_totals_rejected") or {}).items()):
+    # the full-window totals the audit kept are said now, with their counts; the ones it set aside (fewer than the
+    # rows kept, so not the whole window) appear only in the note that says so - never as a count
+    rejected = (report.get("maillog") or {}).get("window_totals_rejected") or {}
+    for n in counted_notes:
+        org = n.split("full-window totals for ", 1)[1].split(" over the last ", 1)[0]
+        if org.lower().rstrip(".") not in {str(o).lower().rstrip(".") for o in rejected}:
+            note(n)
+    for org, why in sorted(rejected.items()):
         n = "mail log: full-window totals for %s set aside, not shown: the answer holds %s" % (org, why)
         note(n)
         degraded.append(n)
