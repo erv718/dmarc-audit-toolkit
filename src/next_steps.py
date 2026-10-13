@@ -2203,7 +2203,15 @@ def where_we_stand(report, view, trend, window=None, policy=None):
         if span:
             text += ", over %s" % span
         if view["truncation"]:
-            text += "; the log export was cut short (%s), so this count is a floor" % view["truncation"]
+            # the row budget keeps whole hours, so its count is a floor; an hour at the API row cap keeps an
+            # arbitrary part of its legs (a passing copy can be dropped, so failures can be overcounted) and a failed
+            # pull keeps nothing: those say what audit says of them, never "a floor"
+            cuts = audit.maillog_cuts(report)
+            odd = any(audit._cut_hours_capped(i) or (isinstance(i, dict) and i.get("reason") in ("api cap", "not pulled"))
+                      for i in cuts.values())
+            said = audit._cut_words(cuts) if odd else ""
+            text += ("; the log export was cut short (%s)%s" % (view["truncation"], said) if said else
+                     "; the log export was cut short (%s), so this count is a floor" % view["truncation"])
         full = full_window(report)
         if full:  # beside the floor, never instead of it: every verdict still rests on the rows kept
             data["window_totals"] = full

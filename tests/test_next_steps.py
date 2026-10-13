@@ -1121,3 +1121,21 @@ def test_the_whole_census_fallback_of_the_one_liner_uses_the_reduced_view():
     assert strm["scope"] == "all audited domains" and strm["excepted"] == 4
     line = next_steps.one_liner("corp.example", "none", None, None, strm, None)
     assert "1 of our own senders still fails (app@corp.example x2); 4 messages from 1 sender formally excepted in audit.toml." in line
+
+
+def test_an_api_cap_cut_is_never_called_a_floor():
+    """An hour at the API row cap keeps an arbitrary part of its legs, so a passing copy can be dropped and the
+    failures overcounted: the stand line says the rows kept are incomplete and not verified, as audit.py does,
+    and keeps 'a floor' for the row budget's whole hours (round 11, P19's reader half)."""
+    rep = audit.build_report(domains=["example.com"], maillog=str(ROOT / "samples" / "sample_maillog.csv"),
+                             offline=True, auth_column="DMARC")
+    rep["maillog"]["truncation"] = "API row cap hit for example.com (6h..5h)"
+    rep["maillog"]["cuts"] = {"example.com": {"reason": "api cap", "api_cap_hours": ["6h..5h"]}}
+    lines = next_steps.build(rep)["stand"]["lines"]
+    assert any("the log export was cut short (API row cap hit for example.com (6h..5h)); the rows kept are incomplete "
+               "for example.com (an hour at the API cap: 6h..5h; its failures are not verified)" in l for l in lines)
+    assert not any("so this count is a floor" in l for l in lines)
+    rep["maillog"]["truncation"] = "row budget kept only the newest 41h for example.com"
+    rep["maillog"]["cuts"] = {"example.com": {"reason": "row budget", "kept_hours": 41}}
+    assert any("the log export was cut short (row budget kept only the newest 41h for example.com), so this count "
+               "is a floor" in l for l in next_steps.build(rep)["stand"]["lines"])
