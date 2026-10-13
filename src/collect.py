@@ -938,8 +938,11 @@ def render_todo(report, plan, caveats=()):
     L.append("")
 
     # monitoring and hygiene rows touch no mail anyone sends; a no-mail-measured row waits on its checks
-    L.append("## 2. Do now (plan priority 1: monitoring and hygiene, zero delivery risk; quarantine where no mail "
-             "is measured, after its checks)")
+    keeps = any(c.get("priority") == 1 and c.get("kind") == "new" and
+                not re.search(r"(?:^|;)\s*p\s*=\s*none\b", str(c.get("value") or ""), re.I) for c in changes)
+    L.append("## 2. Do now (plan priority 1: monitoring and hygiene%s, zero delivery risk; quarantine where no mail "
+             "is measured, after its checks)" % (
+                 " and records that keep a subdomain at the policy it follows today" if keeps else ""))
     L.append("")
     rows = [c for c in changes if c.get("priority") == 1]
     items = []

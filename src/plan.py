@@ -801,6 +801,34 @@ def report_doubt(report, domain, held=False):
     return max(failing - spoof, 0)
 
 
+def excepted_sources(report, keep):
+    """[(source_ip, failing messages, [names])] for the aggregate-report streams a formal exception covers (the
+    gate's exceptions.excepted_streams) that fail as a name keep(name) accepts, busiest first. The gate sets such
+    a source aside everywhere - it neither holds a step nor counts as a sender - so a row that moves the policy
+    its mail meets, where nothing else would name it, names it instead (a check, never a hold)."""
+    ips = {str(x) for x in _rows(_dict(_dict(report.get("gate")).get("exceptions")).get("excepted_streams"))}
+    out = []
+    for f in _rows(_dict(report.get("rua")).get("failing_streams")) if ips else []:
+        if not isinstance(f, dict) or str(f.get("source_ip")) not in ips:
+            continue
+        names = sorted(n for n in {_name(h) for h in _rows(f.get("header_from"))} if n and keep(n))
+        if names:
+            out.append((str(f.get("source_ip")), _measured(f.get("fail")) or 0, names))
+    return sorted(out, key=lambda s: (-s[1], s[0]))
+
+
+def excepted_check(report, keep, effect, alt=""):
+    """[the check naming those sources and what the row does to their mail (effect)], or []."""
+    srcs = excepted_sources(report, keep)
+    if not srcs:
+        return []
+    listed = _listed(["%s (%d failing as %s)" % (ip, n, " and ".join(names)) for ip, n, names in srcs])
+    return ["the business accepts that %s the mail of the formally excepted aggregate-report %s %s: an exception "
+            "sets a source aside everywhere (audit.toml [[exceptions]]), so nothing else in this plan counts %s as a "
+            "sender%s" % (effect, "source" if len(srcs) == 1 else "sources", listed,
+                          "it" if len(srcs) == 1 else "them", alt)]
+
+
 def doubts_for(report, name, held=False):
     """[what this run cannot call spoofing] for one From domain: in the mail log, failures labelled likely_spoof
     on a sign a vendor shares (the envelope alone, or a billing word in the subject: no lure word phishing leans
@@ -1622,6 +1650,8 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
                             "likely_spoof (a source under %d messages carries no label, and a vendor signing with its "
                             "own domain, or passing SPF for its own envelope, fails there the same way) are spoofs "
                             "rather than a sender of ours" % (qev["report_unclear"], domain, stream_floor(report)))
+    if quiet:  # an excepted source is no sender to the gate, but this record quarantines its mail all the same
+        quiet_checks += excepted_check(report, lambda n: n == domain, "this record quarantines")
     quiet_prereqs = quiet_checks + ev["legit_failing"]
     if lowers and missing:
         quiet_prereqs.append("every subdomain that sends has its own _dmarc record: %s %s none yet (the records above "
@@ -1840,6 +1870,12 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
                 "sending as one of them unaligned fails the same way, and %s its mail, so give such a name a record "
                 "of its own first" % (names, effect))
 
+    def excepted_below(effect):
+        """The check naming the formally excepted sources failing as a name below this domain that has no record
+        of its own in DNS (subdomain_context's own): a step on this record's sp= moves their mail too."""
+        return excepted_check(report, lambda n: n != domain and n.endswith("." + domain) and n not in subs["own"],
+                              effect, " - or give such a name a record of its own first")
+
     def sp_step():
         """sp=quarantine on this domain's record (the apex at quarantine with pct 100, or at reject), once
         every subdomain that sends has a record of its own; the sending ones without one get their
@@ -1859,6 +1895,7 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
                    "above)" % (missing_text, "has" if len(missing) == 1 else "have")]
         else:
             pre = ["every subdomain that sends has its own _dmarc record (this run saw none sending without one)"]
+        pre += excepted_below("sp=quarantine junks")
         hold, check = doubts("sp=quarantine junks")
         if hold:
             holds.append({"domain": domain, "reason": hold})
@@ -1891,7 +1928,7 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     elif sp_tag is None and known:
         # the subdomains follow p= to reject: the sp= step's checks on what the evidence cannot reach apply here
         sp_words = "; the record has no sp=, so its subdomains without a record of their own move to reject with it"
-        sp_pre = rarer()
+        sp_pre = rarer() + excepted_below("p=reject refuses")
     elif sp_tag:
         sp_words = "; sp stays as is"
     else:
@@ -1945,6 +1982,7 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
                     pre.append("every subdomain that sends has its own _dmarc record: %s %s none yet (the records "
                                "above, at p=quarantine), and at sp=reject their failing mail is refused%s"
                                % (missing_text, "has" if len(missing) == 1 else "have", look_first))
+                pre += excepted_below("sp=reject refuses")
                 hold, check = doubts("sp=reject refuses")
                 if hold:
                     holds.append({"domain": domain, "reason": hold})

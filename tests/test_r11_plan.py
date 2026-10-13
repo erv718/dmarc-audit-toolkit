@@ -1362,3 +1362,109 @@ def test_docs_say_monthly_or_less_often_and_the_new_rules():
 def test_plain_ascii():
     for rel in ("src/plan.py", "src/verify.py", "tests/test_r11_plan.py", "README.md", "docs/methodology.md"):
         assert (ROOT / rel).read_text(encoding="utf-8").isascii(), rel
+
+
+# ------------------------------------------------------------------ N14: a formally excepted source is named where its mail moves
+
+def excepted(rep, *ips):
+    rep["gate"]["exceptions"] = {"excepted_streams": list(ips), "applied": [], "notes": []}
+    return rep
+
+
+def test_n14_the_quarantine_now_row_names_a_formally_excepted_source_failing_as_the_domain():
+    stream = dict(spoof_stream("legacy.corp.example", 40, "192.0.2.50"))
+    rep = apex_report(APEX, ("legacy.corp.example",), {"corp.example": flow(500), "legacy.corp.example": flow()},
+                      rua=rua_doc(streams=[stream]))
+    check = ("the business accepts that this record quarantines the mail of the formally excepted aggregate-report "
+             "source 192.0.2.50 (40 failing as legacy.corp.example): an exception sets a source aside everywhere "
+             "(audit.toml [[exceptions]]), so nothing else in this plan counts it as a sender")
+    # labelled spoofing and not excepted: what quarantine stops, no check
+    assert check not in one(plan_of(rep), "legacy.corp.example", "no_mail")["prerequisites"]
+    quiet = one(plan_of(excepted(rep, "192.0.2.50")), "legacy.corp.example", "no_mail")
+    assert check in quiet["prerequisites"]
+    # an excepted source failing as another name only is not this row's
+    rep["rua"]["failing_streams"][0]["header_from"] = ["other.corp.example"]
+    assert not any("formally excepted" in p
+                   for p in one(plan_of(rep), "legacy.corp.example", "no_mail")["prerequisites"])
+
+
+def test_n14_the_sp_steps_name_a_formally_excepted_source_failing_as_a_subdomain_without_a_record():
+    stream = dict(spoof_stream("alerts.corp.example", 50, "192.0.2.30"))
+    rua = rua_doc(by_header_from=[{"domain": "corp.example", "count": 500, "pass": 500, "fail": 0}], streams=[stream])
+    rep = apex_report("v=DMARC1; p=reject; sp=none; rua=%s;" % RUA, (), {"corp.example": flow(500)}, rua=rua)
+    rep["dns"]["mail.corp.example"] = own_record("mail.corp.example")
+    rep["inputs"]["domains"] = sorted(rep["dns"])
+
+    def sp_rows(p):
+        return [c for c in p["changes"] if "sp=quarantine" in c["value"] and c["domain"] == "corp.example"]
+    sp = sp_rows(plan_of(rep))
+    assert len(sp) == 1 and not any("formally excepted" in p for p in sp[0]["prerequisites"])
+    sp = sp_rows(plan_of(excepted(rep, "192.0.2.30")))
+    assert len(sp) == 1
+    assert ("the business accepts that sp=quarantine junks the mail of the formally excepted aggregate-report source "
+            "192.0.2.30 (50 failing as alerts.corp.example): an exception sets a source aside everywhere (audit.toml "
+            "[[exceptions]]), so nothing else in this plan counts it as a sender - or give such a name a record of "
+            "its own first") in sp[0]["prerequisites"]
+    # a name with a record of its own in DNS is not moved by sp=: nothing to name
+    rep["dns_extra"] = {"alerts.corp.example": {"dmarc": "v=DMARC1; p=none;", "status": "found",
+                                                "source": "_dmarc.alerts.corp.example", "path": "port53-udp"}}
+    sp = sp_rows(plan_of(rep))
+    assert len(sp) == 1 and not any("formally excepted" in p for p in sp[0]["prerequisites"])
+
+
+# ------------------------------------------------------------------ a record that keeps a name at quarantine is not monitoring
+
+def test_a_record_that_keeps_a_subdomain_at_quarantine_is_never_called_a_monitoring_record():
+    import notify
+    keep = {"id": "P-01", "domain": "e.corp.example", "kind": "new", "priority": 1, "record": "TXT",
+            "hostname": "_dmarc.e.corp.example", "value": "v=DMARC1; p=quarantine; rua=%s;" % RUA, "current": "none",
+            "rollback": "delete the record", "why": "sending subdomain: it inherits p=quarantine from corp.example "
+            "today, and this record keeps it there while corp.example's sp= moves to reject", "prerequisites": []}
+    monitor = dict(keep, id="P-02", domain="m.corp.example", hostname="_dmarc.m.corp.example",
+                   value="v=DMARC1; p=none; rua=%s;" % RUA, why="sending subdomain")
+    half = dict(keep, id="P-03", domain="h.corp.example", hostname="_dmarc.h.corp.example",
+                value="v=DMARC1; p=quarantine; pct=50; rua=%s;" % RUA)
+    assert next_steps.step_label(monitor) == "publish a p=none monitoring record"
+    assert next_steps.step_label(keep) == "publish a record of its own at p=quarantine, the policy it follows today"
+    assert next_steps.step_label(half) == ("publish a record of its own at p=quarantine, pct=50, the policy it "
+                                           "follows today")
+    assert next_steps.keeps_policy(keep) and not next_steps.keeps_policy(monitor)
+    plan = {"changes": [keep, monitor], "holds": []}
+    rep = {"inputs": {"domains": ["corp.example"]}, "gate": {"domains": {}}, "findings": []}
+    groups = next_steps.build_actions(rep, plan, None, [])
+    summary = [i for g in groups for i in g["items"] if i["kind"] == "p1summary"][0]
+    assert summary["hook"] == "2 zero-risk DMARC records"
+    assert summary["action"] == ("ready to publish; 1 keeps a subdomain at the p=quarantine it follows today, not a "
+                                 "p=none monitoring record")
+    only_monitor = [i for g in next_steps.build_actions(rep, {"changes": [monitor], "holds": []}, None, [])
+                    for i in g["items"] if i["kind"] == "p1summary"][0]
+    assert only_monitor["hook"] == "1 zero-risk monitoring record" and only_monitor["action"] == "ready to publish"
+    text = notify.summarize(rep, plan=plan)
+    assert "plan: 2 change(s) waiting, 2 are zero-risk monitoring/hygiene (1 keeps a subdomain at the policy it " \
+           "follows today); 0 hold(s)" in text
+    todo = collect.render_todo(rep, plan)
+    assert ("## 2. Do now (plan priority 1: monitoring and hygiene and records that keep a subdomain at the policy it "
+            "follows today, zero delivery risk;") in todo
+    assert "## 2. Do now (plan priority 1: monitoring and hygiene, zero delivery risk;" in \
+        collect.render_todo(rep, {"changes": [monitor], "holds": []})
+
+
+def test_the_one_liner_says_how_many_spoofing_labels_rest_on_a_weak_sign(tmp_path):
+    """The headline counts dedupe's likely_spoof label; the plan calls a label on the envelope or a billing word
+    alone a check. The one-liner says how many of its 'look like spoofing' are those, so it never claims more."""
+    docs = {"brand.example": own_record("brand.example", "v=DMARC1; p=quarantine; rua=%s;" % RUA)}
+    log = (Log().add("statements@brand.example", "Your October statement", dmarc="fail", times=3,
+                     env="mailer.billing-vendor.invalid")
+           .add("ceo@brand.example", "Urgent wire transfer #", dmarc="fail", times=2, env="evil.invalid")
+           .add("staff@brand.example", "Weekly #", times=20))
+    rep = audited(tmp_path / "run", docs, log, flows={"brand.example": flow(20, 5)})
+    doc = next_steps.build(rep, plan=plan_of(rep))
+    assert ("5 from 2 addresses that look like spoofing (3 of them on the envelope or a billing word alone: a check "
+            "in the plan, not proof), of which 5 reached a mailbox anyway") in doc["one_liner"]
+    # lure words alone: no qualifier
+    rep = audited(tmp_path / "lure", docs, Log().add("ceo@brand.example", "Urgent wire transfer #", dmarc="fail",
+                                                     times=2, env="evil.invalid").add("staff@brand.example", "Weekly #",
+                                                                                      times=20),
+                  flows={"brand.example": flow(20, 2)})
+    line = next_steps.build(rep, plan=plan_of(rep))["one_liner"]
+    assert "look like spoofing" in line and "billing word alone" not in line

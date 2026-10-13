@@ -37,6 +37,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -655,9 +656,15 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
         quiet = sum(1 for c in ch if c.get("kind") == "no_mail")
         p1 = [c for c in ch if c.get("priority") == 1 and c.get("kind") != "no_mail"]
         looks = sum(1 for c in p1 if any(str(p).startswith("look up _dmarc.") for p in _rows(c.get("prerequisites"))))
+        # a record that keeps a subdomain at the p=quarantine it follows today is zero-risk, but not monitoring
+        keeps = sum(1 for c in p1 if c.get("kind") == "new" and re.search(r"(?:^|;)\s*p\s*=\s*(?!none\b)\w",
+                                                                          str(c.get("value") or ""), re.I))
+        said = (["%d of them after a lookup of the name's own record" % looks] if looks else []) + \
+            (["%d %s a subdomain at the policy it follows today" % (keeps, "keeps" if keeps == 1 else "keep")]
+             if keeps else [])
         lines.append("- plan: %d change(s) waiting, %d are zero-risk monitoring/hygiene%s%s; %d hold(s)"
                      % (len(ch), len(p1),
-                        (" (%d of them after a lookup of the name's own record)" % looks) if looks else "",
+                        (" (%s)" % "; ".join(said)) if said else "",
                         (", %d %s no mail straight to quarantine"
                          % (quiet, "moves a domain that sends" if quiet == 1 else "move domains that send"))
                         if quiet else "", len(_rows(plan.get("holds")))))

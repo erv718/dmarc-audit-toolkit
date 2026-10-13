@@ -1290,6 +1290,14 @@ def plan_changes(plan):
     return [c for c in ((plan or {}).get("changes") or []) if isinstance(c, dict)]
 
 
+def keeps_policy(change):
+    """True for plan.py's new record that keeps a name at the enforcing policy it follows today (p= other than
+    none) while the record above it moves: zero-risk, like a monitoring record, but not one."""
+    value = str((change or {}).get("value") or "")
+    return (change or {}).get("kind") == "new" and value.lower().startswith("v=dmarc1") and \
+        dmarc_tags(value).get("p", "none") != "none"
+
+
 def step_label(change):
     """A short action for one plan change, from its record rather than its prose."""
     kind = change.get("kind")
@@ -1307,7 +1315,12 @@ def step_label(change):
     if kind == "no_mail":
         return "move straight to p=quarantine (no mail measured)"
     if kind == "new":
-        return "publish a p=%s monitoring record" % tags.get("p", "none")
+        if tags.get("p", "none") == "none":
+            return "publish a p=none monitoring record"
+        # plan.py's record that keeps a name at the policy it follows today while the record above it moves
+        pct = tags.get("pct")
+        return "publish a record of its own at p=%s%s, the policy it follows today" % (
+            tags.get("p"), ", pct=%s" % pct if pct and pct != "100" else "")
     if kind == "modify":
         if is_spf:
             parts = value.split()
@@ -2039,8 +2052,12 @@ def _own_domain_sentence(org, policy, strm):
         if spoof_n:
             k = len(strm["spoof"])
             who = ("%d %s" % (k, _plural(k, "address", "addresses"))) if k else "addresses"
-            parts.append("%d from %s that look like spoofing%s"
-                         % (spoof_n, who, _handled(policy, k or spoof_n, min(_delivered(strm["spoof"]), spoof_n))))
+            weak = min(_n(strm.get("spoof_weak")) or 0, spoof_n)
+            parts.append("%d from %s that look like spoofing%s%s"
+                         % (spoof_n, who,
+                            (" (%d of them on the envelope or a billing word alone: a check in the plan, not proof)"
+                             % weak) if weak else "",
+                            _handled(policy, k or spoof_n, min(_delivered(strm["spoof"]), spoof_n))))
         if strm.get("excepted") and not unsplit:
             parts.append("%d formally excepted in audit.toml" % strm["excepted"])
         mid += ": " + "; ".join(parts)
@@ -2611,7 +2628,8 @@ def build_actions(report, plan, view, owners):
         if prio == 1 and c.get("kind") in ("new", "modify"):
             items.append({"kind": "p1record", "keys": keys, "ref": c.get("id"), "domain": dom,
                           "hostname": c.get("hostname"), "hook": dom, "action": step_label(c),
-                          "is_dmarc": str(c.get("hostname") or "").startswith("_dmarc."), "lookup": looks_first(c)})
+                          "is_dmarc": str(c.get("hostname") or "").startswith("_dmarc."), "lookup": looks_first(c),
+                          "keeps": keeps_policy(c)})
         else:
             action = plain(step_label(c))
             why = plain(str(c.get("human_summary") or c.get("why") or "").strip())  # plan.py's plain words first
@@ -2794,14 +2812,19 @@ def build_actions(report, plan, view, owners):
         lines = []
         if p1:
             ids = [i["ref"] for i in p1 if i["ref"]]
-            what = "monitoring" if all(i["is_dmarc"] for i in p1) else "monitoring and hygiene"
+            # a record that keeps a name at the policy it follows today is zero-risk too, but not monitoring
+            keeps = sum(1 for i in p1 if i.get("keeps"))
+            what = ("DMARC" if keeps else "monitoring") if all(i["is_dmarc"] for i in p1) else \
+                ("DMARC and hygiene" if keeps else "monitoring and hygiene")
             # a record for a name whose own _dmarc record nobody saw waits on a lookup: a second record breaks it
             looks = [i["ref"] or i["domain"] for i in p1 if i.get("lookup")]
             lines.append({"hook": "%d zero-risk %s %s" % (len(p1), what, _plural(len(p1), "record")),
                           "action": "ready to publish" + (", of which %d (%s) %s a lookup first: the name may have a "
                                                           "record of its own already" % (
                                                               len(looks), ", ".join(looks),
-                                                              "needs" if len(looks) == 1 else "need") if looks else ""),
+                                                              "needs" if len(looks) == 1 else "need") if looks else "")
+                          + ("; %d %s a subdomain at the p=quarantine it follows today, not a p=none monitoring "
+                             "record" % (keeps, "keeps" if keeps == 1 else "keep") if keeps else ""),
                           "ref": ("plan " + id_range(ids)) if ids else None,
                           "kind": "p1summary", "domains": [i["domain"] for i in p1]})
         for i in rest:
@@ -3051,6 +3074,11 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
         since = date  # the delta shows the policy changed in this very run
     own = own_domain_view(report, view, org)
     strm = streams(view, rua, own, _excepted_ips(report))
+    if strm is not None and own is not None and not own.get("subdomains"):
+        spoof_n = (strm.get("by_likely") or {}).get(SPOOF, 0)
+        if spoof_n:  # the plan's split: a lure word in the subject is a strong sign; the envelope or a billing word is not
+            import plan as plan_mod  # here, not at the top: only this helper is needed
+            strm["spoof_weak"] = plan_mod._spoof_split(report, org, spoof_n)[1]
     nxt = org_next(report, plan, org, own)
     line = one_liner(org, policy, pct, since, strm, nxt)
     window = window_of(report)

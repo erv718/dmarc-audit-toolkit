@@ -369,8 +369,9 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   the domain, and until the checks it names are confirmed. An
   aggregate-report source a formal exception covers is set aside
   everywhere: it is not counted as a sender here, so this record will
-  quarantine its mail at receivers - except a source by IP only once you
-  accept that. `p=reject`
+  quarantine its mail at receivers. The row names each such source as a
+  check (the business accepts that), so except a source by IP only once
+  you accept that. `p=reject`
   follows after a week of reports still showing nothing passing, with no
   DKIM proof to wait for and the same checks carried over. The per-domain
   lines lead with it, and give the gate's verdict as the one for the weekly
@@ -383,7 +384,8 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   your organizations), passing in the mail log or in the aggregate reports,
   failing in the mail log as our own system does, as an unclear sender or as
   a formally excepted one (a formally excepted aggregate-report source is
-  set aside, not counted), and an audited subdomain whose mail out was not
+  set aside, not counted: the row names it as a check instead, since the
+  step junks its mail), and an audited subdomain whose mail out was not
   measured - has a `_dmarc` record of its own. It proposes the missing
   monitoring records itself and holds the step, naming them, until they
   exist; with no aggregate report covering the apex's record it says what

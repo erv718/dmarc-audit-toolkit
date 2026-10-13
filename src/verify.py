@@ -1728,7 +1728,7 @@ def prerequisite_steps(change, report):
             have = [s for s in subs if s in seen]
             if subs:
                 once("own_records", [step("dns", "Look up the subdomains' own records: each answers with a v=DMARC1 "
-                                                 "string of its own once its monitoring record is published%s." % (
+                                                 "string of its own once the plan's record for it is published%s." % (
                                                      "; %s %s already: DNS showed %s in this run" % (
                                                          audit._names(have), "answers" if len(have) == 1 else "answer",
                                                          "its own record" if len(have) == 1 else "their own records")
