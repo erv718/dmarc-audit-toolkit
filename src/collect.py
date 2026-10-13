@@ -109,6 +109,7 @@ AGGREGATE_SOURCE = "Advanced Hunting aggregate"
 # domain unused only over 30 silent days (--mailflow's new subdomains are the ones seen in those 30 days too)
 MAILFLOW_DAYS = 30
 TOTALS_COLUMNS = ("fromdom", "logical_messages", "passing", "genuine_failures", "delivered_despite_fail")
+RUN_JSON_SENDERS = 200  # new sender identities listed in run.json; senders.json holds them all, the count says how many
 RUN_FILES = ("report.md", "report.json", "plan.md", "plan.json", "next_steps.md", "next_steps.json", "todo.md",
              "inventory.json", "domains.txt", "summary.txt", "run.json", "setup.json", "maillog.csv", "verify.md")
 PRIORITY_WORD = {1: "now, zero delivery risk", 2: "before enforcement", 3: "enforcement step, gated",
@@ -414,9 +415,61 @@ def pull_maillog(tok, org_domains, out_csv, days=30, max_rows=ROW_BUDGET, volume
 
 def _tally(value):
     """A count in a hunting answer as the mail-flow answer reads one (a whole
-    number >= 0, a long may come as text), 0 for a null (an empty join
-    side), None for anything else."""
-    return 0 if value is None else discover._count(value)
+    number >= 0, a long may come as text, "1234.0" included), 0 for a null
+    or an empty string (an empty join side), None for anything else."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 0
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            return None
+    return discover._count(value)
+
+
+def totals_rejection(result, org):
+    """Why totals_by_domain refused an answer, in one clause for the run
+    note, so a rejected answer on a live tenant explains itself: the shape
+    seen and, when the columns are there, the first value that is not a
+    count."""
+    results = result.get("results") if isinstance(result, dict) else None
+    if not isinstance(results, list) or any(not isinstance(r, dict) for r in results):
+        return "no results list of rows (%s)" % _answer_shape(result)
+    schema = result.get("schema")
+    names = {c.get("name") for c in schema if isinstance(c, dict)} if isinstance(schema, list) else set()
+    if results:
+        missing = sorted(set(TOTALS_COLUMNS) - (names | set(results[0])))
+        if missing:
+            return "columns missing: %s (%s)" % (", ".join(missing), _answer_shape(result))
+    for i, r in enumerate(results):
+        dom = str(r.get("fromdom") or "").strip().lower().rstrip(".")
+        if not (dom == org or dom.endswith("." + org)):
+            continue
+        for k in TOTALS_COLUMNS[1:]:
+            if _tally(r.get(k)) is None:
+                v = r.get(k)
+                return "row %d has a %s of type %s where a count was expected (%s)" % (
+                    i + 1, k, type(v).__name__, _answer_shape(result))
+    return "unknown (%s)" % _answer_shape(result)
+
+
+def _answer_shape(result):
+    """What a hunting answer looks like, for a note that explains a rejected
+    one: the top-level keys, the schema's column names, how many rows, and
+    the first row's columns with their value types (never the values)."""
+    if not isinstance(result, dict):
+        return "a %s, not an object" % type(result).__name__
+    schema = result.get("schema")
+    names = [c.get("name") for c in schema if isinstance(c, dict)] if isinstance(schema, list) else None
+    rows = result.get("results")
+    parts = ["keys %s" % ",".join(sorted(str(k) for k in result)), "schema %s" % (names if names is not None else "absent")]
+    if isinstance(rows, list):
+        parts.append("%d rows" % len(rows))
+        if rows and isinstance(rows[0], dict):
+            parts.append("first row %s" % ",".join("%s:%s" % (k, type(v).__name__) for k, v in rows[0].items()))
+    else:
+        parts.append("results %s" % type(rows).__name__)
+    return "; ".join(parts)
 
 
 def totals_by_domain(result, org):
@@ -428,13 +481,13 @@ def totals_by_domain(result, org):
     delivered_by ({reason: messages}) gathers the delivered failures that
     name their override. None when the answer is not those totals (no
     results list, rows without its columns, a count that is not a whole
-    number); {} when it holds no row under org."""
+    number) - totals_rejection says which; {} when it holds no row under org."""
     results = result.get("results") if isinstance(result, dict) else None
     if not isinstance(results, list) or any(not isinstance(r, dict) for r in results):
         return None
-    schema = result.get("schema")  # the column names, else the first row's keys (run_hunting.columns' rule)
+    schema = result.get("schema")  # the column names, and the first row's keys (run_hunting.columns' rule)
     names = {c.get("name") for c in schema if isinstance(c, dict)} if isinstance(schema, list) else set()
-    if results and not set(TOTALS_COLUMNS) <= (names or set(results[0])):
+    if results and not set(TOTALS_COLUMNS) <= (names | set(results[0])):
         return None
     out = {}
     for r in results:
@@ -488,8 +541,8 @@ def pull_window_totals(tok, orgs, days=30):
             continue
         by_domain = totals_by_domain(res, org)
         if by_domain is None:
-            notes.append("mail log: full-window totals for %s not counted: the answer is not the totals %s asks for"
-                         % (org, TOTALS_QUERY.name))
+            notes.append("mail log: full-window totals for %s not counted: the answer is not the totals %s asks for - %s"
+                         % (org, TOTALS_QUERY.name, totals_rejection(res, org)))
             continue
         if not by_domain:
             notes.append("mail log: full-window totals for %s not counted: the answer holds no mail under it, yet its "
@@ -1266,7 +1319,9 @@ def main():
                                                       "previous_run": prev_dir.name if prev_dir else None,
                                                       "owners_file": str(owners_path) if owners_path else None,
                                                       "next_steps": steps is not None,
-                                                      "settings": cfg.get("_path"), "new_senders": new_senders,
+                                                      "settings": cfg.get("_path"),
+                                                      "new_senders": new_senders[:RUN_JSON_SENDERS],
+                                                      "new_senders_count": len(new_senders),
                                                       "caveats": caveats, "degraded": degraded,
                                                       "strict_reasons": strict_reasons,
                                                       "exit_code": code}, indent=1), encoding="utf-8")

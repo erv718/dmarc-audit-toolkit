@@ -149,6 +149,9 @@ ID_RX = re.compile(r"(?<![\w(-])((?:[A-Z]{2,}|P)-\d{2,})(?![\w-])(?![^(]*\))")
 GAP_RX = re.compile(r"^(\d+) logical message\(s\) from this domain failed with no passing copy "
                     r"\(deduplicated(?:; (\d+) more excepted)?\)"
                     r"(?:; top senders: .*)?$")
+# The gate's blocker for one failing outside-view source (audit._shared_blockers): collapsed to one line per domain.
+STREAM_RX = re.compile(r"^(\S+) fails DMARC on (\d+)/(\d+) msgs \(([^)]*)\)")
+STREAM_NAMES = 3  # sources named in that line; the rest are counted and left to report.md
 # Plan prerequisites written as observations, reworded as the condition that clears them.
 PREREQ_REWORDS = (
     (re.compile(r"^(\d+) message\(s\) in the mail log failed from a sender that looks like your own "
@@ -1289,6 +1292,32 @@ def reword_prereq(text):
 
 
 LOOKUP_FIRST = re.compile(r"^look up _dmarc\.\S+ first:")
+# the plan's prerequisite for one failing outside-view source (plan.evidence_for), one per source
+STREAM_PREREQ_RX = re.compile(r"^aggregate reports: (\S+) sends (\d+) message\(s\) as (\S+) and fails")
+
+
+def reword_prereqs(texts):
+    """Every plan prerequisite reworded as its condition (reword_prereq), with
+    the per-source aggregate-report ones folded into one condition that names
+    the busiest: a busy tenant's reject row carried ninety of them, and a
+    sentence with ninety clauses is not a sentence anyone reads."""
+    out, streams = [], []
+    for p in texts:
+        m = STREAM_PREREQ_RX.match(p or "")
+        if m:
+            streams.append((int(m.group(2)), m.group(1), m.group(3)))
+        else:
+            out.append(reword_prereq(p))
+    if len(streams) == 1:
+        n, ip, dom = streams[0]
+        out.append("the sender at %s (%d messages as %s) is fixed" % (ip, n, dom))
+    elif streams:
+        streams.sort(key=lambda s: (-s[0], s[1]))
+        top = ", ".join("%s (%d as %s)" % (ip, n, dom) for n, ip, dom in streams[:STREAM_NAMES])
+        more = len(streams) - STREAM_NAMES
+        out.append("the %d failing outside-view senders are fixed or formally excepted (busiest: %s%s)"
+                   % (len(streams), top, ("; %d more in report.md" % more) if more > 0 else ""))
+    return out
 
 
 def looks_first(change):
@@ -1593,7 +1622,12 @@ def blocker_items(report, domain, own=None):
     bl = (own or {}).get("by_likely") or {}
     unsplit = bool(own) and not own.get("excepted_reduced", True)  # the split and names still hold the excepted
     clause = _spoof_clause(current_policy(report, domain))
+    streams = []  # the gate names every failing outside-view source; the reader gets one line for all of them
     for r in blockers:
+        s = STREAM_RX.match(r)
+        if s:
+            streams.append((int(s.group(2)), int(s.group(3)), s.group(1), s.group(4)))
+            continue
         m = GAP_RX.match(r)
         if m and bl.get(SPOOF) and not (unsplit and (own.get("excepted") or m.group(2))):
             total, spoof_n = int(m.group(1)), bl[SPOOF]
@@ -1615,6 +1649,16 @@ def blocker_items(report, domain, own=None):
                                else "addresses", (" (%s)" % names) if names else "", clause)})
             continue
         out.append({"kind": "other", "text": plain(r)})
+    if streams:
+        streams.sort(key=lambda s: (-s[0], s[2]))
+        top = ", ".join("%s (%d of %d msgs, %s)" % (ip, fail, count, LIKELY_WORDS.get(label, label))
+                        for fail, count, ip, label in streams[:STREAM_NAMES])
+        more = len(streams) - STREAM_NAMES
+        out.append({"kind": "outside", "text": "%d outside-view %s %s DMARC with real volume (%s%s); fix, or formally "
+                    "except %s, before p= moves" % (len(streams), _plural(len(streams), "sender"),
+                                                    _plural(len(streams), "fails", "fail"), top,
+                                                    (" and %d more in report.md" % more) if more > 0 else "",
+                                                    "it" if len(streams) == 1 else "them")})
     if verdict == "no_go" and not out:  # the gate holds the step even when its words were not recognised
         out.append({"kind": "other", "text": "the audit's gate says not yet (report.md lists why)"})
     return out
@@ -1643,7 +1687,7 @@ def org_next(report, plan, org, own=None):
     quiet = next((c for c in changes if c.get("kind") == "no_mail"), None)
     if quiet is not None:  # the run measured no mail sent as it: the quarantine-now row is the step, policy or not
         return {"label": plain(step_label(quiet)), "ref": quiet.get("id"),
-                "prerequisites": [reword_prereq(p) for p in prereqs_of(quiet)], "why": quiet.get("why"),
+                "prerequisites": reword_prereqs(prereqs_of(quiet)), "why": quiet.get("why"),
                 "source": "plan", "kind": "no_mail", "priority": _n(quiet.get("priority")), "verdict": verdict,
                 "notes": notes, "blockers": []}
     if current_policy(report, org) is None or gate_step.lower().startswith("unknown"):
@@ -1655,7 +1699,7 @@ def org_next(report, plan, org, own=None):
                 "blockers": [b for b in blocker_items(report, org, own) if b["kind"] != "data"]}
     if changes:
         c = changes[0]
-        prereqs = [reword_prereq(p) for p in prereqs_of(c)]
+        prereqs = reword_prereqs(prereqs_of(c))
         return {"label": plain(step_label(c)), "ref": c.get("id"), "prerequisites": prereqs,
                 "why": c.get("why"), "source": "plan", "kind": c.get("kind"), "priority": c.get("priority"),
                 "verdict": verdict, "notes": notes, "blockers": []}
@@ -2222,7 +2266,7 @@ def build_actions(report, plan, view, owners):
             why = plain(str(c.get("human_summary") or c.get("why") or "").strip())  # plan.py's plain words first
             if why:
                 action += " - " + why
-            pre = [reword_prereq(p) for p in prereqs_of(c)]
+            pre = reword_prereqs(prereqs_of(c))
             if pre:
                 action += " (before applying: %s)" % _join(pre)
             items.append({"kind": "dns", "keys": keys, "ref": c.get("id"), "domain": dom, "hook": dom, "action": action})
@@ -2501,9 +2545,9 @@ def open_questions(report, plan, org, nxt, owners, groups):
         return o["owner"] if o else "unassigned"
 
     for c in changes_for(plan, org):
-        for p in prereqs_of(c):
+        for text in reword_prereqs(prereqs_of(c)):
             qs.append({"question": "Can we confirm this before we %s (plan %s): %s?"
-                       % (step_label(c), c.get("id") or "?", reword_prereq(p)),
+                       % (step_label(c), c.get("id") or "?", text),
                        "owner": owner_for(c.get("domain"), c.get("owner_hint")), "kind": "prerequisite",
                        "ref": c.get("id")})
     if nxt and (nxt["source"] == "gate" or nxt.get("kind") == "first"):

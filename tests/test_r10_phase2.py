@@ -694,10 +694,10 @@ def test_g3_a_failed_totals_query_leaves_a_note_and_no_totals(monkeypatch):
     monkeypatch.setattr(collect.graph_client, "hunting", hunting)
     totals, notes = collect.pull_window_totals("tok", ["corp.example", "odd.example"], 30)
     assert totals is None
-    assert notes == ["mail log: full-window totals for corp.example not counted: HTTP 400 on hunting: the query ran out "
-                     "of resources",
-                     "mail log: full-window totals for odd.example not counted: the answer is not the totals "
-                     "maillog_totals.kql asks for"]
+    assert notes[0] == ("mail log: full-window totals for corp.example not counted: HTTP 400 on hunting: the query ran "
+                        "out of resources")
+    assert notes[1].startswith("mail log: full-window totals for odd.example not counted: the answer is not the totals "
+                               "maillog_totals.kql asks for - columns missing: ") and len(notes) == 2
     totals, notes = collect.pull_window_totals("tok", ["corp.example", "shop.example"], 30)
     assert list(totals["orgs"]) == ["shop.example"] and len(notes) == 2  # the one that answered is kept
     # a customized query without the placeholder line is a note too, never a crash
@@ -729,6 +729,7 @@ def test_g3_an_answer_that_counts_nothing_for_a_cut_org_is_no_count(monkeypatch)
     nothing = "the answer holds no mail under it, yet its rows were cut for holding too many"
     unusable = "the answer is not the totals maillog_totals.kql asks for"
     why = dict(n.split(" not counted: ", 1) for n in notes if " not counted" in n)  # {"... totals for <org>": why}
+    why = {k: v.split(" - ", 1)[0] for k, v in why.items()}  # the reason after " - " is checked in test_r11_scale
     why = {k.rsplit(" ", 1)[1]: v for k, v in why.items()}
     assert why == {"empty.example": nothing, "other.example": nothing, "bare.example": unusable,
                    "nulls.example": unusable, "lists.example": unusable, "text.example": unusable,
@@ -1120,8 +1121,8 @@ def test_collect_measures_mail_flow_once_per_run_and_counts_a_cut_orgs_whole_win
     t.totals = {"corp.example": {"schema": [{"name": "x"}], "results": [{"x": 1}]}}
     files, text = run(1500)  # the totals answer is unusable: a note, no totals, the floor alone
     assert "window_totals" not in files["report.json"]["maillog"]
-    assert ("mail log: full-window totals for corp.example not counted: the answer is not the totals "
-            "maillog_totals.kql asks for") in files["run.json"]["degraded"]
+    assert any(d.startswith("mail log: full-window totals for corp.example not counted: the answer is not the totals "
+                            "maillog_totals.kql asks for - ") for d in files["run.json"]["degraded"])
     assert "Advanced Hunting" not in text["summary.txt"]
 
     for answer in ({"schema": TOTALS["schema"], "results": []}, {}):  # no row, no results: never zero totals

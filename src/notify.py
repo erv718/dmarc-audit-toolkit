@@ -236,7 +236,7 @@ def sender_keys(report):
     if rows:  # the census names every envelope domain seen; the verdicts are no longer in report.json by default
         for r in rows:
             env = str(r.get("envelope_domain") or "").strip().lower() if isinstance(r, dict) else ""
-            if env and env != "(blank)":
+            if env and env != "(blank)" and _sender_envelope(r):
                 keys.add("envelope:" + env)
     else:
         for v in maillog.get("verdicts") or []:
@@ -244,6 +244,21 @@ def sender_keys(report):
             if env:
                 keys.add("envelope:" + env)
     return keys
+
+
+def _sender_envelope(row):
+    """Is a census envelope domain a sender identity worth remembering? One
+    that carried a message that did not fail, or whose failures are not all
+    read as spoofing. A domain every message from which failed as spoofing is
+    a spoofer's throwaway (a live tenant saw twenty thousand of them in a
+    month), not a sender to announce as new. A census without the counts
+    (an older report) keeps every envelope, as before."""
+    messages, failures = _whole(row.get("messages")), _whole(row.get("genuine_failures"))
+    if "messages" not in row or "genuine_failures" not in row:
+        return True
+    if messages > failures:
+        return True
+    return (row.get("likely_after") or row.get("likely")) not in ("likely_spoof",)
 
 
 def _key_label(key):

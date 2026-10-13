@@ -346,7 +346,31 @@ def _trim_rua(doc, keep):
                 doc["source_ips"] = [r.get("source_ip") for r in rows if isinstance(r, dict) and r.get("source_ip")]
             doc[key] = rows[:keep]
             doc.setdefault("truncated", {})[key] = {"kept": keep, "total": len(rows)}
+        for r in doc.get(key) or []:
+            _trim_row_lists(r)
     return doc
+
+
+ROW_LIST_CAP = 25  # entries kept per list inside one source row: a relay carries thousands of envelope domains
+
+
+def _trim_row_lists(row):
+    """Cut the lists inside one source or unknown-sender row to their
+    busiest ROW_LIST_CAP entries (by count when the entries carry one, else
+    the first ones), with <field>_total beside a cut list. A Microsoft relay
+    IP alone carried 3,000 envelope domains on a live tenant, 600 KB of
+    JSON per row that no reader needs whole."""
+    if not isinstance(row, dict):
+        return
+    for field in ("spf", "dkim", "envelope_from", "selectors", "reporters", "header_from", "spf_domains",
+                  "dkim_domains", "source_ips", "as_reported"):
+        items = row.get(field)
+        if not isinstance(items, list) or len(items) <= ROW_LIST_CAP:
+            continue
+        if all(isinstance(i, dict) for i in items):
+            items = sorted(items, key=lambda i: -(_count(i.get("count")) or 0))
+        row[field + "_total"] = len(items)
+        row[field] = items[:ROW_LIST_CAP]
 
 
 def _analyse(args, kwargs):
