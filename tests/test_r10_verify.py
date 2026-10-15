@@ -1126,7 +1126,11 @@ def test_a_monitoring_row_for_a_name_the_run_does_not_audit(run):
     # its section says it is not audited: no DNS looked up, no failed measurement, the census it does have
     md = verify.render(report, dict(plan, changes=plan["changes"] + [mono]))
     assert "- news.corp.example: not audited (only the plan names it), 1 plan row" in md
-    assert re.findall(r"^## (.+)$", md, re.M)[-3:] == ["news.corp.example", "Across the run", "Queries for the portal"]
+    # its section sits with its organization, in the one order every file follows (round 12): the headline's
+    # organization first, its own domain before the names below it, then each organization by name
+    assert re.findall(r"^## (.+)$", md, re.M)[1:] == ["corp.example", "hr.corp.example", "news.corp.example", "dup.example",
+                                                      "parked.example", "shop.example", "Across the run",
+                                                      "Queries for the portal"]
     sec = md.split("## news.corp.example\n", 1)[1].split("\n## ", 1)[0]
     assert "Not audited in this run: news.corp.example is not on the domain list, so its DNS was not looked up" in sec
     assert "None, and none looked for" in sec and "No DNS finding" not in sec

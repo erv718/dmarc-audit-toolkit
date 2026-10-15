@@ -685,9 +685,11 @@ def _after_exceptions(entries, what):
     return left, excepted
 
 
-def maillog_view(report):
+def maillog_view(report, headline=None):
     """What the document needs from the mail log: summaries when the report
     carries them, else derived from the verdicts. None when there is no mail log.
+    The envelope domains run worst first, a tie in the one order every list
+    of names follows (audit.domain_key, the headline's organization first).
 
     The lists that name senders are what the formal exceptions left: the
     census counts the excepted failures per stream (audit.py marks every
@@ -753,7 +755,7 @@ def maillog_view(report):
         by_env = by_env if by_env is not None else v_env
         by_sender = by_sender if by_sender is not None else v_snd
         view["basis"] = view["basis"] or "verdicts"
-    view["by_envelope"] = by_env or []
+    view["by_envelope"] = sorted(by_env or [], key=lambda e: (-e["count"], audit.domain_key(e["name"], headline)))
     view["by_sender"] = by_sender or []
     view["census_missing"] = by_env is None and by_sender is None
     view["excepted"] = excepted
@@ -1100,15 +1102,16 @@ def merge_trends(candidates):
     return out
 
 
-def _cut_reason(cut_orgs):
+def _cut_reason(cut_orgs, headline=None):
     """'the row budget cut the mail log for corp.example in the previous run',
     from {org: {"now": cut info or None, "previous": cut info or None}}: the
     orgs cut in each run, each run under the cause its own record names
     (none when it does not say; a budget that cut the previous run is never
-    said to have cut this one), 'and N more' past three."""
+    said to have cut this one), 'and N more' past three; the orgs named in
+    the one order every list follows (the headline's first)."""
     order = ("this run", "the previous run", "both runs")
     by_cause = {}
-    for org, sides in sorted(cut_orgs.items()):
+    for org, sides in sorted(cut_orgs.items(), key=lambda kv: (audit.domain_key(kv[0], headline), str(kv[0]))):
         now, prev = (sides.get("now"), sides.get("previous")) if isinstance(sides, dict) else (None, None)
         if now is None and prev is None:
             continue
@@ -1133,12 +1136,13 @@ def _report_orgs(report):
     return {org_domain(_dom(d)) for d in doms if _dom(d)}
 
 
-def _orgs_reason(orgs):
+def _orgs_reason(orgs, headline=None):
     """'shop.example audited in one of the two runs only', the delta's reason in the trend's words."""
-    return "%s audited in one of the two runs only" % audit._names(sorted(str(o) for o in orgs if o))
+    return "%s audited in one of the two runs only" % audit._names(
+        audit.order_domains([str(o) for o in orgs if o], headline))
 
 
-def apply_comparability(trend, delta, report, view):
+def apply_comparability(trend, delta, report, view, headline=None):
     """Drop a comparison the two runs cannot bear, and say why: failure
     counts when collect.py cut an organization's mail log in either run (the
     row budget keeps the newest hours of an org's pull; an hour can stay at
@@ -1160,15 +1164,15 @@ def apply_comparability(trend, delta, report, view):
         # the delta's own reasons, each as it recorded it: the cuts, an organization audited in one run only
         # (the whole log then covers different populations), the spans
         if isinstance(mw.get("cut_orgs"), dict) and mw["cut_orgs"]:
-            fail_why.append(_cut_reason(mw["cut_orgs"]))
+            fail_why.append(_cut_reason(mw["cut_orgs"], headline))
         shared = mw.get("orgs_not_shared") if isinstance(mw.get("orgs_not_shared"), list) else []
         if shared:
-            fail_why.append(_orgs_reason(shared))
+            fail_why.append(_orgs_reason(shared, headline))
         if mw.get("log_comparable") is False:
             fail_why.append("the two mail logs cover very different spans")
     elif fail_ok is False:  # a delta from before the cuts were recorded named the domains whose own spans differed
         listed = mw.get("domains_not_comparable")
-        names = sorted(str(d) for d in listed if d) if isinstance(listed, list) else []
+        names = audit.order_domains([str(d) for d in listed if d], headline) if isinstance(listed, list) else []
         if names:
             fail_why.append("the mail-log rows of %s cover very different spans in the two runs" % audit._names(names))
     elif fail_ok is None and None not in (t.get("previous_genuine_failures"), (view or {}).get("genuine_failures")):
@@ -1179,10 +1183,10 @@ def apply_comparability(trend, delta, report, view):
         prev_cut = audit._dict(t.get("previous_cuts"))
         if now_cut or prev_cut:
             fail_why.append(_cut_reason({org: {"now": now_cut.get(org), "previous": prev_cut.get(org)}
-                                         for org in set(now_cut) | set(prev_cut)}))
+                                         for org in set(now_cut) | set(prev_cut)}, headline))
         prev_orgs, now_orgs = t.get("previous_orgs"), _report_orgs(report)
         if isinstance(prev_orgs, list) and now_orgs and set(prev_orgs) != now_orgs:
-            fail_why.append(_orgs_reason(set(prev_orgs) ^ now_orgs))
+            fail_why.append(_orgs_reason(sorted(set(prev_orgs) ^ now_orgs, key=str), headline))
         if not audit._spans_comparable(audit._hours(audit._dict(report.get("maillog")).get("window")),
                                        audit._hours({"hours": t.get("previous_maillog_hours")})):
             fail_why.append("the two mail logs cover very different spans")
@@ -1562,6 +1566,43 @@ def pick_org(report, org_name=None):
         if org_domain(d) == d:
             return d
     return head or names[0]
+
+
+def headline_org(report, org_name=None):
+    """The organization every file of a run leads with: the one this
+    document leads with (pick_org - --org-name, else the gate's headline by
+    the rules above), as its organizational domain, which is what
+    audit.domain_key and audit.order_domains put first. plan.py, todo.md,
+    summary.txt and verify.md take it from here, so each lists the same
+    family first. None when no domain can be chosen - a report that names
+    none, or one too damaged to read: there is no headline then, and every
+    list keeps plain organization order (never a failed run)."""
+    if not isinstance(report, dict):
+        return None
+    try:
+        name = _dom(pick_org(report, org_name))
+    except Exception:  # no domain to choose from, or a damaged report: no headline
+        return None
+    return org_domain(name) if name else None
+
+
+def _domain_of(value):
+    """The domain name a value names: itself when it is one, the part after
+    the @ of an address; '' for anything else (an IP, a rule name, a
+    placeholder such as '(no header_from)'). What an action or a question
+    concerns, as a name audit.domain_key can place."""
+    text = _dom(value)
+    if "@" in text:
+        text = text.rpartition("@")[2]
+    if not re.fullmatch(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)+", text) or re.fullmatch(r"[0-9.]+", text):
+        return ""
+    return text
+
+
+def _ordered(names, headline=None):
+    """The domain names among values (addresses count by their domain), each
+    once, in the one order every list follows (audit.order_domains)."""
+    return audit.order_domains([_domain_of(n) for n in names or ()], headline)
 
 
 def policy_tags(report, domain):
@@ -2171,10 +2212,11 @@ def _delivered_line(ddf, gone, view, policy):
     return text + ((" - " + "; ".join(parts)) if parts else "") + ((" (%s)" % named) if named else "")
 
 
-def where_we_stand(report, view, trend, window=None, policy=None):
+def where_we_stand(report, view, trend, window=None, policy=None, headline=None):
     """The four 'Where we stand' lines, as data and as text. policy: the
     organization domain's, which says whether a delivered failure with no
-    override recorded is the policy's own doing (p=none)."""
+    override recorded is the policy's own doing (p=none); headline: the
+    organization a list of them names first."""
     rua = report.get("rua") if isinstance(report.get("rua"), dict) else None
     tot = (rua or {}).get("totals") or {}
     lines, data = [], {"window": window or window_of(report)}
@@ -2214,6 +2256,7 @@ def where_we_stand(report, view, trend, window=None, policy=None):
                      "; the log export was cut short (%s), so this count is a floor" % view["truncation"])
         full = full_window(report)
         if full:  # beside the floor, never instead of it: every verdict still rests on the rows kept
+            full["orgs"] = audit.order_domains(full["orgs"], headline)
             data["window_totals"] = full
             floor = cut_org_floor(report, full["orgs"])
             data["window_totals"]["floor"] = floor
@@ -2445,7 +2488,14 @@ def _unread_step(report, domain):
     return "publish a monitoring-only DMARC record so reports start (no record found)"
 
 
-def per_domain(report, plan):
+def per_domain(report, plan, headline=None):
+    """One row per audited name, in the one order every list follows
+    (audit.domain_key: the headline's organization first, then each
+    organization by name, its organizational domain before the names below
+    it). Subdomains share a row only when they sit next to each other in
+    that order and share their organization, policy, gate, next step and
+    mail flow, so a merged row never pulls a name out of its place. Each
+    row carries its organization (org) for readers that group by it."""
     gate_domains = (report.get("gate") or {}).get("domains") or {}
     gate_domains = gate_domains if isinstance(gate_domains, dict) else {}
     planned = audit._dict(plan).get("domains")
@@ -2456,7 +2506,7 @@ def per_domain(report, plan):
         covered = audit._dict(audit._dict(report.get("rua")).get("totals")).get("domains")
         names = [str(d) for d in (covered if isinstance(covered, list) else [])]
     names = list(dict.fromkeys(n.lower() for n in names if n))
-    names.sort(key=lambda d: (org_domain(d), d != org_domain(d), d))
+    names.sort(key=lambda d: audit.domain_key(d, headline))
     bd = (report.get("maillog") or {}).get("by_domain") if isinstance(report.get("maillog"), dict) else None
     bd = bd if isinstance(bd, dict) else {}
     mf = report.get("mailflow") if isinstance(report.get("mailflow"), dict) else {}
@@ -2521,22 +2571,25 @@ def per_domain(report, plan):
                      "maillog": ({k: _n(ml.get(k)) for k in ("logical_messages", "genuine_failures",
                                                               "delivered_despite_fail")} if ml else None),
                      "mailflow": flow, "mailflow_text": audit.mailflow_text(flow, mf.get("days"))})
-    grouped = OrderedDict()
+    groups, last = [], None
     for r in rows:
-        if r["domain"] == r["apex"]:
-            key = ("apex", r["domain"])
-        else:  # subdomains share a row only when they also share what their mail flow says
-            key = ("sub", r["apex"], r["policy_today"], r["gate"], r["next_step"], r["mailflow_text"])
-        grp = grouped.setdefault(key, {"domains": [], "policy_today": r["policy_today"], "gate": r["gate"],
-                                       "gate_text": r["gate_text"], "next_step": r["next_step"], "plan_ids": [],
-                                       "maillog": {}, "mailflow_text": r["mailflow_text"], "mailflow": {}})
+        # an organizational domain keeps a row of its own; subdomains share one only with the row right above
+        # them, and only when they also share what their mail flow says
+        key = None if r["domain"] == r["apex"] else (r["apex"], r["policy_today"], r["gate"], r["next_step"],
+                                                      r["mailflow_text"])
+        if key is None or key != last:
+            groups.append({"domains": [], "org": r["apex"], "policy_today": r["policy_today"], "gate": r["gate"],
+                           "gate_text": r["gate_text"], "next_step": r["next_step"], "plan_ids": [], "maillog": {},
+                           "mailflow_text": r["mailflow_text"], "mailflow": {}})
+        last = key
+        grp = groups[-1]
         grp["domains"].append(r["domain"])
         grp["plan_ids"] += r["plan_ids"]
         if r["maillog"]:
             grp["maillog"][r["domain"]] = r["maillog"]
         if r["mailflow"]:
             grp["mailflow"][r["domain"]] = r["mailflow"]
-    return list(grouped.values())
+    return groups
 
 
 def render_per_domain(groups):
@@ -2621,15 +2674,39 @@ def override_action(by, count, recorded=False, policy=None):
         because, "; ".join(fixes), "it" if single else "them")
 
 
-def build_actions(report, plan, view, owners):
+# The order of an owner's items: the zero-risk records bundle, the other plan rows (in plan order), sender fixes,
+# overrides, outside and unknown sources, then the other findings
+ACTION_ORDER = {"p1summary": 0, "dns": 1, "sender": 2, "override": 3, "stream": 4, "spoof": 4, "spf_only": 4,
+                "finding": 5}
+# an owner group this big that spans two organizations or more is shown with one line per organization
+GROUP_BY_ORG = 6
+
+
+def _item_key(item, pos, headline=None, plan_pos=0):
+    """Where an item sits in its owner group: by kind (ACTION_ORDER); a plan
+    row then by its place in the plan (plan_pos), whose own order is
+    already priority, DNS host, zone and domain; anything else by
+    organization (the headline's first, a tenant-wide item last), then
+    domain, then the order it was built in (pos)."""
+    doms = item.get("domains") or []
+    return (ACTION_ORDER.get(item.get("kind"), len(ACTION_ORDER)), plan_pos if item.get("kind") == "dns" else 0,
+            not doms, audit.domain_key(item.get("org") or "", headline),
+            audit.domain_key(doms[0] if doms else "", headline), pos)
+
+
+def build_actions(report, plan, view, owners, headline=None):
     """Every plan change and every actionable finding as an item with the keys
-    it is matched to an owner by, then grouped by owner."""
+    it is matched to an owner by, then grouped by owner. Each item names the
+    domains it concerns (domains, in the one order every list follows; []
+    for a tenant-wide one) and the organization of the first (org), and an
+    owner's items run in ACTION_ORDER (_item_key) with the headline's
+    organization first."""
     items = []
     findings = [f for f in (report.get("findings") or []) if isinstance(f, dict)]
     ids_present = {f.get("id") for f in findings}
     covered = set()
 
-    for c in plan_changes(plan):
+    for pos, c in enumerate(plan_changes(plan)):
         dom = (c.get("domain") or "").lower()
         keys = [dom, str(c.get("owner_hint") or "").lower()]
         prio = _n(c.get("priority"))
@@ -2646,7 +2723,8 @@ def build_actions(report, plan, view, owners):
             pre = reword_prereqs(prereqs_of(c))
             if pre:
                 action += " (before applying: %s)" % _join(pre)
-            items.append({"kind": "dns", "keys": keys, "ref": c.get("id"), "domain": dom, "hook": dom, "action": action})
+            items.append({"kind": "dns", "keys": keys, "ref": c.get("id"), "domain": dom, "hook": dom, "action": action,
+                          "domains": [dom] if dom else [], "plan_pos": pos})
         for fid in c.get("finding_ids") or []:
             covered.add(("dns:" + dom, fid))
 
@@ -2676,14 +2754,16 @@ def build_actions(report, plan, view, owners):
             if detail:
                 action += " (%s)" % detail
             items.append({"kind": "sender", "keys": [s["name"], s.get("domain"), s.get("envelope")], "ref": ref,
-                          "sender": s["name"], "hook": hook, "action": action})
+                          "sender": s["name"], "hook": hook, "action": action,
+                          "domains": _ordered([s.get("domain") or s["name"]], headline)})
         rest = own_all[SENDER_ITEMS_CAP:]
         if rest:
             total = sum(s["count"] for s in rest)
             items.append({"kind": "sender", "keys": [], "ref": ref,
                           "hook": "%d more senders with %d %s between them" % (len(rest), total, _plural(total, "message")),
                           "action": "work through them from the census in report.json (maillog.census); "
-                                    "none is a headline on its own"})
+                                    "none is a headline on its own",
+                          "domains": _ordered([s.get("domain") or s["name"] for s in rest], headline)})
         if spoof:
             total = sum(s["count"] for s in spoof)
             k = len({s["name"] for s in spoof})
@@ -2699,7 +2779,8 @@ def build_actions(report, plan, view, owners):
             action = "confirm none of them is ours, then leave them to the policy"
             if top_env:
                 action += " (most came in via %s%s)" % (top_env, (", as %s" % top_dom) if top_dom else "")
-            items.append({"kind": "spoof", "keys": [top_dom, top_env], "ref": ref, "hook": hook, "action": action})
+            items.append({"kind": "spoof", "keys": [top_dom, top_env], "ref": ref, "hook": hook, "action": action,
+                          "domains": _ordered([s.get("domain") or s["name"] for s in spoof], headline)})
         if view["by_sender"] or view["genuine_failures"] == 0 or view.get("excepted"):
             covered.add(("maillog", "MAILFLOW-001"))  # nothing left to work: every named failure is excepted
         ref = "MAILFLOW-002" if "MAILFLOW-002" in ids_present else "mail log"
@@ -2713,7 +2794,8 @@ def build_actions(report, plan, view, owners):
                 "find the override (transport rule, allow list, safe sender) that let them in and make it "
                 "conditional on authentication; outside receivers do not have it")
             items.append({"kind": "override", "keys": [s["name"], s.get("domain"), s.get("envelope")], "ref": ref,
-                          "sender": s["name"], "hook": hook, "action": action})
+                          "sender": s["name"], "hook": hook, "action": action,
+                          "domains": _ordered([s.get("domain") or s["name"]], headline)})
         rest = ddf[TOP_ENTRIES:]
         if rest:
             total = sum(s["count"] for s in rest)
@@ -2722,7 +2804,8 @@ def build_actions(report, plan, view, owners):
                                   % (len(rest), _plural(len(rest), "sender"), total, _plural(total, "message")),
                           "action": "find the overrides that let them in from the census in report.json "
                                     "(maillog.census, delivered_despite_fail per sender) and make each conditional "
-                                    "on authentication"})
+                                    "on authentication",
+                          "domains": _ordered([s.get("domain") or s["name"] for s in rest], headline)})
         delivered = view["delivered_despite_fail"]
         if ddf or delivered == 0 or (delivered is not None and delivered <= (view.get("delivered_excepted") or 0)):
             covered.add(("maillog", "MAILFLOW-002"))
@@ -2751,7 +2834,7 @@ def build_actions(report, plan, view, owners):
             if sig:  # whole: the signal that decided the label is often the second one
                 action += " (%s)" % sig
             items.append({"kind": "stream", "keys": hf + [org_domain(h) for h in hf], "ref": ref,
-                          "hook": hook, "action": action})
+                          "hook": hook, "action": action, "domains": _ordered(hf, headline)})
         if spoof_fs:
             total = sum(f for _, _, f in spoof_fs)
             disp = Counter()
@@ -2766,7 +2849,8 @@ def build_actions(report, plan, view, owners):
             action = "confirm none of the IPs is ours; receivers reported %s" % (seen or "no dispositions")
             if disp.get("none"):
                 action += " - the ones delivered (disposition none) are what the next policy step is for"
-            items.append({"kind": "spoof", "keys": [top], "ref": ref, "hook": hook, "action": action})
+            items.append({"kind": "spoof", "keys": [top], "ref": ref, "hook": hook, "action": action,
+                          "domains": _ordered(hf_all, headline)})
         covered.add(("rua", "OUTSIDE-001"))
         ref = "OUTSIDE-003" if "OUTSIDE-003" in ids_present else "aggregate reports"
         for s in [s for s in (rua.get("spf_only_senders") or []) if isinstance(s, dict)]:
@@ -2778,7 +2862,7 @@ def build_actions(report, plan, view, owners):
             if spf_doms:
                 action += "; its envelope domain is %s" % ", ".join(spf_doms[:2])
             items.append({"kind": "spf_only", "keys": hf + spf_doms + [org_domain(h) for h in hf], "ref": ref,
-                          "hook": hook, "action": action})
+                          "hook": hook, "action": action, "domains": _ordered(hf, headline)})
         covered.add(("rua", "OUTSIDE-003"))
 
     for f in findings:
@@ -2799,7 +2883,9 @@ def build_actions(report, plan, view, owners):
         text = (title + " - " + action) if title and action else (title or action)
         if f.get("verified") is False:
             text += " (not verified)"
-        items.append({"kind": "finding", "keys": keys, "ref": f.get("id"), "hook": hook, "action": text})
+        # a DNS finding concerns its domain, any other the domain its object names (none: tenant-wide)
+        items.append({"kind": "finding", "keys": keys, "ref": f.get("id"), "hook": hook, "action": text,
+                      "domains": _ordered([src[4:]] if src.startswith("dns:") else [f.get("object")], headline)})
 
     groups = OrderedDict()
     for name in dict.fromkeys(o["owner"] for o in owners):
@@ -2834,17 +2920,32 @@ def build_actions(report, plan, view, owners):
                           + ("; %d %s a subdomain at the p=quarantine it follows today, not a p=none monitoring "
                              "record" % (keeps, "keeps" if keeps == 1 else "keep") if keeps else ""),
                           "ref": ("plan " + id_range(ids)) if ids else None,
-                          "kind": "p1summary", "domains": [i["domain"] for i in p1]})
+                          "kind": "p1summary", "domains": _ordered([i["domain"] for i in p1], headline)})
         for i in rest:
             lines.append({"hook": i["hook"], "action": i["action"], "ref": i["ref"], "kind": i["kind"],
-                          "matched_by": i.get("matched_by")})
-        out.append({"owner": g["owner"], "channel": g["channel"], "items": lines})
+                          "matched_by": i.get("matched_by"), "domains": list(i.get("domains") or [])})
+        plan_pos = [0] * (len(lines) - len(rest)) + [i.get("plan_pos", 0) for i in rest]
+        for line in lines:
+            line["org"] = org_domain(_dom(line["domains"][0])) if line["domains"] else ""
+        order = sorted(range(len(lines)), key=lambda k: _item_key(lines[k], k, headline, plan_pos[k]))
+        out.append({"owner": g["owner"], "channel": g["channel"], "items": [lines[k] for k in order]})
     return out
 
 
-def render_actions(groups, failing=None):
+def _action_line(item, pad):
+    """One owner's item as a markdown list line, indented by pad: its hook in bold, the action, the reference."""
+    ref = (" (%s)" % item["ref"]) if item.get("ref") else ""
+    return "%s- **%s** %s%s" % (pad, item["hook"], item["action"], ref)
+
+
+def render_actions(groups, failing=None, headline=None):
     """The owner groups as markdown; failing (the document's What is failing
-    data) says why nothing is left when the exceptions took it all."""
+    data) says why nothing is left when the exceptions took it all. An owner
+    group of GROUP_BY_ORG items or more that spans two organizations or more
+    gets one line per organization (the headline's first, then by name)
+    with its items under it in their order, and the tenant-wide items last
+    under Tenant-wide; a smaller group, or one an older document's items
+    carry no organization for, stays one flat list in its order."""
     L = []
     if not any(g["items"] for g in groups):
         if (failing or {}).get("excepted") or (failing or {}).get("outside_excepted"):
@@ -2853,9 +2954,17 @@ def render_actions(groups, failing=None):
         return ["- Nothing to do this week: no plan changes and no actionable findings in this run."]
     for g in groups:
         L.append("- **%s**" % g["owner"] + (" (%s)" % g["channel"] if g["channel"] else ""))
-        for i in g["items"]:
-            ref = (" (%s)" % i["ref"]) if i.get("ref") else ""
-            L.append("  - **%s** %s%s" % (i["hook"], i["action"], ref))
+        items = g["items"]
+        orgs = audit.order_domains(sorted({_dom(i.get("org")) for i in items if _dom(i.get("org"))}), headline)
+        if len(items) < GROUP_BY_ORG or len(orgs) < 2:
+            L += [_action_line(i, "  ") for i in items]
+            continue
+        parts = [(o, [i for i in items if _dom(i.get("org")) == o]) for o in orgs]
+        parts.append(("Tenant-wide", [i for i in items if not _dom(i.get("org"))]))
+        for name, part in parts:
+            if part:
+                L.append("  - **%s** - %d %s" % (name, len(part), _plural(len(part), "item")))
+                L += [_action_line(i, "    ") for i in part]
     return L
 
 
@@ -2926,7 +3035,29 @@ def build_ask(plan, org, nxt, policy):
     return "The ask this week: " + _join(parts, "and") + "."
 
 
-def open_questions(report, plan, org, nxt, owners, groups):
+# the order open questions run in, kind by kind (any other kind follows, by name), and each kind in plain words
+QUESTION_KINDS = OrderedDict([("blocker", "Blockers"), ("prerequisite", "Prerequisites"), ("hold", "Plan holds"),
+                              ("gap", "Gaps"), ("unverified", "Not verified yet"), ("unassigned", "Needs an owner")])
+
+
+def _question_key(q, headline=None):
+    """Where an open question sits: by kind (QUESTION_KINDS, any other kind
+    after them by name), then organization (the headline's first, a
+    tenant-wide question last), then domain, then its text (as a reader
+    alphabetizes it: case aside)."""
+    kind = str(q.get("kind") or "")
+    known = list(QUESTION_KINDS)
+    doms = q.get("domains") or []
+    text = str(q.get("question") or "")
+    return (known.index(kind) if kind in known else len(known), "" if kind in known else kind, not doms,
+            audit.domain_key(q.get("org") or "", headline), audit.domain_key(doms[0] if doms else "", headline),
+            text.casefold(), text)
+
+
+def open_questions(report, plan, org, nxt, owners, groups, headline=None):
+    """The questions the run leaves open, each with the domains it concerns
+    (domains, in the one order every list follows; [] for a tenant-wide
+    one) and the organization of the first (org), in _question_key order."""
     qs = []
 
     def owner_for(*keys):
@@ -2938,7 +3069,7 @@ def open_questions(report, plan, org, nxt, owners, groups):
             qs.append({"question": "Can we confirm this before we %s (plan %s): %s?"
                        % (step_label(c), c.get("id") or "?", text),
                        "owner": owner_for(c.get("domain"), c.get("owner_hint")), "kind": "prerequisite",
-                       "ref": c.get("id")})
+                       "ref": c.get("id"), "domains": _ordered([c.get("domain")], headline)})
     if nxt and nxt.get("kind") not in ("no_mail", "park"):
         at_end = nxt["label"].lower().startswith("none")
         # the gate's blockers that hold this step: all of them for a gate step, the ones its row does not carry
@@ -2964,10 +3095,12 @@ def open_questions(report, plan, org, nxt, owners, groups):
                 q = "Can we close this gap on %s (enforcement does not fix it by itself): %s?" % (org, b["text"])
             else:
                 q = "Can we clear this before we %s on %s: %s?" % (nxt["label"], org, b["text"])
-            qs.append({"question": q, "owner": owner_for(org), "kind": "blocker", "ref": None})
+            qs.append({"question": q, "owner": owner_for(org), "kind": "blocker", "ref": None,
+                       "domains": _ordered([org], headline)})
     for h in holds_for(plan):
         qs.append({"question": "%s: %s - who decides?" % (h.get("domain") or org, plain(h.get("reason") or "")),
-                   "owner": owner_for(h.get("domain")), "kind": "hold", "ref": None})
+                   "owner": owner_for(h.get("domain")), "kind": "hold", "ref": None,
+                   "domains": _ordered([h.get("domain") or org], headline)})
     for f in (report.get("findings") or []):
         if not isinstance(f, dict) or f.get("verified", True):
             continue
@@ -2975,13 +3108,15 @@ def open_questions(report, plan, org, nxt, owners, groups):
         keys = [src[4:]] if src.startswith("dns:") else [f.get("object") or "", org if src in ("rua", "maillog") else ""]
         qs.append({"question": "Is this right (%s, a heuristic, not verified): %s?"
                    % (f.get("id") or "finding", plain(f.get("title") or "")),
-                   "owner": owner_for(*keys), "kind": "unverified", "ref": f.get("id")})
+                   "owner": owner_for(*keys), "kind": "unverified", "ref": f.get("id"),
+                   "domains": _ordered([src[4:]] if src.startswith("dns:") else [f.get("object")], headline)})
     for g in groups:
         if g["owner"] != UNASSIGNED:
             continue
         for i in g["items"]:
             qs.append({"question": "Who owns this: %s%s?" % (i["hook"], (" (%s)" % i["ref"]) if i.get("ref") else ""),
-                       "owner": "unassigned", "kind": "unassigned", "ref": i.get("ref")})
+                       "owner": "unassigned", "kind": "unassigned", "ref": i.get("ref"),
+                       "domains": list(i.get("domains") or [])})
     # byte-identical questions (the same heuristic once per header file) collapse into one, counted
     merged = OrderedDict()
     for q in qs:
@@ -2990,7 +3125,28 @@ def open_questions(report, plan, org, nxt, owners, groups):
             merged[key]["count"] += 1
         else:
             merged[key] = dict(q, count=1)
-    return list(merged.values())
+    out = list(merged.values())
+    for q in out:
+        q["org"] = org_domain(_dom(q["domains"][0])) if q["domains"] else ""
+    return sorted(out, key=lambda q: _question_key(q, headline))
+
+
+def render_questions(questions):
+    """The open questions as markdown: one bold line per kind in plain words
+    (QUESTION_KINDS; any other kind spelled out) with how many it holds,
+    and its questions listed under it in their order."""
+    kinds = OrderedDict()
+    for q in questions:
+        kinds.setdefault(str(q.get("kind") or ""), []).append(q)
+    L = []
+    for kind, qs in kinds.items():
+        if L:
+            L.append("")
+        name = QUESTION_KINDS.get(kind) or kind.replace("_", " ").capitalize() or "Other questions"
+        L.append("**%s (%d)**" % (name, len(qs)))
+        L += ["- %s%s (owner: %s)" % (q["question"], (" x %d" % q["count"]) if q.get("count", 1) > 1 else "",
+                                      q["owner"]) for q in qs]
+    return L
 
 
 def audit_notes(nxt, plan, org):
@@ -3070,8 +3226,9 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
     owners = list(owners or [])
     audience = (audience or DEFAULT_AUDIENCE).strip().rstrip(".") or DEFAULT_AUDIENCE
     org = pick_org(report, org_name)
+    head = org_domain(_dom(org))  # the organization every list of names leads with (headline_org)
     date = date or _day(report.get("generated_utc")) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    view = maillog_view(report)
+    view = maillog_view(report, head)
     rua = report.get("rua") if isinstance(report.get("rua"), dict) else None
     policy_str, pct = policy_text(report, org)
     policy = current_policy(report, org)
@@ -3096,13 +3253,13 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
     trend = merge_trends([trend_from_delta(delta, now_gf, now_pr),
                           trend_from_report(previous),
                           trend_from_metrics(metrics, report, view) if metrics else None])
-    trend = apply_comparability(trend, delta, report, view)
-    stand = where_we_stand(report, view, trend, window, policy)
+    trend = apply_comparability(trend, delta, report, view, head)
+    stand = where_we_stand(report, view, trend, window, policy, head)
     failing, failing_lines = what_is_failing(report, view)
-    domains = per_domain(report, plan)
-    groups = build_actions(report, plan, view, owners)
+    domains = per_domain(report, plan, head)
+    groups = build_actions(report, plan, view, owners, head)
     ask = build_ask(plan, org, nxt, policy)
-    questions = open_questions(report, plan, org, nxt, owners, groups)
+    questions = open_questions(report, plan, org, nxt, owners, groups, head)
     strm_data = None
     if strm is not None:
         strm_data = {"basis": strm["basis"], "scope": strm.get("scope")}
@@ -3184,7 +3341,7 @@ def render_md(doc):
     L.append("")
     L.append("## What happens next, by owner")
     L.append("")
-    L += render_actions(doc["actions_by_owner"], doc["failing"])
+    L += render_actions(doc["actions_by_owner"], doc["failing"], doc.get("org_domain"))
     L.append("")
     L.append("## The ask")
     L.append("")
@@ -3193,8 +3350,7 @@ def render_md(doc):
     L.append("## Open questions")
     L.append("")
     if doc["open_questions"]:
-        L += ["- %s%s (owner: %s)" % (q["question"], (" x %d" % q["count"]) if q.get("count", 1) > 1 else "", q["owner"])
-              for q in doc["open_questions"]]
+        L += render_questions(doc["open_questions"])
     else:
         L.append("- None from this run.")
     L.append("")

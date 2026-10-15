@@ -880,7 +880,12 @@ def update_senders(path, report, stamp, notes=None):
 def render_todo(report, plan, caveats=()):
     """todo.md: one prioritised list to work top to bottom, assembled from what
     report.json and plan.json already say. Nothing new is inferred here, and
-    every line says which file holds the evidence."""
+    every line says which file holds the evidence. The domains run in the one
+    order every file follows, led by the organization the status document
+    leads with (next_steps.headline_org); the plan's rows and holds in the
+    plan's own order, which is that order already; senders ranked by count,
+    a tie in that order."""
+    headline = next_steps.headline_org(report)
     gate = report.get("gate") or {}
     exc = gate.get("exceptions") or {}
     excepted_ips = set(exc.get("excepted_streams") or [])
@@ -906,7 +911,7 @@ def render_todo(report, plan, caveats=()):
         if c.get("kind") == "park" or (c.get("kind") == "new" and c.get("hostname") == "_dmarc.%s" % c.get("domain")):
             own.setdefault(c["domain"], []).append(c)
     dns = report.get("dns") if isinstance(report.get("dns"), dict) else {}
-    for d, g in sorted(per.items()):
+    for d, g in sorted(per.items(), key=lambda kv: (audit.domain_key(kv[0], headline), str(kv[0]))):
         if d in quiet:
             left = audit.ramp_blockers_left(report, d)
             L.append("- %s: p=%s, next step: no mail measured, quarantine now (%s, section 2); the gate's %s %s"
@@ -982,7 +987,9 @@ def render_todo(report, plan, caveats=()):
         return out, gone
 
     def tops(senders):
-        return "; ".join("%s x%d" % kv for kv in sorted(senders.items(), key=lambda kv: (-kv[1], kv[0]))[:5])
+        """The busiest five, a tie by the sender's domain in the one order, then by address."""
+        return "; ".join("%s x%d" % kv for kv in sorted(senders.items(), key=lambda kv: (
+            -kv[1], audit.domain_key(str(kv[0]).rpartition("@")[2], headline), kv[0]))[:5])
 
     for f in ml.get("findings") or []:
         if f.get("id") not in ("MAILFLOW-001", "MAILFLOW-002"):

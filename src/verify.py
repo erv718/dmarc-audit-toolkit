@@ -56,6 +56,7 @@ import audit
 import dedupe
 import discover
 import dns_audit
+import next_steps  # the organization the status document leads with, which the sections lead with too
 import plan as plan_mod
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -547,7 +548,7 @@ def maillog_steps(report, domain):
                                                               window_note(report, domain, 7))))
     st = _d(c.get("subdomains_total"))
     if _n(st.get("logical_messages")):
-        subs = [str(s) for s in _l(st.get("domains"))]
+        subs = audit.order_domains([str(s) for s in _l(st.get("domains"))])  # one organization's: no headline needed
         full = [full_window(report, _name(s))[1] for s in subs]
         if subs and all(isinstance(x, dict) for x in full):
             counted = ("come to about total %d and genuine_failures %d, the full-window counts collect.py took in "
@@ -1000,9 +1001,11 @@ def dns_finding_steps(f, domain, report):
 # ------------------------------------------------------------------ mail-log findings
 
 def _domains_by(report, key, cap=5):
-    """(audited domain, its own count of key) for the domains carrying any, the most first."""
+    """(audited domain, its own count of key) for the domains carrying any, the most first, a tie in the one
+    order every list of names follows (the status document's organization first)."""
     rows = [(d, _n(c.get(key)) or 0) for d, c in _buckets(report).items()]
-    return sorted([r for r in rows if r[1] and _ok(r[0])], key=lambda r: (-r[1], r[0]))[:cap]
+    head = next_steps.headline_org(report)
+    return sorted([r for r in rows if r[1] and _ok(r[0])], key=lambda r: (-r[1], audit.domain_key(r[0], head)))[:cap]
 
 
 def _csv_path(report):
@@ -1721,10 +1724,12 @@ def prerequisite_steps(change, report):
         elif "_dmarc record" in text and _ok(domain):
             # the sending subdomains the prerequisite names (audited or not), the unaudited ones whose own record DNS
             # showed in this run (report.dns_extra: the plan counts them as covered), then the audited ones
-            seen = sorted(n for n, x in plan_mod.dns_extra(report).items()
-                          if n.endswith("." + domain) and plan_mod.has_own_record(n, x))
+            seen = audit.order_domains([n for n, x in plan_mod.dns_extra(report).items()
+                                        if n.endswith("." + domain) and plan_mod.has_own_record(n, x)])
             named = re.findall(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)+", text.lower()) + seen + _names_in_order(report, [], [])
-            subs = [s for s in dict.fromkeys(named) if s.endswith("." + domain) and _ok("_dmarc." + s)][:6]
+            # the first six named, looked up in the one order every list of names follows (one organization's)
+            subs = audit.order_domains([s for s in dict.fromkeys(named)
+                                        if s.endswith("." + domain) and _ok("_dmarc." + s)][:6])
             have = [s for s in subs if s in seen]
             if subs:
                 once("own_records", [step("dns", "Look up the subdomains' own records: each answers with a v=DMARC1 "
@@ -1943,16 +1948,21 @@ def _finding_head(f, level="####"):
                                   "" if f.get("verified", True) else " (not verified)")
 
 
-def _names_in_order(report, changes, holds):
+def _names_in_order(report, changes, holds, headline=None):
+    """Every name the run audits or the plan names, each once, in the one order
+    every list of names follows (audit.domain_key: the headline's
+    organization first, each organization's own domain before the names
+    below it)."""
     names = [_name(d) for d in _l(_d(report.get("inputs")).get("domains"))]
     names += [_name(d) for d in _d(_d(report.get("gate")).get("domains"))]
     names += [_name(d) for d in _d(report.get("dns"))]
     names += [_name(c.get("domain")) for c in changes] + [_name(h.get("domain")) for h in holds]
-    return [n for n in dict.fromkeys(names) if n]
+    return audit.order_domains(names, headline)
 
 
-def _orgs(names):
-    return sorted({org_of(d) for d in names if _ok(d) and _ok(org_of(d))})
+def _orgs(names, headline=None):
+    """The organizations of names, in that same order."""
+    return audit.order_domains({org_of(d) for d in names if _ok(d) and _ok(org_of(d))}, headline)
 
 
 def build(report, plan=None):
@@ -1962,13 +1972,16 @@ def build(report, plan=None):
     findings = [f for f in _l(report.get("findings")) if isinstance(f, dict)]
     changes = [c for c in _l((plan or {}).get("changes")) if isinstance(c, dict)]
     holds = [h for h in _l((plan or {}).get("holds")) if isinstance(h, dict)]
-    names = _names_in_order(report, changes, holds)
+    # one section per name, in the order the status document's own lists follow; each section's plan rows keep
+    # the plan's order
+    headline = next_steps.headline_org(report)
+    names = _names_in_order(report, changes, holds, headline)
     mine = {}
     for f in findings:
         d = finding_domain(f)
         if d:
             mine.setdefault(d, []).append(f)
-    names += [d for d in mine if d not in names]
+    names = audit.order_domains(names + [d for d in mine if d not in names], headline)
     across = [f for f in findings if not finding_domain(f)]
     places = {str(f.get("id")): "Across the run" for f in across}
     gates = _d(_d(report.get("gate")).get("domains"))
@@ -2162,7 +2175,7 @@ def build(report, plan=None):
         _steps_md(L, finding_steps(f, report))
 
     files = {}
-    for org in _orgs(names):
+    for org in _orgs(names, headline):
         for name in ORG_QUERIES:
             files[query_path(name, org)] = (name, org)
     for m in FILE_RX.finditer("\n".join(L)):
@@ -2176,7 +2189,7 @@ def build(report, plan=None):
              "sets its own window in its text (ago(30d), or ago(7d) for genuine_failures), so where the portal's time "
              "range control applies, set it to cover the same window." % PORTAL)
     L.append("")
-    for path in sorted(files, key=lambda p: (files[p][1], files[p][0])):
+    for path in sorted(files, key=lambda p: (audit.domain_key(files[p][1], headline), files[p][1], files[p][0])):
         name, domain = files[path]
         try:
             texts[path] = query_text(name, domain)

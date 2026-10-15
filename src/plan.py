@@ -806,12 +806,13 @@ def excepted_sources(report, keep):
     gate's exceptions.excepted_streams) that fail as a name keep(name) accepts, busiest first. The gate sets such
     a source aside everywhere - it neither holds a step nor counts as a sender - so a row that moves the policy
     its mail meets, where nothing else would name it, names it instead (a check, never a hold)."""
+    import audit  # here, not at the top: audit.py imports this module
     ips = {str(x) for x in _rows(_dict(_dict(report.get("gate")).get("exceptions")).get("excepted_streams"))}
     out = []
     for f in _rows(_dict(report.get("rua")).get("failing_streams")) if ips else []:
         if not isinstance(f, dict) or str(f.get("source_ip")) not in ips:
             continue
-        names = sorted(n for n in {_name(h) for h in _rows(f.get("header_from"))} if n and keep(n))
+        names = audit.order_domains([n for n in {_name(h) for h in _rows(f.get("header_from"))} if n and keep(n)])
         if names:
             out.append((str(f.get("source_ip")), _measured(f.get("fail")) or 0, names))
     return sorted(out, key=lambda s: (-s[1], s[0]))
@@ -855,7 +856,8 @@ def doubtful_names(report):
     names = {_dns_name(r.get("domain")) for r in _rows(census.get("by_sender")) if isinstance(r, dict)}
     names |= {_dns_name(h.get("domain")) for h in _rows(_dict(report.get("rua")).get("by_header_from"))
               if isinstance(h, dict)}
-    for name in sorted(n for n in names if n):
+    import audit  # here, not at the top: audit.py imports this module
+    for name in audit.order_domains(names):
         texts = doubts_for(report, name)
         if texts:
             out[name] = texts
@@ -1141,15 +1143,19 @@ def sending_names(report, inventory_rows=None, volume=None):
 def unaudited_senders(report, inventory_rows=None):
     """[(name, volume)] for the names below an audited domain that the
     sending rule finds (sending_names) and the run does not audit, the
-    busiest first (volume: the largest count any source shows for it). Only
-    DNS says whether such a name has a DMARC record of its own: collect.py
-    looks these up (report.dns_extra) before the plan reads them."""
+    busiest first (volume: the largest count any source shows for it), a
+    tie in the one order every list of names follows. Only DNS says whether
+    such a name has a DMARC record of its own: collect.py looks these up
+    (report.dns_extra) before the plan reads them."""
+    import audit  # here, not at the top: audit.py imports this module
+    import next_steps  # the organization the status document leads with
     dns = report.get("dns") if isinstance(report.get("dns"), dict) else {}
     audited = {_name(d) for d in dns}
     volume = {}
     names = sending_names(report, inventory_rows, volume)
     below = [n for n in names if n not in audited and any(n.endswith("." + a) for a in audited if a)]
-    return sorted(((n, volume.get(n, 0)) for n in below), key=lambda kv: (-kv[1], kv[0]))
+    headline = next_steps.headline_org(report)
+    return sorted(((n, volume.get(n, 0)) for n in below), key=lambda kv: (-kv[1], audit.domain_key(kv[0], headline)))
 
 
 EXTRA_STATUSES = ("found", "absent", "error")
@@ -1497,10 +1503,13 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
     hostname = "_dmarc." + domain
     subdomains = sorted(d for d in all_domains if d != domain and d.endswith("." + domain))
     subs = subs if subs is not None else subdomain_context(report, {}, _dict(report.get("dns")))
-    # the names below this domain that send (or that nothing measured) and have no record of their own; one whose
-    # own record nobody saw (no lookup, or one that failed - an audited name's too) is named as not checked
+    # the names below this domain that send (or that nothing measured) and have no record of their own, as one
+    # list in the one order every list of names follows - two sorted lists end to end are not in order - each
+    # keeping its marks below (they share this domain's organization, so the headline cannot move them); one
+    # whose own record nobody saw (no lookup, or one that failed - an audited name's too) is named as not checked
     sending_subs, unmeasured_subs = missing_records(domain, subs)
-    missing = sending_subs + unmeasured_subs
+    import audit  # here, not at the top: audit.py imports this module
+    missing = audit.order_domains(sending_subs + unmeasured_subs)
     unchecked = [n for n in missing if n not in subs.get("checked", ())]
 
     def marked(n):
@@ -1857,12 +1866,12 @@ def plan_domain(domain, dns_doc, report, inventory_row, rua_addr, ttl, all_domai
         already named as sending apart: neither a sender to give a record nor a spoof to leave to sp=, until a
         person says which. An audited one is left out: its own rows carry that check (the quiet row, or the
         ramp's steps). (hold text, prerequisite) or (None, None)."""
-        doubt = {n: v for n, v in sorted(_dict(subs.get("doubtful")).items())
+        doubt = {n: v for n, v in _dict(subs.get("doubtful")).items()
                  if n.endswith("." + domain) and n not in subs["own"] and n not in missing
                  and n not in subs["audited"]}
         if not doubt:
             return None, None
-        names = _listed(["%s (%s)" % (n, "; ".join(v)) for n, v in doubt.items()])
+        names = _listed(["%s (%s)" % (n, "; ".join(doubt[n])) for n in audit.order_domains(doubt)])
         return ("subdomains whose failing mail this run cannot call spoofing: %s - a vendor sending as one of them "
                 "unaligned fails the same way, and %s its mail; decide whether each sends for you, and give it a "
                 "record of its own first, before sp= moves" % (names, effect),
@@ -2045,13 +2054,42 @@ def alternatives(changes):
             c["prerequisite_items"] = prereq_items(c["prerequisites"])
 
 
+def record_rank(change):
+    """Where a row's record sits among one domain's rows: its _dmarc record
+    first, then the record at its own name (SPF), then its _domainkey
+    names, then anything else."""
+    host, domain = _name(change.get("hostname")), _name(change.get("domain"))
+    if host == "_dmarc." + domain:
+        return 0
+    if host == domain:
+        return 1
+    return 2 if "_domainkey" in host.split(".") else 3
+
+
+def row_key(change, headline=None):
+    """The one order of the plan's rows: priority, then DNS host (unknown
+    last), then zone and domain in the one order every list of names
+    follows (audit.domain_key: the headline's organization first; a
+    delegated zone such as shop.example.com sorts with its organization,
+    right after the organization's own zone), then the record (record_rank),
+    then the hostname. A plain text sort put e.example.com between two other
+    organizations' names."""
+    import audit  # here, not at the top: audit.py imports this module
+    host = str(change.get("zone_host") or "")
+    return (change["priority"], host.strip().lower() in ("", "unknown"), host,
+            audit.domain_key(change.get("zone") or change.get("domain"), headline),
+            audit.domain_key(change.get("domain"), headline), record_rank(change), str(change.get("hostname") or ""))
+
+
 def build_plan(report, inventory=None, rua=None, ttl=DEFAULT_TTL):
     """The plan for a report. rua: the run's report address (collect.py's
     --rua-address, else the mailbox it reads the reports from): new records
     carry it (with mailto: added when it came without), and a record whose
     rua lacks it gets it appended - when it is one address (address_note
     says why not otherwise). Without it, new records take the rua most
-    existing records use and nothing is appended."""
+    existing records use and nothing is appended. Rows run in row_key
+    order and holds in the domains' order, both led by the organization
+    the status document leads with (next_steps.headline_org)."""
     if not isinstance(report, dict):
         raise ValueError("the report is not a JSON object (report.json from src/audit.py)")
     dns_docs = report.get("dns")
@@ -2086,7 +2124,11 @@ def build_plan(report, inventory=None, rua=None, ttl=DEFAULT_TTL):
                 proposed.add(change["hostname"])
             changes.append(change)
         holds += h
-    changes.sort(key=lambda c: (c["priority"], c["zone_host"], c["domain"], c["hostname"]))
+    import audit  # here, not at the top: audit.py imports this module
+    import next_steps  # the organization the status document leads with
+    headline = next_steps.headline_org(report)
+    changes.sort(key=lambda c: row_key(c, headline))
+    holds.sort(key=lambda h: audit.domain_key(h.get("domain"), headline))  # each domain's holds keep their order
     for i, c in enumerate(changes, 1):
         c["id"] = "P-%02d" % i
     alternatives(changes)
@@ -2152,20 +2194,28 @@ def render_md(plan):
         for host, rows in hosts.items():
             L.append("### %s" % host)
             L.append("")
-            L.append("| # | Record | Hostname | Value | TTL |")
-            L.append("|---|---|---|---|---|")
+            # a host that holds more than one zone names each zone above its rows (the rows run zone by zone)
+            zones = collections.OrderedDict()
             for c in rows:
-                L.append("| %s | %s | `%s` | `%s` | %d |" % (c["id"], c["record"], c["hostname"], c["value"], c["ttl"]))
-            L.append("")
-            for c in rows:
-                L.append("- **%s** %s - %s" % (c["id"], c["domain"], c["why"]))
-                L.append("  - current: `%s`" % c["current"])
-                L.append("  - rollback: %s" % c["rollback"])
-                for p in c["prerequisites"]:
-                    L.append("  - before applying: %s" % p)
-                if c.get("human_summary"):
-                    L.append("  - *in plain words:* %s" % c["human_summary"])
-            L.append("")
+                zones.setdefault(_name(c.get("zone")), (c.get("zone"), []))[1].append(c)
+            for zone, zone_rows in (zones.values() if len(zones) > 1 else [(None, rows)]):
+                if zone:
+                    L.append("#### %s" % zone)
+                    L.append("")
+                L.append("| # | Record | Hostname | Value | TTL |")
+                L.append("|---|---|---|---|---|")
+                for c in zone_rows:
+                    L.append("| %s | %s | `%s` | `%s` | %d |" % (c["id"], c["record"], c["hostname"], c["value"], c["ttl"]))
+                L.append("")
+                for c in zone_rows:
+                    L.append("- **%s** %s - %s" % (c["id"], c["domain"], c["why"]))
+                    L.append("  - current: `%s`" % c["current"])
+                    L.append("  - rollback: %s" % c["rollback"])
+                    for p in c["prerequisites"]:
+                        L.append("  - before applying: %s" % p)
+                    if c.get("human_summary"):
+                        L.append("  - *in plain words:* %s" % c["human_summary"])
+                L.append("")
     L.append("## How to use this")
     L.append("")
     L.append("Apply priority 1 as one change per zone host: its monitoring and hygiene rows touch no mail anyone "

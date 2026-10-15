@@ -45,6 +45,7 @@ from pathlib import Path
 
 import audit  # the delta's own rules, the recorded cuts, what a quarantine-now row clears, a split census
 import dedupe  # the overrides that let a delivered failure in, in plain words
+import next_steps  # the organization the status document leads with, which the per-domain lines lead with too
 import run_hunting
 
 WEBHOOK_KEYS = ("SLACK_WEBHOOK_URL", "TEAMS_WEBHOOK_URL")
@@ -177,7 +178,7 @@ def unknown_counts(rua):
     return ips, doms, n_ips, max(len(doms), total - n_ips)
 
 
-def census_top(census, n=CENSUS_TOP):
+def census_top(census, n=CENSUS_TOP, headline=None):
     """(labels, failing) for a census dict: the n worst entries as short labels
     made of domains only - envelope domains with their genuine failures, and
     sender rows (the delta's new senders) folded to their From domain and
@@ -185,13 +186,16 @@ def census_top(census, n=CENSUS_TOP):
     only. Entries with no genuine failures are skipped; failing counts every
     failing entry. The failures are what the formal exceptions left
     (census_excepted counts the rest), and they decide which entries are the
-    worst."""
+    worst; a tie goes by messages, as the census ranks them, then in the one
+    order every list of names follows (audit.domain_key, the headline's
+    organization first)."""
     rows = []
     for r in _rows(census.get("by_envelope")):
         failing, label = _left(r) if isinstance(r, dict) else (0, None)
         if failing:
             rows.append(dict(r, genuine_failures=failing, likely=label))
-    rows.sort(key=lambda r: -r["genuine_failures"])  # stable: on a tie the census's own order stands
+    rows.sort(key=lambda r: (-r["genuine_failures"], -_whole(r.get("messages")),
+                             audit.domain_key(str(r.get("envelope_domain") or ""), headline)))
     if not rows:
         folded = {}
         for r in _rows(census.get("by_sender")):
@@ -203,7 +207,8 @@ def census_top(census, n=CENSUS_TOP):
             f = folded.setdefault((dom, env), {"domain": dom, "envelope_domain": env, "genuine_failures": 0,
                                               "likely": label})
             f["genuine_failures"] += failing
-        rows = sorted(folded.values(), key=lambda r: (-r["genuine_failures"], r["domain"]))
+        rows = sorted(folded.values(), key=lambda r: (-r["genuine_failures"], audit.domain_key(r["domain"], headline),
+                                                      r["envelope_domain"]))
     out = []
     for r in rows[:n]:
         name = r.get("envelope_domain") or r.get("domain") or "?"
@@ -408,13 +413,15 @@ def trend_word(values):
     return "flat"
 
 
-def trend_judgement(pts):
+def trend_judgement(pts, headline=None):
     """(word, reasons) for the trend line over metrics entries: the failure
     counts decide when two runs carry them, the two ends' mail logs cover
     alike spans and neither end's org was cut by the row budget or the API
     cap; else the pass rate, when the first and last runs that carry one have
     outside views of comparable size; else "not comparable". A reason names
-    each comparison refused, only when the line shows what it explains."""
+    each comparison refused, only when the line shows what it explains; the
+    organizations it names run in the one order every list of names follows
+    (the headline's first)."""
     gf = [_finite(h.get("genuine_failures")) for h in pts]
     pr = [_finite(h.get("rua_pass_rate")) for h in pts]
     counted = [i for i, x in enumerate(gf) if x is not None]
@@ -424,12 +431,15 @@ def trend_judgement(pts):
         first, last = pts[counted[0]], pts[counted[-1]]
         cf, cl = set(_cut_orgs(first) or []), set(_cut_orgs(last) or [])
         orgs_f, orgs_l = _entry_orgs(first), _entry_orgs(last)
+        def ordered(orgs):
+            return sorted(orgs, key=lambda o: (audit.domain_key(o, headline), o))
+
         if cf or cl:  # which end runs were cut, as the delta says it
             parts = [("for %s in both runs", cf & cl), ("for %s in the first run", cf - cl),
                      ("for %s in the last run", cl - cf)]
-            why_counts = "the mail log was cut " + " and ".join(fmt % _names(sorted(s)) for fmt, s in parts if s)
+            why_counts = "the mail log was cut " + " and ".join(fmt % _names(ordered(s)) for fmt, s in parts if s)
         elif orgs_f is not None and orgs_l is not None and orgs_f != orgs_l:
-            why_counts = "%s audited in one of these runs only" % _names(sorted(orgs_f ^ orgs_l))
+            why_counts = "%s audited in one of these runs only" % _names(ordered(orgs_f ^ orgs_l))
         elif not _spans_alike([first.get("maillog_hours"), last.get("maillog_hours")]):
             why_counts = "the mail-log spans differ"
     if len(rated) >= 2:
@@ -453,7 +463,9 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     known_senders: every sender key seen in earlier runs (collect.py keeps
     them); with it, "newly identified" means never seen before, not merely
     absent last week. history: the metrics.json entries, newest last, for
-    the trend line over the last TREND_RUNS runs."""
+    the trend line over the last TREND_RUNS runs. The per-domain lines run
+    in the one order every file of the run follows, led by the organization
+    the status document leads with (next_steps.headline_org)."""
     lines = []
     gen = str(report.get("generated_utc") or "")
     lines.append("*DMARC audit* %s" % gen[:16].replace("T", " "))
@@ -479,7 +491,10 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     for c in _rows(plan.get("changes")) if isinstance(plan, dict) else []:
         if isinstance(c, dict) and c.get("kind") == "no_mail" and c.get("domain"):
             quiet.setdefault(str(c["domain"]).lower(), c.get("id") or "?")
-    for dom in sorted(per, key=str):
+    # the domains in the one order every file follows: the status document's organization first, each
+    # organization's own domain before the names below it
+    headline = next_steps.headline_org(report)
+    for dom in sorted(per, key=lambda d: (audit.domain_key(d, headline), str(d))):
         g = _d(per[dom])
         policy = g.get("current_policy") if isinstance(g.get("current_policy"), str) else None
         verdict = g.get("verdict") if isinstance(g.get("verdict"), str) else "?"
@@ -579,7 +594,7 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
             lines.append("- resolved: " + ", ".join("%s %s" % (str(d).replace("dns:", ""), i) for d, i in gone_f[:8]))
         if dl:
             pol, gch = _d(dl.get("policy_changes")), _d(dl.get("gate_changes"))
-            for dom in sorted(set(pol) | set(gch), key=str):
+            for dom in sorted(set(pol) | set(gch), key=lambda d: (audit.domain_key(d, headline), str(d))):
                 b = _d(per.get(dom))
                 p, v = _d(pol.get(dom)), _d(gch.get(dom))
                 lines.append("- `%s` changed: p=%s/%s -> p=%s/%s"
@@ -646,7 +661,7 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
             # the word compares the first and last runs on the entries' own figures: failure counts over
             # mail logs that were not cut and cover alike spans, else pass rates over outside views of a
             # comparable size, else nothing
-            word, why = trend_judgement(pts)
+            word, why = trend_judgement(pts, headline)
             lines.append("- trend over the last %d runs (%s): %s" % (len(pts), word, "; ".join(parts + why)))
 
     if isinstance(plan, dict):

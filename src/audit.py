@@ -2577,6 +2577,13 @@ def _md_findings(findings, limit=None, report=None):
     return lines or ["- none"]
 
 
+def _md_order(pairs, headline=None):
+    """(name, value) pairs of a per-domain mapping in the one order every list
+    of names in the run's files follows (domain_key), for report.md; the
+    (other) bucket, which is no domain, stays last."""
+    return sorted(pairs, key=lambda kv: (kv[0] == OTHER, domain_key(kv[0], headline), str(kv[0])))
+
+
 def _md_rows(L, label, rows, fmt, cap=20):
     if not rows:
         return
@@ -2692,7 +2699,7 @@ def _md_domain_counters(c):
             + (f"; {label}: {tops}" if tops else ""))
 
 
-def _md_by_domain(L, bd):
+def _md_by_domain(L, bd, headline=None):
     L.append("")
     L.append("Per sender domain (each gate uses only its own rows):")
     L.append("")
@@ -2705,13 +2712,11 @@ def _md_by_domain(L, bd):
                  f"({oc.get('genuine_failures', 0)} genuine failures{_excepted_share(oc)}) counted once under "
                  f"{OTHER}" + (f"; sender domains seen: {shown}" if shown else ""))
         return
-    for d, dc in bd.items():
-        if d == OTHER:
-            continue
+    for d, dc in _md_order(((d, dc) for d, dc in bd.items() if d != OTHER), headline):
         L.append(f"- {d}: {_md_domain_counters(dc)}")
         st = dc.get("subdomains_total") or {}
         if st.get("logical_messages"):
-            subs = st.get("domains") or []
+            subs = order_domains(st.get("domains") or [])  # one organization's names: no headline needed
             shown = ", ".join(subs[:8]) + (f" (+{len(subs) - 8} more)" if len(subs) > 8 else "")
             L.append(f"  - unaudited subdomains ({shown}): {st['logical_messages']} logical messages, "
                      f"{st['genuine_failures']} genuine failures{_excepted_share(st)} - counted separately, not "
@@ -2759,11 +2764,12 @@ MAILFLOW_NOTE = ("Mail flow is what the tenant itself carried with the domain as
                  "through the tenant: only the aggregate reports show it.")
 
 
-def _md_mailflow(L, report):
-    """Each audited domain's mail flow (report.mailflow), or why there is none."""
+def _md_mailflow(L, report, headline=None):
+    """Each audited domain's mail flow (report.mailflow), or why there is none, in the one order every list
+    of names follows; the names seen sending beyond them busiest first, a tie in that order."""
     mf = report.get("mailflow")
     names = [_norm_name(d) for d in (report.get("inputs") or {}).get("domains") or []]
-    names = [d for d in dict.fromkeys(names + [_norm_name(d) for d in _dict(_dict(mf).get("domains"))]) if d]
+    names = order_domains(names + [_norm_name(d) for d in _dict(_dict(mf).get("domains"))], headline)
     L.append("## Mail flow per domain (tenant)")
     L.append("")
     if not isinstance(mf, dict):
@@ -2779,7 +2785,7 @@ def _md_mailflow(L, report):
         # the names the same query saw under those organizations that are not audited: the ones sending
         # out through the tenant are subdomains the plan wants a record of their own for before sp= moves
         out = sorted(((n, _count(_dict(c).get("outbound")) or 0) for n, c in _dict(mf.get("unaudited")).items()),
-                     key=lambda nc: (-nc[1], nc[0]))
+                     key=lambda nc: (-nc[1], domain_key(nc[0], headline), str(nc[0])))
         sending = [f"{n} {k} out" for n, k in out if k > 0]
         if sending:
             L.append(f"- not audited, seen sending through the tenant: {', '.join(sending[:8])}"
@@ -2818,10 +2824,12 @@ def _totals_line(c):
             + (f" ({by})" if by else ""))
 
 
-def _md_window_totals(L, report):
+def _md_window_totals(L, report, headline=None):
     """The full-window totals collect.py counted in advanced hunting for each
     organization whose rows the row budget or the API cap cut, next to the
-    attribution built from the rows kept."""
+    attribution built from the rows kept: the organizations in the one order
+    every list of names follows, each one's domains worst first, a tie in
+    that order."""
     ml = _dict(report.get("maillog"))
     wt = _dict(ml.get("window_totals"))
     orgs = _dict(wt.get("orgs"))
@@ -2836,11 +2844,12 @@ def _md_window_totals(L, report):
              "Kusto estimates. The gate, the census and the labels keep using the deduplicated rows above; the plan "
              "reads these totals for a cut organization's quarantine-now decision and its list of sending subdomains.")
     L.append("")
-    for org, info in sorted(orgs.items()):
+    for org, info in _md_order(orgs.items(), headline):
         bd = _dict(_dict(info).get("by_domain"))
         kept = _cut_kept(cuts.get(org))
         L.append(f"- {org}" + (f" ({kept} in the rows above)" if kept else "") + f": {_totals_line(_window_sums(bd))}")
-        rows = sorted(bd.items(), key=lambda kv: (-dedupe._whole(_dict(kv[1]).get("genuine_failures")), kv[0]))
+        rows = sorted(bd.items(), key=lambda kv: (-dedupe._whole(_dict(kv[1]).get("genuine_failures")),
+                                                  domain_key(kv[0], headline), str(kv[0])))
         for d, c in rows[:10]:
             L.append(f"  - {d}: {_totals_line(_window_sums({d: c}))}")
         if len(rows) > 10:
@@ -2882,15 +2891,20 @@ def _md_census(L, cs):
     L.append("")
 
 
-def _md_delta(L, dl):
+def _md_delta(L, dl, headline=None):
+    """'Since the previous run': the delta, every list of domains in it in the one order every list of names
+    follows (the report's headline first)."""
+    def ordered(names):
+        return sorted(names, key=lambda n: (domain_key(n, headline), str(n)))
+
     mw = _dict(dl.get("maillog_window"))
     why, said = [], 0  # what withheld the counts, and how many notes below say so
     if mw.get("comparable") is False:
-        cut = sorted(_dict(mw.get("cut_orgs")))
+        cut = ordered(_dict(mw.get("cut_orgs")))
         if cut:
             why.append("mail log cut for %s" % _names(cut))
             said += len(cut)
-        shared = mw.get("orgs_not_shared") if isinstance(mw.get("orgs_not_shared"), list) else []
+        shared = ordered(mw.get("orgs_not_shared")) if isinstance(mw.get("orgs_not_shared"), list) else []
         if shared:
             why.append("%s audited in one run only" % _names(shared))
             said += 1
@@ -2922,7 +2936,7 @@ def _md_delta(L, dl):
     if bd:
         L.append("- per domain: " + "; ".join(f"{d} {signed(_dict(v).get('genuine_failures'), 'n/a')} genuine, "
                                               f"{signed(_dict(v).get('delivered_despite_fail'), 'n/a')} delivered despite fail"
-                                              for d, v in bd.items()))
+                                              for d, v in _md_order(bd.items(), headline)))
     new = [f for f in dl.get("findings_new") or [] if isinstance(f, dict)]
     L.append(f"- new findings ({len(new)}): " + (", ".join(
         f"[{f.get('severity')}] {f.get('id')} ({_display_source(f.get('source'))})" for f in new[:10]) + more(new)
@@ -2931,12 +2945,14 @@ def _md_delta(L, dl):
     L.append(f"- resolved findings ({len(gone)}): " + (", ".join(
         f"{f.get('id')} ({_display_source(f.get('source'))})" for f in gone[:10]) + more(gone) if gone else "none"))
     pc = _dict(dl.get("policy_changes"))
-    L.append("- policy changes: " + (", ".join(f"{d} p={_dict(v).get('from')} -> p={_dict(v).get('to')}" for d, v in pc.items())
-                                     if pc else "none"))
+    L.append("- policy changes: " + (", ".join(f"{d} p={_dict(v).get('from')} -> p={_dict(v).get('to')}"
+                                               for d, v in _md_order(pc.items(), headline)) if pc else "none"))
     gc = _dict(dl.get("gate_changes"))
     if gc:
-        L.append("- gate changes: " + ", ".join(f"{d} {_dict(v).get('from')} -> {_dict(v).get('to')}" for d, v in gc.items()))
+        L.append("- gate changes: " + ", ".join(f"{d} {_dict(v).get('from')} -> {_dict(v).get('to')}"
+                                                for d, v in _md_order(gc.items(), headline)))
     added, removed = dl.get("domains_added") or [], dl.get("domains_removed") or []
+    added, removed = (ordered(x) if isinstance(x, list) else x for x in (added, removed))
     if added or removed:
         L.append(f"- domains added: {', '.join(map(str, added)) or 'none'}; removed: {', '.join(map(str, removed)) or 'none'}")
     ns = [s for s in dl.get("new_senders") or [] if isinstance(s, dict)]
@@ -2967,6 +2983,8 @@ def render_md(report):
     per = g.get("domains") or {}
     hl = g.get("headline") or {}
     hd, worst = hl.get("domain"), g.get("worst_domain")
+    # every per-domain list below runs in the one order every file follows, the headline's organization first
+    headline = hd or g.get("headline_domain")
     if per and hd in per:
         head = f"**{g['verdict']}** - {g.get('overall')}"
         if worst and worst != hd:
@@ -2995,7 +3013,7 @@ def render_md(report):
         L.append(f"Per domain ({g.get('overall') or 'the overall verdict is the worst of these'}; "
                  "each gate uses only its own mail-log rows):")
         L.append("")
-        for d, dg in per.items():
+        for d, dg in _md_order(per.items(), headline):
             pol = f"p={dg['current_policy']} ({dg['policy_source']})" if dg["current_policy"] else "policy unknown"
             L.append(f"- {d}: **{dg['verdict']}** - {pol}; next step: {dg['next_step']}")
             for r in dg["reasons"]:
@@ -3010,11 +3028,11 @@ def render_md(report):
     L.append("")
 
     if report.get("delta"):
-        _md_delta(L, report["delta"])
+        _md_delta(L, report["delta"], headline)
 
     L.append("## Inputs")
     L.append("")
-    L.append(f"- domains: {', '.join(inp['domains']) or 'none'}"
+    L.append(f"- domains: {', '.join(order_domains(inp['domains'], headline)) or 'none'}"
              + (f" (from {display_path(inp['domain_file'])})" if inp.get("domain_file") else ""))
     L.append(f"- aggregate reports: {', '.join(display_path(p) for p in inp['rua']) or 'none'}")
     L.append(f"- mail log: {display_path(inp['maillog']) if inp['maillog'] else 'none'}"
@@ -3034,7 +3052,7 @@ def render_md(report):
     if report["dns"]:
         L.append("## DNS posture (live)")
         L.append("")
-        for d, r in report["dns"].items():
+        for d, r in _md_order(report["dns"].items(), headline):
             if r.get("spf_status") == "error":
                 spf = "LOOKUP FAILED - not verified"
             else:
@@ -3080,7 +3098,7 @@ def render_md(report):
                 L.append(f"  - {f['source_ip']}: {f['spf_only']} msgs as {', '.join(f['header_from'][:2])}")
         L.append("")
 
-    _md_mailflow(L, report)
+    _md_mailflow(L, report, headline)
 
     if report["maillog"]:
         c = report["maillog"]["counters"]
@@ -3121,8 +3139,8 @@ def render_md(report):
             L.append(f"- verdict basis: column '{report['maillog']['auth_column']}'"
                      + (" (auto-detected)" if report["maillog"].get("auth_column_detected") else ""))
         if report["maillog"].get("by_domain"):
-            _md_by_domain(L, report["maillog"]["by_domain"])
-        _md_window_totals(L, report)
+            _md_by_domain(L, report["maillog"]["by_domain"], headline)
+        _md_window_totals(L, report, headline)
         L.append("")
         if report["maillog"].get("census"):
             _md_census(L, report["maillog"]["census"])
