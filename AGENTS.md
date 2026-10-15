@@ -89,7 +89,10 @@ file only.)
     something is missing from it, it is missing from the inputs: add the
     `owners.csv` row, the `--known` list or the missing evidence, then
     rerun. The shape and the polishing rules are in
-    `docs/templates/next-steps.md`.
+    `docs/templates/next-steps.md`. `brief.html` beside it is the same
+    document laid out as one page by `src/brief.py`, no AI either; check
+    every polished copy with `scripts/check_doc.py`, which names any number,
+    plan id, finding id or policy value the run's files do not carry.
 
 ## The working sequence
 
@@ -180,6 +183,7 @@ Starter tasks, in order:
 | File | What it holds | How to use it |
 |---|---|---|
 | `next_steps.md`, `next_steps.json` | the status document: the one-liner, where we stand, what is failing, the per-domain table, actions by owner, the ask and the open questions; the JSON is the same content as data | start here; refine the generated copy, never rewrite it from memory (rule 13) |
+| `brief.html` | the status document designed as one self-contained page (no script, no link out): the one-liner, the figures as tiles, the next step, the per-domain table by organization, what is failing, actions by owner, the ask, the plan's records as cards (priority, DNS host, zone, domain), the open questions by kind; written by `src/brief.py` from `next_steps.json` and `plan.json` | open it, present it, print it to PDF; it holds sender addresses, subject lines and IPs, so it stays inside the company (rule 3); rebuild it with `python src/brief.py audit-out/latest`, never edit it |
 | `todo.md` | the prioritised list: holds to decide, priority-1 DNS rows (zero-risk monitoring and hygiene, and "no mail measured: quarantine now" for a domain the run measured sending nothing, which waits on the checks it names), senders to fix DKIM-first, tenant findings, gated enforcement steps with prerequisites, exceptions in force | work it top to bottom; every line names the file with the evidence |
 | `report.json`, `report.md` | every finding with severity, evidence, action and `verified`; the gate per domain with its reasons; `gate.exceptions` (applied, expired, invalid); `gate.evidence.dkim_evidence`; `maillog.verdicts_omitted` and `rua.truncated` say what the JSON leaves out (`audit.py --keep-verdicts` keeps the verdicts); `mailflow` (each audited domain's mail flow as the tenant measured it, `None` per domain when not measured; `mailflow.unaudited`, the other names under the same organizations the query saw); `maillog.counters.delivered_despite_fail_by` and the census's `delivered_by` (the override that let failing mail in); `maillog.window_totals` (a cut organization's full window, counted in advanced hunting; an answer that counts less than the rows kept is set aside and named in `maillog.window_totals_rejected`); `dns_extra` (the own `_dmarc` record of each unaudited subdomain seen sending, looked up by `collect.py`: found, absent or error) | cite finding ids and gate reasons, never raw rows; quote deduplicated and raw counts together; quote a cut organization's floor and its full-window totals together, and say the verdicts rest on the floor |
 | `plan.json`, `plan.md` | the records to publish with current value, rollback and prerequisites; a `no_mail` row quarantines a domain the run measured sending nothing, with the checks the run could not settle as prerequisites (never a zero-risk row; on an organizational domain it keeps `sp=none`); the `sp=` step names every sending subdomain still without a record of its own, audited or not (a formally excepted aggregate-report source is set aside, never counted as a sender), and proposes their monitoring records - only DNS says a subdomain has one (`report.json` `dns_extra` for the unaudited ones), and a name marked not checked (an audited one whose own lookup failed, DMARC-007, too) gets its record only after a lookup shows none; a record whose `rua` lacks the run's report address gets it appended in a zero-risk row of its own (inside the quarantine-now row when that rewrites the record anyway), never gated on the reports it starts; a record that gains an address in another organization waits on that domain's `_report._dmarc` record; two rows that rewrite one record from today's value name each other (one a week) | draft the change ticket from a row; the human applies it |
@@ -221,4 +225,9 @@ DKIM-before-reject hold on an SPF-only sender.
   `report.json`, `plan.json`, `metrics.json` and `owners.csv`. Polish the
   hooks, the order and the audience split as `docs/templates/next-steps.md`
   describes; every number, verdict and finding id stays the generator's,
-  never a raw row count, never invented (rule 13).
+  never a raw row count, never invented (rule 13). The
+  `dmarc-status-brief` skill (`.claude/skills/dmarc-status-brief/`) walks
+  it: find the run, render `brief.html`, polish the leadership summary, the
+  owner messages and the DNS change ticket on request, and check each copy
+  with `scripts/check_doc.py`; an agent without skills follows its
+  `SKILL.md` as a checklist.

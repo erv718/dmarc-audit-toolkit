@@ -38,7 +38,8 @@ What it does, in order, and what it skips when it cannot:
   8. write the stakeholder document, next_steps.md and next_steps.json, from
      the report, the plan, the metrics and the owners file (<repo root>/
      owners.csv when it exists; --owners PATH points elsewhere, --no-owners
-     skips it; start from samples/owners.csv.example)
+     skips it; start from samples/owners.csv.example), and brief.html, the
+     same document with the plan's records designed as one page (src/brief.py)
   9. post the summary to Slack or Teams (SLACK_WEBHOOK_URL in .env; --dry-run
      prints it; --no-notify skips it)
 
@@ -56,7 +57,7 @@ in .env.
 
 Outputs under --out (default audit-out/):
   history/<UTC stamp>/   report.md report.json plan.md plan.json next_steps.md next_steps.json
-                         todo.md inventory.json domains.txt summary.txt run.json
+                         brief.html todo.md inventory.json domains.txt summary.txt run.json
                          verify.md and queries/ (how to check every finding and plan row yourself)
   latest/                the newest run, same files
   metrics.json           one entry per run (policy, gate, findings, failure counts, pass rate)
@@ -81,6 +82,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import audit
+import brief
 import config as config_mod
 import console
 import discover
@@ -111,8 +113,8 @@ MAILFLOW_DAYS = 30
 TOTALS_COLUMNS = ("fromdom", "logical_messages", "passing", "genuine_failures", "delivered_despite_fail")
 RUN_JSON_SENDERS = 200  # new sender identities listed in run.json; senders.json holds them all, the count says how many
 RUN_FILES = ("report.md", "report.json", audit.CENSUS_FILE, "plan.md", "plan.json", "next_steps.md", "next_steps.json",
-             "todo.md", "inventory.json", "domains.txt", "summary.txt", "run.json", "setup.json", "maillog.csv",
-             "verify.md")
+             "brief.html", "todo.md", "inventory.json", "domains.txt", "summary.txt", "run.json", "setup.json",
+             "maillog.csv", "verify.md")
 PRIORITY_WORD = {1: "now, zero delivery risk", 2: "before enforcement", 3: "enforcement step, gated",
                  4: "subdomain policy, gated", 5: "final hardening, gated"}
 
@@ -1395,6 +1397,13 @@ def main():
 
     # 8. the stakeholder document (entries already holds this run; next_steps skips it for the trend)
     steps = write_next_steps(run_dir, report, plan_doc, entries, owners, owners_path, prev_report, prev_dir, note)
+    try:  # the same document designed as one page, from the files just written, as brief.py builds it by hand: it
+        # never fails the run (absolute: brief resolves relative paths from the repo root)
+        if steps is None:  # the note above says why there is no document; the page would have nothing to lay out
+            raise brief.BriefError("no next-steps document in this run")
+        brief.write_run(run_dir.resolve())
+    except Exception as err:
+        note("no brief.html written (%s: %s)" % (type(err).__name__, err))
     try:  # how to check every finding and plan row by hand, from the files above: it never fails the run
         verify.write(report, plan_doc, run_dir)
     except Exception as err:

@@ -13,3 +13,8 @@ The working sequence starts from `audit-out/latest/next_steps.md` and
 `next_steps.json` (the status document the toolkit itself writes, with no
 AI), then `report.json` for the evidence. Rule 13 applies: never produce a
 status document from memory when `next_steps.md` exists - edit it.
+
+For a status doc, a meeting brief, owner messages or a DNS change ticket,
+use the project skill `dmarc-status-brief`
+(`.claude/skills/dmarc-status-brief/SKILL.md`): it renders `brief.html` from
+the run and checks every polished copy with `scripts/check_doc.py`.
