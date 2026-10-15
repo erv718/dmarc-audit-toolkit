@@ -1015,15 +1015,19 @@ def render_todo(report, plan, caveats=()):
         items.append("- mail log: %s (envelope %s) passes on SPF alone, %d msgs - aligned DKIM at that platform before reject"
                      % (sender.get("sender") or "?", sender.get("envelope_domain") or "?", sender.get("spf_only") or 0))
     rua = report.get("rua") or {}
+    counts = audit.from_counts(rua)  # every From domain a source sends as, named, the busiest first (from_names)
     for stream in rua.get("failing_streams") or []:
         if stream.get("likely") == "likely_spoof" or stream.get("source_ip") in excepted_ips:
             continue
         items.append("- aggregate reports: %s fails %s/%s msgs as %s (%s) - find the owner; DKIM-sign it, or except it "
                      "with a removal criterion" % (stream.get("source_ip"), stream.get("fail"), stream.get("count"),
-                                                   ", ".join((stream.get("header_from") or [])[:2]), stream.get("likely")))
+                                                   audit.from_names(stream.get("header_from"),
+                                                                    counts.get(str(stream.get("source_ip"))), headline),
+                                                   stream.get("likely")))
     for sender in rua.get("spf_only_senders") or []:
         items.append("- aggregate reports: %s passes on SPF alone, %d msgs as %s - aligned DKIM before reject"
-                     % (sender.get("source_ip"), sender.get("spf_only") or 0, ", ".join((sender.get("header_from") or [])[:2])))
+                     % (sender.get("source_ip"), sender.get("spf_only") or 0,
+                        audit.from_names(sender.get("header_from"), counts.get(str(sender.get("source_ip"))), headline)))
     for c in changes:
         if c.get("priority") == 2:
             items.append("- %s %s: %s" % (c["id"], c["domain"], c["why"]))
@@ -1068,7 +1072,8 @@ def render_todo(report, plan, caveats=()):
     if caveats:
         L.append("## Caveats")
         L.append("")
-        L += ["- %s" % c for c in caveats]
+        # one per cut organization, in the order the pull ran: listed in the one order, the headline's first
+        L += ["- %s" % c for c in next_steps.order_by_org(caveats, headline)]
         L.append("")
 
     L.append("Spoof streams that receivers already reject are not work items: enforcement is what stops them. "

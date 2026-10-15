@@ -150,6 +150,7 @@ import sys
 from pathlib import Path
 
 import dedupe
+from dns_audit import TWO_LEVEL_SUFFIXES  # the one table of two-label public suffixes
 
 DEFAULT_TTL = 3600
 RUA_PLACEHOLDER = "mailto:<your aggregate reports address>"
@@ -359,10 +360,11 @@ def derive_rua(dns_docs):
 
 
 def org_domain(name):
+    """The organizational domain, under the two-label public suffixes the DNS
+    audit knows (dns_audit.TWO_LEVEL_SUFFIXES, the table discover.py and
+    next_steps.py read too)."""
     labels = name.split(".")
-    two = {"co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.jp", "co.nz",
-           "com.br", "com.mx", "co.za", "com.sg", "com.hk", "co.in", "co.kr", "com.tr", "com.ar"}
-    if len(labels) > 2 and ".".join(labels[-2:]) in two:
+    if len(labels) > 2 and ".".join(labels[-2:]) in TWO_LEVEL_SUFFIXES:
         return ".".join(labels[-3:])
     return ".".join(labels[-2:]) if len(labels) >= 2 else name
 
