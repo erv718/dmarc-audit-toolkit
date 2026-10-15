@@ -56,9 +56,7 @@ CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'n
 GATE_PILLS = {"go": ("ok", "go"), "no_go": ("warn", "not yet"), "insufficient_data": ("info", "needs data")}
 NOT_CHECKED = ("info", "not checked")
 # the open questions' kinds in the order the reader takes them, in plain words; any other kind follows by name
-QUESTION_KINDS = (("blocker", "Blockers"), ("prerequisite", "Prerequisites"), ("hold", "Holds to decide"),
-                  ("gap", "Gaps enforcement does not close"), ("unverified", "Not verified yet"),
-                  ("unassigned", "Needs an owner"))
+QUESTION_KINDS = tuple(next_steps.QUESTION_KINDS.items())  # next_steps.md's own words for them
 # an owner's items by kind: the zero-risk records first, then the other plan rows (DNS changes) in plan order,
 # then sender fixes, overrides, outside and unknown sources, other findings; anything else last
 ACTION_RANK = {"p1summary": 0, "p1record": 0, "dns": 1, "sender": 2, "override": 3, "spoof": 4, "stream": 4,
@@ -921,13 +919,13 @@ def dns_section(plan, head):
 def _question_key(q, idx, head, located):
     """Within a kind: by organization (the headline's first, a tenant-wide
     question last) and domain when the questions say which (round 12 on),
-    then by text; an older document's questions keep its order."""
+    then in the document's own order, as next_steps.md lists them; an
+    older document's questions keep its order."""
     if not located:
         return (idx,)
     org = _norm(q.get("org"))
     names = _texts(q.get("domains"))
-    return ((0, dkey(org, head)) if org else (1, ()), dkey(names[0], head) if names else (),
-            _text(q.get("question")), idx)
+    return ((0, dkey(org, head)) if org else (1, ()), dkey(names[0], head) if names else (), idx)
 
 
 def questions_section(doc, head):

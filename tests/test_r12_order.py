@@ -298,7 +298,11 @@ def test_the_open_questions_run_by_kind_then_organization_and_are_grouped_by_kin
     assert [q["domains"] for q in qs if q["kind"] == "hold"] == [["example.com"], ["brand.example"]]
     unverified = [q for q in qs if q["kind"] == "unverified"]
     assert unverified[0]["domains"] == ["brand.example"] and [q["org"] for q in unverified[1:]] == ["", "", ""]
-    assert [q["question"] for q in unverified[1:]] == sorted(q["question"] for q in unverified[1:])
+    # within one domain (here: none, tenant-wide) the questions keep the order they were asked in - the report's
+    # findings order for these - never the alphabet: a plan row lists its prerequisites most important first
+    ids = [f["id"] for f in run["report"]["findings"] if f.get("verified") is False]
+    asked = [next(i for i in ids if "(%s," % i in q["question"]) for q in unverified[1:]]
+    assert asked == sorted(asked, key=ids.index)
     owned = [q for q in qs if q["kind"] == "unassigned"]
     assert [q["org"] for q in owned] == ["example.com"] * 11 + ["example.net"] * 6 + [""]
     assert owned[-1]["question"] == "Who owns this: Partner bypass (RULES-002)?"

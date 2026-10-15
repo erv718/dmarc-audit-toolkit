@@ -3043,15 +3043,15 @@ QUESTION_KINDS = OrderedDict([("blocker", "Blockers"), ("prerequisite", "Prerequ
 def _question_key(q, headline=None):
     """Where an open question sits: by kind (QUESTION_KINDS, any other kind
     after them by name), then organization (the headline's first, a
-    tenant-wide question last), then domain, then its text (as a reader
-    alphabetizes it: case aside)."""
+    tenant-wide question last), then domain. Within one domain the
+    questions keep the order they were asked in (the sort is stable): a
+    plan row lists its prerequisites in a deliberate order, the one that
+    matters most first, and the alphabet would scramble it."""
     kind = str(q.get("kind") or "")
     known = list(QUESTION_KINDS)
     doms = q.get("domains") or []
-    text = str(q.get("question") or "")
     return (known.index(kind) if kind in known else len(known), "" if kind in known else kind, not doms,
-            audit.domain_key(q.get("org") or "", headline), audit.domain_key(doms[0] if doms else "", headline),
-            text.casefold(), text)
+            audit.domain_key(q.get("org") or "", headline), audit.domain_key(doms[0] if doms else "", headline))
 
 
 def open_questions(report, plan, org, nxt, owners, groups, headline=None):
