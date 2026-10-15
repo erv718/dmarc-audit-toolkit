@@ -38,6 +38,29 @@ collapse into one "notes, not headlines" line), and a section with no
 evidence says "not in this run" instead of showing a zero, because a zero
 count is not evidence of health.
 
+## The designed brief
+
+Every run also writes `brief.html` next to the document: the same content
+laid out as one page for a meeting or a leadership read. `src/brief.py`
+builds it from `next_steps.json` and `plan.json` with no AI, the way
+`next_steps.py` builds the document: the one-liner as the lede, Where we
+stand as four figures (genuine failures with the raw count beside them,
+delivered despite failing, rejected and quarantined by receivers, the trend)
+over the section's lines, the next step with its conditions as a checklist,
+the per-domain table grouped by organization, What is failing as tables,
+the actions by owner, the ask, the plan's records as cards (the holds first,
+then by priority, DNS host and zone), the open questions grouped by kind,
+and the glossary. Every list of domains is in one order: the headline
+organization first, then each organization by name, its own domain before
+the names below it. A section with nothing in it says "Not in this run."
+The page is one file with no script, no font and no link out; open it in a
+browser and use Print to PDF for an A4 or Letter copy. Rebuild it after any
+change to the run's files:
+
+```bash
+python src/brief.py audit-out/latest            # writes audit-out/latest/brief.html
+```
+
 ## How to polish it
 
 The generated copy is the starting point; the polished copy is what you
@@ -79,6 +102,25 @@ no owners file (everything unassigned), no `--known` list with IP prefixes
 does not run, and every outside source is listed as unknown - domains alone
 only narrow the signing-domain list), no plan (an offline run has no DNS
 section), no previous run (no trend). Fix the input and regenerate.
+
+## Polishing with an agent
+
+An agent that polishes the document works from the project skill
+`dmarc-status-brief` (`.claude/skills/dmarc-status-brief/SKILL.md`; an agent
+without skills reads it as a checklist): it finds the run, renders
+`brief.html`, and only on request writes the audience copies into
+`audit-out/latest/polished/` - the leadership summary, one message per
+owner, the DNS change ticket - in the shapes its `reference.md` gives.
+Every polished copy is then checked against the run:
+
+```bash
+python scripts/check_doc.py audit-out/latest/polished/leadership.md --run audit-out/latest
+```
+
+It prints one line per problem, `line N: <token>: <why>`: a number, plan id,
+finding id or `p=` / `sp=` / `pct=` value the run's files do not carry, or
+the punctuation the voice rules forbid. The copy is fixed until it exits 0;
+the run's files never are.
 
 ## Voice rules for the final document
 

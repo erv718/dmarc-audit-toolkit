@@ -15,7 +15,9 @@ python src/collect.py                       # the whole audit
 
 You get, under `audit-out/latest/`: `next_steps.md` (the status document you
 send: where the rollout stands in one sentence, what is failing, who fixes it,
-the ask), `report.md` (every finding, and a go / no-go gate per domain),
+the ask), `brief.html` (the same document designed as one page, with the DNS
+records to publish as cards: open it in a browser, present it, print it to
+PDF), `report.md` (every finding, and a go / no-go gate per domain),
 `todo.md` (one prioritised list, top to bottom), `plan.md` (the exact DNS
 records to publish next, with rollback), plus a dated history and running
 metrics. Put it on a weekly schedule and it posts a short Slack summary when
@@ -293,6 +295,24 @@ Read them in this order, all under `audit-out/latest/`:
    `python src/verify.py report.json --plan plan.json --out DIR` writes it
    for any report.
 
+**Status brief.** `brief.html` is `next_steps.md` laid out for a meeting: the
+one-liner, the figures as tiles, the next step with its checklist, the
+per-domain table grouped by organization, what is failing, actions by owner,
+the ask, the plan's records as cards in the order a DNS change ticket wants
+them (priority, DNS host, zone, domain), the open questions grouped by kind
+and the glossary. `src/brief.py` writes it from `next_steps.json` and
+`plan.json` with no AI, so it says what the document says; `collect.py` writes
+it on every run, and `python src/brief.py audit-out/latest` rebuilds it. It is
+one self-contained file with no script and no link out: open it in any
+browser, and Print to PDF for an A4 or Letter copy. It holds sender addresses,
+subject lines and IPs, so share it inside the company only. For audience
+copies (a leadership summary, one message per owner, the DNS change ticket),
+point an agent at the `dmarc-status-brief` skill in
+`.claude/skills/dmarc-status-brief/`: it polishes from the run and nothing
+else, and `python scripts/check_doc.py <copy> --run audit-out/latest` names
+any number, plan id, finding id or policy value in a copy that the run does
+not carry.
+
 **Who owns what.** `next_steps.md` groups actions by owner, and the owners
 come from `owners.csv` in the repo root: one row per sender address, domain
 or glob, naming the team or person who fixes it and the channel to reach
@@ -480,7 +500,7 @@ audited domain with mail of its own, and the busiest clean rows of those
 domains, so `plan.py` and `verify.py` read the same senders from it with or
 without the side file; `next_steps.py` and `notify.py` read the side file
 back whole), `plan.md`,
-`plan.json`, `next_steps.md`, `next_steps.json`, `todo.md`, `verify.md` and
+`plan.json`, `next_steps.md`, `next_steps.json`, `brief.html`, `todo.md`, `verify.md` and
 `queries/`, `summary.txt`, `run.json`, `inventory.json`, `domains.txt`,
 `setup.json` and `maillog.csv` - the raw per-recipient mail log the run
 pulled, with recipient addresses and subject lines: personal data that stays
@@ -569,6 +589,7 @@ answer.
 | `src/collect.py` | The weekly job and the one command: verify, discover, pull mail log and reports, audit, plan, status document, to-do, history, metrics, summary. Reads `audit.toml`. |
 | `src/audit.py` | The engine: DNS posture, aggregate reports, deduplicated mail log and headers in one report with the gate verdict per domain, each judged on its own rows. Works `--offline` from files. |
 | `src/next_steps.py` | `report.json` in, `next_steps.md` + `next_steps.json` out: the status document you send. One-line status, deduplicated counts with the raw number alongside, what is failing, a per-domain table, actions grouped by owner, the ask and the open questions. Reads `plan.json`, `metrics.json`, the previous run and `owners.csv` when they exist; deterministic, no AI. |
+| `src/brief.py` | `next_steps.json` and `plan.json` in, `brief.html` out: the status document designed as one self-contained page, with the plan's records as cards. Same content, every list in one domain order, no script, no AI; `--fragment` writes the title, style and body only. |
 | `src/plan.py` | `report.json` in, `plan.md` out: the exact records to publish, with current value, rollback, priority and prerequisites. |
 | `src/config.py` | Reads `audit.toml`: settings and the formal exceptions. Library only. |
 | `src/discover.py` | Finds the domains: command line, file, the tenant, `EXTRA_DOMAINS` from `.env` (domains the tenant does not hold), subdomains seen in mail flow; records each zone's DNS host; with `collect.py`'s token, measures every domain's own mail flow in one aggregate query. |
@@ -586,6 +607,8 @@ answer.
 | `src/mcp_server.py` | The tools above for any MCP client. |
 | `scripts/register_weekly_task.ps1` | Registers or removes the Windows scheduled task. |
 | `scripts/check_public.py` | Pre-push gate: deny terms, typographic dashes, and credential material never leave the repo. |
+| `scripts/check_doc.py` | Checks a polished copy of the status document against its run: every number, plan id, finding id and `p=` / `sp=` / `pct=` value must be in the run's files, and the punctuation must follow the voice rules. One line per problem, never the copy's content. |
+| `.claude/skills/dmarc-status-brief/` | The agent skill that finds the run, renders `brief.html`, and on request polishes the leadership summary, the owner messages and the DNS change ticket, each checked with `check_doc.py`. |
 | `queries/` | Nine advanced-hunting queries: deduplicated census and failures, subdomain health, override audit, echo-vs-loss twins, pre-reject DKIM alignment, impersonation, the raw per-leg export that feeds `dedupe.py` (with the override each leg recorded), and the full-window totals `collect.py` counts for an organization its row budget or the API cap cut. |
 | `samples/` | Synthetic mail log, aggregate reports, annotated headers and `owners.csv.example`, so every tool can be tried offline. |
 | `docs/` | The methodology, the app registration walkthrough, the AI workflow guide, and the shape of the generated status document (`docs/templates/next-steps.md`). |
