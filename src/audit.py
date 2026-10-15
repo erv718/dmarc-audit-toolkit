@@ -256,6 +256,32 @@ def _norm_name(name):
     return str(name or "").strip().lower().rstrip(".")
 
 
+def domain_key(name, headline=None):
+    """The one order every list of domains in the run's files follows: the
+    headline's organization first when one is given, then each organization
+    by name; within one organization its organizational domain first and the
+    names below it by name. A subdomain therefore always sits with its own
+    organization - sub.example.com never lands between example.com and
+    example.net's names, as a plain text sort would put it. Names compare
+    the way gate keys are spelled (_norm_name)."""
+    n = _norm_name(name)
+    org = discover.org_domain(n) if n else ""
+    head = _norm_name(headline)
+    head = discover.org_domain(head) if head else ""
+    return (0 if head and org == head else 1, org, n != org, n)
+
+
+def order_domains(names, headline=None):
+    """names in domain_key order, each once (compared as _norm_name spells
+    it, the first spelling kept), blanks and non-strings dropped: a list."""
+    seen = {}
+    for x in names or ():
+        n = _norm_name(x) if isinstance(x, str) else ""
+        if n and n not in seen:
+            seen[n] = x
+    return [seen[n] for n in sorted(seen, key=lambda n: domain_key(n, headline))]
+
+
 def _as_list(value):
     if value is None:
         return []
