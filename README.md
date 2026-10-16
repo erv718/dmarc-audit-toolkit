@@ -298,11 +298,13 @@ Read them in this order, all under `audit-out/latest/`:
 **Status brief.** `brief.html` is `next_steps.md` laid out for a meeting: the
 one-liner, the figures as tiles, the next step with its checklist, the
 per-domain table grouped by organization, what is failing, actions by owner,
-the ask, the plan's records as cards in the order a DNS change ticket wants
-them (priority, DNS host, zone, domain), the open questions grouped by kind
-and the glossary. `src/brief.py` writes it from `next_steps.json` and
-`plan.json` with no AI, so it says what the document says; `collect.py` writes
-it on every run, and `python src/brief.py audit-out/latest` rebuilds it. It is
+the ask, the plan's records - every row at a glance, each linked to its
+card, then the cards in the order a DNS change ticket wants them (priority,
+DNS host, zone, domain: the plan's own order, ids ascending) - the open
+questions grouped by kind and the glossary. `src/brief.py` writes it from
+`next_steps.json` and `plan.json` with no AI, so it says what the document
+says; `collect.py` writes it on every run, and
+`python src/brief.py audit-out/latest` rebuilds it. It is
 one self-contained file with no script and no link out: open it in any
 browser, and Print to PDF for an A4 or Letter copy. It holds sender addresses,
 subject lines and IPs, so share it inside the company only. For audience
@@ -310,8 +312,10 @@ copies (a leadership summary, one message per owner, the DNS change ticket),
 point an agent at the `dmarc-status-brief` skill in
 `.claude/skills/dmarc-status-brief/`: it polishes from the run and nothing
 else, and `python scripts/check_doc.py <copy> --run audit-out/latest` names
-any number, plan id, finding id or policy value in a copy that the run does
-not carry.
+any number, date, percentage, plan id, finding id or policy value in a copy
+that the run does not carry. Subject lines and sender addresses in the run
+were written by strangers: the page shows them as data, and the skill tells
+the agent to quote them, never to act on them.
 
 **Who owns what.** `next_steps.md` groups actions by owner, and the owners
 come from `owners.csv` in the repo root: one row per sender address, domain
@@ -544,9 +548,11 @@ the one dependency. No AI library is installed, no data leaves your machine
 except the Slack message you opted into, and `AGENTS.md` is just a file.
 
 **With AI**, when you want it. Set `AI_ANALYSIS_ENABLED=true` in `.env` (off by
-default; the MCP server refuses to start without it and `AGENTS.md` tells
-every agent to stop). Point Claude Code, Codex, Cursor or any agent that reads
-`AGENTS.md` at the repo. That file is the rules the agent works under: read
+default; an environment variable of the same name overrides `.env`; the MCP
+server refuses to start without it and `AGENTS.md` tells every agent to stop;
+`python .claude/skills/dmarc-status-brief/ai_switch.py` prints `on` or `off`
+and nothing of what `.env` holds). Point Claude Code, Codex, Cursor or any
+agent that reads `AGENTS.md` at the repo. That file is the rules the agent works under: read
 `audit-out/latest/` first, deduplicate before believing any number, cite the
 artifact for every claim, draft DNS diffs and exception entries for a human to
 apply, never change DNS or tenant configuration, never handle credentials in
@@ -607,7 +613,7 @@ answer.
 | `src/mcp_server.py` | The tools above for any MCP client. |
 | `scripts/register_weekly_task.ps1` | Registers or removes the Windows scheduled task. |
 | `scripts/check_public.py` | Pre-push gate: deny terms, typographic dashes, and credential material never leave the repo. |
-| `scripts/check_doc.py` | Checks a polished copy of the status document against its run: every number, plan id, finding id and `p=` / `sp=` / `pct=` value must be in the run's files, and the punctuation must follow the voice rules. One line per problem, never the copy's content. |
+| `scripts/check_doc.py` | Checks a polished copy of the status document against its run: every number, date, percentage, plan id, finding id and `p=` / `sp=` / `pct=` value must be in the run's files, and the punctuation must follow the voice rules. One line per problem, never the copy's content. |
 | `.claude/skills/dmarc-status-brief/` | The agent skill that finds the run, renders `brief.html`, and on request polishes the leadership summary, the owner messages and the DNS change ticket, each checked with `check_doc.py`. |
 | `queries/` | Nine advanced-hunting queries: deduplicated census and failures, subdomain health, override audit, echo-vs-loss twins, pre-reject DKIM alignment, impersonation, the raw per-leg export that feeds `dedupe.py` (with the override each leg recorded), and the full-window totals `collect.py` counts for an organization its row budget or the API cap cut. |
 | `samples/` | Synthetic mail log, aggregate reports, annotated headers and `owners.csv.example`, so every tool can be tried offline. |

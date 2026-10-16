@@ -1416,6 +1416,12 @@ def main():
         brief.write_run(run_dir.resolve())
     except Exception as err:
         note("no brief.html written (%s: %s)" % (type(err).__name__, err))
+        # the note says there is no page, so none may be left for latest/ to copy: brief.py writes all or nothing,
+        # and whatever failed on the way, a half-written brief.html never stands in for this run's
+        try:
+            (run_dir / "brief.html").unlink(missing_ok=True)
+        except OSError as gone:
+            note("a partial brief.html is left in %s (%s): it is not this run's page" % (run_dir, gone))
     try:  # how to check every finding and plan row by hand, from the files above: it never fails the run
         verify.write(report, plan_doc, run_dir)
     except Exception as err:

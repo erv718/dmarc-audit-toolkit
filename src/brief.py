@@ -18,12 +18,16 @@ A browser prints it to PDF (A4 or Letter, light palette). The page is one
 self-contained file: no script, no font, no image, no link out, and a
 Content-Security-Policy that forbids them anyway. Part of the data is
 written by strangers (spoofed subject lines, display names, sender
-addresses), so every string from either file is HTML-escaped, and the only
-marks honoured inside one are the generator's own **bold** and `code`,
-converted after escaping. The same inputs give the same bytes. Every list of
-domains follows the run's one order (audit.domain_key): the headline
-organization (next_steps.json org_domain) first, then each organization by
-name, its organizational domain first and the names below it by name.
+addresses), so every string from either file is HTML-escaped, a character
+that would hide or reorder the text around it (U+202E, a zero-width space)
+shows as a visible marker such as [U+202E], and the only marks honoured
+inside a string are the generator's own **bold** and `code`, converted
+after escaping. The same inputs give the same bytes. Every list of domains
+follows the run's one order (audit.domain_key): the headline organization
+(next_steps.json org_domain) first, then each organization by name, its
+organizational domain first and the names below it by name; the plan's
+records run in the plan's own order (plan.row_key), the order plan.md,
+todo.md and the plan ids follow.
 
 Relative paths resolve from the repo root, as in every tool here. Exit
 codes: 0 written, 2 usage or input error. Never a traceback.
@@ -33,22 +37,30 @@ import argparse
 import html
 import itertools
 import json
+import math
+import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 import audit  # the one domain order (domain_key) every list of names follows
 import next_steps  # the document's own words and thresholds, so the page says what next_steps.md says
-import plan as plan_mod  # the plan's priority and kind words
+import plan as plan_mod  # the plan's priority and kind words, and its row order
 
 ROOT = Path(__file__).resolve().parent.parent
 NOT_IN_RUN = "Not in this run."
+NO_QUESTIONS = "None from this run."  # next_steps.md's words for an Open questions section the run left empty
+NO_DOMAINS = "No domain was audited in this run."  # and for a Per domain section with no row
+EMPTY_PLAN = "No DNS changes: the plan proposes no record and holds nothing."
 # the page's sections, in order, with the titles the table of contents links: (fixed id, title)
 SECTIONS = (("stand", "Where we stand"), ("next-step", "The next step"), ("domains", "Per domain"),
             ("failing", "What is failing"), ("owners", "What happens next, by owner"), ("ask", "The ask"),
             ("dns", "DNS changes"), ("questions", "Open questions"), ("glossary", "Glossary"))
 # every id on the page, in page order: the masthead, the contents and the one-liner, the sections, the footer
 SECTION_IDS = ("top", "contents", "summary") + tuple(sid for sid, _ in SECTIONS) + ("footer",)
+# a record card's id, from its place in the DNS changes section (never from the data): the index links to it
+CARD_ID = "rec-%d"
 VERIFY_LINE = ("To check any number or record here yourself, follow verify.md next to this file: the lookup, query "
                "or command for every finding and every plan row, with the value to expect.")
 CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'"
@@ -65,6 +77,8 @@ ACTION_RANK = {"p1summary": 0, "p1record": 0, "dns": 1, "sender": 2, "override":
 FAILING_BLOCKS = (("By envelope domain (", "by_envelope"), ("By sender address (", "by_sender"),
                   ("From the outside (aggregate reports; these counts", "outside"))
 SUBJECT_MAX = 100  # characters of a subject shown in a table cell; the rest is in next_steps.json
+# a per-domain row read as a block on a phone: the column names, fixed text in the style, never from the data
+DOMAIN_HEADS = ("Domain", "Policy", "Gate", "Next step", "Mail flow")
 
 # The design plan: every color and font on the page comes from these tokens, light by default, dark when the
 # reader's system asks for it (or a host sets data-theme), and light again on paper.
@@ -85,6 +99,12 @@ def _tokens(pairs):
     """A token block's declarations, a few to a line."""
     decls = ["%s: %s;" % kv for kv in pairs]
     return "".join("  %s\n" % " ".join(decls[i:i + 5]) for i in range(0, len(decls), 5))
+
+
+def _stacked_labels():
+    """The per-domain table's column names as the labels of a row read as a block (fixed text)."""
+    return "".join('  table.stack td:nth-child(%d)::before { content: "%s"; }\n' % (i, h)
+                   for i, h in enumerate(DOMAIN_HEADS, 1))
 
 
 COMPONENTS = """\
@@ -113,8 +133,8 @@ strong { font-weight: 650; }
 .sources { font-size: 0.875rem; color: var(--muted); max-width: 70ch; }
 .toc { display: flex; flex-direction: column; gap: 0.4rem; }
 .toc ol { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 0.3rem 1.25rem; font-size: 0.875rem; }
-.lede { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
-  padding: 1.1rem 1.25rem; break-inside: avoid; }
+.lede { width: fit-content; max-width: 100%; background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 1.1rem 1.25rem; }
 .lede p { font-size: 1.125rem; max-width: 70ch; }
 .section { display: flex; flex-direction: column; gap: 1rem; border-top: 1px solid var(--line); padding-top: 1.5rem; }
 .section-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 1rem; }
@@ -125,31 +145,45 @@ strong { font-weight: 650; }
 .lines > li { position: relative; padding-left: 1rem; }
 .lines > li::before { content: ""; position: absolute; left: 0.2rem; top: 0.62em; width: 0.34rem; height: 0.34rem;
   border: 0.17rem solid var(--muted); border-radius: 50%; }
+.lines > li.item { display: flex; flex-direction: column; gap: 0.35rem; }
 .note, .why, .empty, .muted { color: var(--muted); }
 .note { font-size: 0.875rem; }
 .empty { font-style: italic; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: 0.75rem; }
 .tile { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
-  padding: 0.85rem 1rem; display: flex; flex-direction: column; gap: 0.3rem; break-inside: avoid; }
+  padding: 0.85rem 1rem; display: grid; grid-row: span 4; grid-template-rows: subgrid; row-gap: 0.3rem;
+  align-content: start; break-inside: avoid; }
 .figure { font-size: 2rem; font-weight: 650; line-height: 1.15; font-variant-numeric: tabular-nums; }
 .figure .side { font-size: 0.875rem; font-weight: 400; color: var(--muted); }
 .figure.words { font-size: 1.125rem; line-height: 2.05; }
 .figure.na { font-size: 1.125rem; line-height: 2.05; font-weight: 400; color: var(--muted); }
 .caption { font-size: 0.875rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.scope { font-size: 0.78rem; line-height: 1.4; color: var(--muted); font-variant-numeric: tabular-nums; }
+.scope .d { white-space: nowrap; }
 .pill { display: inline-block; font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.5;
   padding: 0 0.55rem; border: 1px solid currentColor; border-radius: 999px; white-space: nowrap; }
 .pill.ok { color: var(--ok); background: var(--ok-bg); }
 .pill.warn { color: var(--warn); background: var(--warn-bg); }
 .pill.bad { color: var(--bad); background: var(--bad-bg); }
 .pill.info { color: var(--info); background: var(--info-bg); }
-.tag { display: inline-block; font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.5;
-  padding: 0 0.4rem; border: 1px solid var(--line); border-radius: 4px; color: var(--ink); white-space: nowrap; }
+.tag { display: inline-block; max-width: 100%; font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.5;
+  padding: 0 0.4rem; border: 1px solid var(--line); border-radius: 4px; color: var(--ink); overflow-wrap: anywhere; }
+.refs { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem; max-width: 100%; }
+.refs .muted { font-size: 0.875rem; }
+.dn, .hook, .subject, .channel { unicode-bidi: isolate; }
+.dn > * { white-space: nowrap; }
+.card .dn > * { display: inline-block; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 .step { display: flex; flex-direction: column; gap: 0.75rem; }
 .step-label { font-size: 1.125rem; font-weight: 600; }
 .verdict { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.6rem; }
+.verdict .mono { font-size: 0.875rem; }
 .checklist { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
 .checklist li { display: grid; grid-template-columns: 1rem minmax(0, 1fr); gap: 0.6rem; align-items: start; }
 .box { width: 0.95rem; height: 0.95rem; margin-top: 0.3rem; border: 1.5px solid var(--muted); border-radius: 3px; }
+.checklist.compact { gap: 0.2rem; font-size: 0.875rem; }
+.checklist.compact li { grid-template-columns: 0.85rem minmax(0, 1fr); gap: 0.5rem; }
+.checklist.compact .box { width: 0.8rem; height: 0.8rem; margin-top: 0.28rem; }
+.pre { display: flex; flex-direction: column; gap: 0.25rem; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
 th, td { text-align: left; vertical-align: top; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--line); }
@@ -157,8 +191,10 @@ thead th { font-size: 0.78rem; font-weight: 600; color: var(--muted); border-bot
   white-space: nowrap; }
 tr { break-inside: avoid; }
 tr.org th { background: var(--sunken); font-family: var(--font-mono); font-weight: 600; }
+tbody + tbody > tr:first-child > * { border-top: 1px solid var(--muted); }
 .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-td.name { font-family: var(--font-mono); overflow-wrap: anywhere; min-width: 12ch; }
+td.name { font-family: var(--font-mono); }
+table.stack td.name { min-width: 26ch; }
 td.name b, .card-head .name b { font-weight: 600; }
 .apex { color: var(--muted); }
 .rest { display: block; font-size: 0.78rem; color: var(--muted); }
@@ -166,38 +202,63 @@ td.name b, .card-head .name b { font-weight: 600; }
 .owner { display: flex; flex-direction: column; gap: 0.6rem; }
 .owner > h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.75rem; }
 .channel { font-family: var(--font-mono); font-size: 0.78rem; font-weight: 400; color: var(--muted); }
+.org-block { display: flex; flex-direction: column; gap: 0.5rem; }
+.org-block > .lines { padding-inline-start: 1rem; }
 .org-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.75rem; font-family: var(--font-mono);
   font-size: 0.875rem; font-weight: 600; background: var(--sunken); border-radius: 4px; padding: 0.3rem 0.6rem; }
 .count, .sub { font-family: var(--font-body); font-size: 0.78rem; font-weight: 400; color: var(--muted);
   font-variant-numeric: tabular-nums; }
 .hook { font-weight: 600; }
-.ask { background: var(--sunken); border-radius: var(--radius); padding: 1rem 1.25rem; }
+.ask { width: fit-content; max-width: 100%; background: var(--sunken); border-radius: var(--radius);
+  padding: 1rem 1.25rem; }
+table.index td:first-child { font-family: var(--font-mono); white-space: nowrap; }
 .cards { display: flex; flex-direction: column; gap: 0.75rem; }
 .card { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
-  padding: 1rem 1.1rem; display: flex; flex-direction: column; gap: 0.65rem; break-inside: avoid; }
+  padding: 0.85rem 1rem; display: flex; flex-direction: column; gap: 0.55rem; break-inside: avoid; }
 .card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.3rem 0.75rem; }
-.card-head .name { font-family: var(--font-mono); overflow-wrap: anywhere; }
-.fields { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0.35rem 1rem; font-size: 0.875rem; }
-.fields dt { color: var(--muted); }
+.card-head .name { font-family: var(--font-mono); min-width: 0; }
+.fields { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 1fr) minmax(0, 1fr); gap: 0.45rem 1.25rem;
+  font-size: 0.875rem; }
+.field { display: grid; grid-template-columns: 5.5rem minmax(0, 1fr); gap: 0.6rem; align-items: baseline;
+  min-width: 0; }
+.field.wide { grid-column: 1 / -1; }
+.fields dt { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); }
 .fields dd { min-width: 0; overflow-wrap: anywhere; }
 pre.value { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.875rem; background: var(--sunken);
-  border-radius: 4px; padding: 0.45rem 0.6rem; }
+  border-radius: 4px; padding: 0.4rem 0.6rem; }
+.card .why { font-size: 0.875rem; }
 .zone { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.6rem; }
 .glossary { display: flex; flex-direction: column; gap: 0.5rem; }
 .term { display: grid; grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr); gap: 0.15rem 1.25rem; }
 .term dt { font-weight: 600; }
+.term dd, .foot p { max-width: 70ch; }
 .foot { display: flex; flex-direction: column; gap: 0.35rem; border-top: 1px solid var(--line); padding-top: 1rem;
   font-size: 0.78rem; color: var(--muted); }
-@media (max-width: 40rem) { .term { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 40rem) {
+  .term { grid-template-columns: minmax(0, 1fr); }
+  .fields { grid-template-columns: minmax(0, 1fr); }
+  table.stack, table.stack tbody, table.stack tr, table.stack th, table.stack td { display: block; }
+  table.stack thead { display: none; }
+  table.stack tr { padding-block: 0.45rem; border-bottom: 1px solid var(--line); }
+  table.stack tr.org { padding-block: 0; border-bottom: 0; }
+  table.stack td { position: relative; min-width: 0; padding: 0.15rem 0 0.15rem 6.5rem; border: 0; }
+  table.stack td::before { position: absolute; left: 0; top: 0.3rem; font-family: var(--font-mono); font-size: 0.7rem;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  table.stack tbody + tbody > tr:first-child > * { border-top: 0; }
+  table.stack tbody + tbody { border-top: 1px solid var(--muted); }
+""" + _stacked_labels() + """\
+}
 @page { margin: 16mm 14mm; }
 @media print {
   html { font-size: 11pt; }
   body { background: var(--surface); }
   .brief { max-width: none; padding: 0; gap: 1.5rem; }
-  .tiles { grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .table-wrap { overflow: visible; }
   a { color: inherit; text-decoration: none; }
-  .tile, .card, .lede, .ask, tr, .checklist li { break-inside: avoid; }
+  .tile, .card, .ask, tr, .checklist li { break-inside: avoid; }
+  .zone, tr.org, .org-head, .pre > .k { break-after: avoid; }
 }
 """
 
@@ -237,6 +298,16 @@ def _texts(value):
     return [x for x in _list(value) if isinstance(x, str) and x.strip()]
 
 
+def _shown(value):
+    """A field a record card shows: a string as it is, a whole number in digits (a TTL); anything else (None, a
+    list, an object, a boolean - a damaged file) as '', never as Python would spell it."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
 def _num(value):
     """A count the document carries, else None: never a bool, never NaN or
     an infinity (JSON as Python reads it can spell both)."""
@@ -245,8 +316,14 @@ def _num(value):
     return None if value in (float("inf"), float("-inf")) else value
 
 
+def _count(value):
+    """A count as the page shows it: its digits, or '?' when the document's value is missing or damaged."""
+    n = _num(value)
+    return "?" if n is None else str(n)
+
+
 def _norm(name):
-    return str(name or "").strip().lower().rstrip(".")
+    return _text(name).lower().rstrip(".")
 
 
 def _plural(n, one, many=None):
@@ -259,10 +336,40 @@ def _counted(n, one, many=None):
 
 # ------------------------------------------------------------------ escaping: every string from the data goes here
 
+ODD_RX = re.compile(r"[^\t\n\r\x20-\x7e]")  # anything but printable ASCII and the three whitespace controls
+
+
+def clean(value):
+    """Data as a reader may see it. A character no reader can see, or one
+    that reorders the text around it - a Unicode format character such as
+    U+202E or U+200B, a control other than tab and the line breaks -
+    becomes a visible marker, [U+202E]; a lone surrogate (JSON can spell
+    one, UTF-8 cannot carry it) becomes U+FFFD. Text from mail can then
+    change only its own look: it can neither mirror nor hide the
+    generator's words, counts, ids or IPs around it."""
+    text = "" if value is None else str(value)
+    if not ODD_RX.search(text):
+        return text
+    out = []
+    for ch in text:
+        if " " <= ch <= "~" or ch in "\t\n\r":
+            out.append(ch)
+            continue
+        cat = unicodedata.category(ch)
+        if cat == "Cs":
+            out.append("\ufffd")
+        elif cat in ("Cf", "Cc"):
+            out.append("[U+%04X]" % ord(ch))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def esc(value):
-    """Data as HTML text: escaped, quotes included, so no string from either
-    file can open a tag or leave an attribute."""
-    return html.escape("" if value is None else str(value), quote=True)
+    """Data as HTML text: made visible (clean), then escaped, quotes
+    included, so no string from either file can open a tag, leave an
+    attribute or turn the line around it."""
+    return html.escape(clean(value), quote=True)
 
 
 CODE_RX = re.compile(r"`([^`\n]+)`")
@@ -285,32 +392,72 @@ def marks(value):
     return KEPT_RX.sub(lambda m: codes[int(m.group(1))], text)
 
 
-# ------------------------------------------------------------------ the one domain order
+# ------------------------------------------------------------------ the one domain order, and names that break well
 
 def org_of(name):
     """The organization a name belongs to, as the run's one order groups it."""
-    return audit.domain_key(name)[1]
+    return audit.domain_key(_text(name))[1]
 
 
 def dkey(name, headline):
     """audit.domain_key: the headline's organization first, then each
     organization by name, its organizational domain first and the names
     below it by name."""
-    return audit.domain_key(name, headline)
+    return audit.domain_key(_text(name), headline)
+
+
+NAME_RUN_RX = re.compile(r"[^.@]*[.@]|[^.@]+")
+
+
+def _runs(text):
+    """A DNS name or an address cut after each dot and each @, the only
+    places it may break: 'dev.support.example.com' is dev. support.
+    example. com."""
+    return NAME_RUN_RX.findall(text)
 
 
 def name_html(name, org=None):
     """A domain as the tables and cards show it: a subdomain's own labels in
     the foreground and its organization's part muted
-    (<b>pay</b><span class="apex">.example.com</span>); an apex in bold."""
-    text = str(name or "").strip()
+    (<b>pay.</b><wbr><span class="apex">example.</span>...); an apex in
+    bold. Each label is one unbreakable piece with a break opportunity
+    after its dot, so a narrow column breaks the name only between labels,
+    never inside one."""
+    text = _text(name)
+    if not text:
+        return ""
     base = text.rstrip(".")
     org = _norm(org) or org_of(base)
     suffix = "." + org
+    own = len(text)
     if org and len(base) > len(suffix) and base[-len(suffix):].lower() == suffix:
-        own = base[:-len(suffix)]
-        return '<b>%s</b><span class="apex">%s</span>' % (esc(own), esc(text[len(own):]))
-    return "<b>%s</b>" % esc(text)
+        own = len(base) - len(suffix) + 1  # the subdomain's own labels and the dot after them
+    parts, pos = [], 0
+    for run in _runs(text):
+        end = pos + len(run)
+        if end <= own:
+            parts.append("<b>%s</b>" % esc(run))
+        elif pos >= own:
+            parts.append('<span class="apex">%s</span>' % esc(run))
+        else:
+            parts.append('<span><b>%s</b><span class="apex">%s</span></span>' % (esc(text[pos:own]), esc(text[own:end])))
+        pos = end
+    return '<span class="dn">%s</span>' % "<wbr>".join(parts)
+
+
+IP_RX = re.compile(r"[0-9.]+|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*")  # an IPv4 or IPv6 address: one piece, never cut
+
+
+def plain_name(value):
+    """A name or address with no emphasis (a sender, an envelope domain, a
+    record's host name), cut the same way: it breaks only after a dot or an
+    @, never inside a label; an IP address is one piece. '?' when the
+    document has none."""
+    text = _text(value)
+    if not text:
+        return "?"
+    runs = [text] if IP_RX.fullmatch(text) else _runs(text)
+    return '<span class="dn">%s</span>' % "<wbr>".join("<span>%s</span>" % esc(r) for r in runs)
 
 
 # ------------------------------------------------------------------ small parts
@@ -323,7 +470,7 @@ def pill(cls, word):
 def policy_class(text):
     """A policy's pill color: reject is where enforcement ends, quarantine on
     the way, none and no record are unprotected; anything else is plain."""
-    t = str(text or "").strip().lower()
+    t = _text(text).lower()
     if t.startswith("p=reject"):
         return "ok"
     if t.startswith("p=quarantine"):
@@ -336,7 +483,7 @@ def policy_class(text):
 def policy_cell(text):
     """The policy pill, with what follows the policy itself ('(inherited
     from example.com)') muted beneath it."""
-    text = str(text or "").strip()
+    text = _text(text)
     if not text:
         return ""
     head, sep, rest = text.partition(" (")
@@ -362,20 +509,59 @@ def tag(text, cls="tag"):
     return '<span class="%s">%s</span>' % (cls, esc(text))
 
 
+def refs_html(tags):
+    """Several tags in one row that wraps between them, never one box wider than the page."""
+    return '<span class="refs">%s</span>' % " ".join(tags)
+
+
+REF_ID_RX = re.compile(r"(?<![A-Za-z0-9])[A-Z]+-\d+(?: to [A-Z]+-\d+)?(?![0-9])")
+
+
+def ref_tags(ref):
+    """An item's reference as tags. One id or one range ('P-04', 'plan P-03
+    to P-07', 'MAILFLOW-002') is one tag, as next_steps.md writes it;
+    several ('plan P-01, P-03, P-05, ...', a bundle whose ids do not run
+    without a gap) are one tag each, in a row that wraps between them, with
+    the words around them ('plan') muted - so a long list of ids never
+    pushes the page sideways."""
+    ref = _text(ref)
+    if not ref:
+        return ""
+    found = list(REF_ID_RX.finditer(ref))
+    if len(found) <= 1:
+        return tag(ref)
+    out, pos = [], 0
+    for m in found:
+        words = ref[pos:m.start()].strip(" ,;")
+        if words and words != "and":
+            out.append('<span class="muted">%s</span>' % esc(words))
+        out.append(tag(m.group(0)))
+        pos = m.end()
+    tail = ref[pos:].strip(" ,;")
+    if tail:
+        out.append('<span class="muted">%s</span>' % esc(tail))
+    return refs_html(out)
+
+
 def id_tags(ids):
-    """Plan ids as small tags after a step; more than three as one range."""
+    """A per-domain row's plan ids after its step: one tag each in a row that
+    wraps, or one tag for a run of more than three that has no gap (as
+    next_steps.md writes it, 'P-03 to P-07')."""
     ids = list(dict.fromkeys(i for i in ids if i))
     if not ids:
         return ""
-    if len(ids) > 3:
-        return " " + tag(next_steps.id_range(ids))
-    return " " + " ".join(tag(i) for i in ids)
+    if len(ids) == 1:
+        return " " + tag(ids[0])
+    joined = next_steps.id_range(ids)
+    if len(ids) > 3 and " to " in joined and ", " not in joined:
+        return " " + tag(joined)
+    return " " + refs_html([tag(i) for i in ids])
 
 
-def checklist(texts):
+def checklist(texts, cls="checklist"):
     """Conditions as a checklist of unchecked boxes: the reader ticks them."""
-    return '<ul class="checklist">%s</ul>' % "".join(
-        '<li><span class="box" aria-hidden="true"></span><span>%s</span></li>' % marks(t) for t in texts)
+    return '<ul class="%s">%s</ul>' % (cls, "".join(
+        '<li><span class="box" aria-hidden="true"></span><span>%s</span></li>' % marks(t) for t in texts))
 
 
 def bullets(texts, cls="lines"):
@@ -387,22 +573,24 @@ def block(title, inner):
     return '<div class="group"><h3>%s</h3>%s</div>' % (esc(title), inner)
 
 
-def table(heads, body_rows, numeric=()):
+def table(heads, body_rows, numeric=(), cls=""):
     """A table inside its scrolling wrapper: heads as column titles (fixed
-    text), body_rows as already-built <tr> or <tbody> markup."""
+    text), body_rows as already-built <tr> or <tbody> markup; cls one of the
+    page's fixed table classes (stack, index)."""
     th = "".join('<th scope="col"%s>%s</th>' % (' class="num"' if i in numeric else "", esc(h))
                  for i, h in enumerate(heads))
     body = "".join(body_rows)
     if not body.startswith("<tbody"):
         body = "<tbody>%s</tbody>" % body
-    return '<div class="table-wrap"><table><thead><tr>%s</tr></thead>%s</table></div>' % (th, body)
+    return '<div class="table-wrap"><table%s><thead><tr>%s</tr></thead>%s</table></div>' % (
+        (' class="%s"' % cls) if cls in ("stack", "index") else "", th, body)
 
 
-def section(sid, title, parts, meta=""):
-    """One section: its fixed id and title, then its parts - or Not in this
-    run. when it has none, as next_steps.md says of a section with no
-    evidence (a zero is not evidence of health)."""
-    parts = [p for p in parts if p] or ['<p class="empty">%s</p>' % NOT_IN_RUN]
+def section(sid, title, parts, meta="", empty=NOT_IN_RUN):
+    """One section: its fixed id and title, then its parts - or, when it has
+    none, the sentence next_steps.md says there (empty): Not in this run.
+    for a section with no evidence (a zero is not evidence of health)."""
+    parts = [p for p in parts if p] or ['<p class="empty">%s</p>' % esc(empty)]
     head = "<h2>%s</h2>" % esc(title)
     if meta:
         head = '<div class="section-head">%s<p class="meta">%s</p></div>' % (head, meta)
@@ -439,28 +627,59 @@ def contents():
 
 
 def lede(doc):
-    """The one-liner, as the lede: policy today, who still fails, the next safe step."""
+    """The one-liner, as the lede: policy today, who still fails, the next
+    safe step. Its panel is as wide as its text, never a band of empty
+    surface beside it."""
     text = _text(doc.get("one_liner"))
     inner = "<p>%s</p>" % marks(text) if text else '<p class="empty">%s</p>' % NOT_IN_RUN
     return '<section id="summary" class="lede" aria-label="In one line">%s</section>' % inner
 
 
-def tile(label, figure, caption, side=""):
-    """One KPI tile: the label above, the figure, a one-line caption below.
-    A figure the run does not have says so in words, never as a zero."""
+def tile(label, figure, caption, side="", scope=""):
+    """One KPI tile: the label above, the figure, a one-line caption below
+    it and the scope the figure counts (scope: markup from log_scope or
+    outside_scope - which source, which domains, which span) - always four
+    rows, so the tiles' rows line up. A figure the run does not have says
+    so in words, never as a zero."""
     if figure is None:
         fig = '<p class="figure na">not in this run</p>'
     elif isinstance(figure, str) and not re.match(r"^[+-]?\d", figure):
         fig = '<p class="figure words">%s</p>' % esc(figure)
     else:
         fig = '<p class="figure">%s%s</p>' % (esc(figure), (' <span class="side">%s</span>' % esc(side)) if side else "")
-    return '<div class="tile"><p class="label">%s</p>%s<p class="caption">%s</p></div>' % (esc(label), fig, marks(caption))
+    return ('<div class="tile"><p class="label">%s</p>%s<p class="caption">%s</p><p class="scope">%s</p></div>'
+            % (esc(label), fig, marks(caption), scope))
+
+
+def _unbroken(text):
+    """A span or a date that must not break across lines ('59-minute span', '2026-09-18'), as markup."""
+    return '<span class="d">%s</span>' % esc(text)
+
+
+def log_scope(st):
+    """What a mail-log figure counts, as markup: every domain in the mail
+    log - the one-liner counts one organization's, so the two figures
+    differ - over the span next_steps.md names ('59-minute')."""
+    try:
+        phrase = next_steps.span_phrase(_dict(st.get("maillog_window")) or None) or ""
+    except Exception:  # a damaged window names no span; the figure still counts the whole log
+        phrase = ""
+    m = re.match(r"the mail log's (\S+) span", phrase)
+    return "all domains in the mail log" + (", " + _unbroken("%s span" % m.group(1)) if m else "")
+
+
+def outside_scope(sb):
+    """What the receivers' figures count, as markup: the outside view, the
+    aggregate reports over their own window."""
+    win = _texts(sb.get("window"))
+    return "aggregate reports" + (", %s to %s" % (_unbroken(win[0]), _unbroken(win[1])) if len(win) == 2 else "")
 
 
 def trend_tile(st):
     """The trend as next_steps.md's trend line computes it: the change in
     genuine failures, else in the pass rate, from the previous run's figures
-    and this run's."""
+    and this run's. A difference that is not a finite number (a damaged
+    figure) is not comparable, never a crash."""
     tr = st.get("trend")
     if not isinstance(tr, dict):
         return tile("Trend", "first run", "no trend yet")
@@ -468,11 +687,11 @@ def trend_tile(st):
     gf, prev_gf = _num(st.get("genuine_failures")), _num(tr.get("previous_genuine_failures"))
     sb = _dict(st.get("spoofing_blocked"))
     pr, prev_pr = _num(sb.get("pass_rate")), _num(tr.get("previous_pass_rate"))
-    if gf is not None and prev_gf is not None:
-        return tile(label, "%+d" % (gf - prev_gf), "genuine failures, %d -> %d" % (prev_gf, gf))
-    if pr is not None and prev_pr is not None:
+    if gf is not None and prev_gf is not None and math.isfinite(gf - prev_gf):
+        return tile(label, "%+d" % (gf - prev_gf), "genuine failures, %d -> %d" % (prev_gf, gf), scope=log_scope(st))
+    if pr is not None and prev_pr is not None and math.isfinite(100 * (pr - prev_pr)):
         return tile(label, "%+.1f pts" % (100 * (pr - prev_pr)),
-                    "pass rate, %.1f%% -> %.1f%%" % (100 * prev_pr, 100 * pr))
+                    "pass rate, %.1f%% -> %.1f%%" % (100 * prev_pr, 100 * pr), scope=outside_scope(sb))
     why = _texts(tr.get("not_comparable"))
     return tile(label, "not comparable", why[0] if why else "the two runs share no failure count or pass rate")
 
@@ -481,8 +700,10 @@ def stand_tiles(st):
     """The four figures of Where we stand as tiles - genuine failures with
     the raw count beside them, delivered despite failing, what receivers
     rejected and quarantined, the trend - each label short enough to stay on
-    one line, so the figures line up; none when the document carries none of
-    them. The section's lines below say each figure in full."""
+    one line, and each with its scope: the mail-log figures count every
+    domain in the mail log (the one-liner counts one organization's), the
+    receivers' the aggregate reports. None when the document carries none
+    of them. The section's lines below say each figure in full."""
     if not any(k in st for k in ("genuine_failures", "delivered_despite_fail", "spoofing_blocked", "trend")):
         return ""
     tiles = []
@@ -494,16 +715,17 @@ def stand_tiles(st):
         gone = _num(st.get("genuine_failures_excepted"))
         cap = "no passing copy, in the rows the cut log kept" if st.get("truncation") else "messages with no passing copy"
         tiles.append(tile("Genuine failures", gf, cap + ("; %s formally excepted" % gone if gone else ""),
-                          ("raw %s" % raw) if raw is not None else ""))
+                          ("raw %s" % raw) if raw is not None else "", log_scope(st)))
     ddf = _num(st.get("delivered_despite_fail"))
-    tiles.append(tile("Delivered despite failing", ddf,
-                      "reached a mailbox anyway" if ddf is not None else "no mail log was read"))
+    tiles.append(tile("Delivered despite failing", ddf, "reached a mailbox anyway" if ddf is not None else
+                      "no mail log was read", scope=log_scope(st) if ddf is not None else ""))
     sb = st.get("spoofing_blocked")
     if isinstance(sb, dict):
         rej, qua = _num(sb.get("rejected")) or 0, _num(sb.get("quarantined")) or 0
         msgs = _num(sb.get("messages"))
         tiles.append(tile("Rejected / quarantined", "%s / %s" % (rej, qua),
-                          "by receivers, of %s" % _counted(msgs, "message") if msgs is not None else "by receivers"))
+                          "by receivers, of %s" % _counted(msgs, "message") if msgs is not None else "by receivers",
+                          scope=outside_scope(sb)))
     else:
         tiles.append(tile("Rejected / quarantined", None, "no aggregate reports were read"))
     tiles.append(trend_tile(st))
@@ -512,15 +734,19 @@ def stand_tiles(st):
 
 def stand_section(doc):
     """Where we stand: the figures as tiles, then every line of the section
-    as next_steps.md writes it, the caveats with them."""
+    as next_steps.md writes it, the caveats with them. The heading's dates
+    say whose window they are (the aggregate reports'), so no reader dates
+    the mail-log figures by them."""
     st = _dict(doc.get("stand"))
     lines = _texts(st.get("lines"))
     for c in _texts(st.get("caveats")):  # an older document kept them apart from the lines
         if not any(c in line for line in lines):
             lines.append("**Caveat:** %s" % c)
     parts = [stand_tiles(st), bullets(lines) if lines else ""]
-    window = _text(_dict(st.get("window")).get("text")) or "this run's window"
-    meta = "%s, deduplicated" % esc(window) if any(parts) else ""
+    window = _dict(st.get("window"))
+    text, source = _text(window.get("text")), _text(window.get("source"))
+    span = ("%s %s" % (source, text)) if text and source else (text or "this run's window")
+    meta = "%s, deduplicated" % esc(span) if any(parts) else ""
     return section("stand", "Where we stand", parts, meta)
 
 
@@ -528,27 +754,34 @@ def next_step_section(doc):
     """The organization's next step: its label and plan id, the gate's
     verdict, then what holds it - a plan step's prerequisites are the
     conditions that make it ready, a gate step's are what holds it - and the
-    data an insufficient_data verdict asks for."""
+    data an insufficient_data verdict asks for, each said once. A domain
+    with no step left ('none - already at the end') has nothing on hold: its
+    gate's blockers are what is left to fix, and the pill is its gate's."""
     nxt = doc.get("next_step")
     if not isinstance(nxt, dict) or not _text(nxt.get("label")):
         return section("next-step", "The next step", [])
-    ref = _text(nxt.get("ref"))
+    label, ref = _text(nxt.get("label")), _text(nxt.get("ref"))
+    at_end = label.lower().startswith("none") and not ref  # next_steps.py's own test for no step left
     cls, word = GATE_PILLS.get(_text(nxt.get("verdict")), NOT_CHECKED)
-    prereqs = _texts(nxt.get("prerequisites"))
-    holds = [h for h in _texts(nxt.get("holds")) if h not in prereqs]
     data = _texts(nxt.get("data"))
+    prereqs = [p for p in _texts(nxt.get("prerequisites")) if p not in data]
+    holds = [h for h in _texts(nxt.get("holds")) if h not in prereqs and h not in data]
     gate_step = nxt.get("source") == "gate"
-    parts = ['<p class="step-label">%s%s</p>' % (marks(nxt["label"]), (" " + tag(ref)) if ref else ""),
-             '<p class="verdict"><span class="k">Gate</span>%s</p>' % pill(cls, word)]
+    org = _text(doc.get("org_domain"))
+    gate = ('<span class="k">Gate on</span><span class="mono">%s</span>' % esc(org)) if at_end and org else \
+        '<span class="k">Gate</span>'
+    parts = ['<p class="step-label">%s%s</p>' % (marks(label), (" " + ref_tags(ref)) if ref else ""),
+             '<p class="verdict">%s%s</p>' % (gate, pill(cls, word))]
     if _text(nxt.get("why")):
         parts.append('<p class="why">%s</p>' % marks(nxt["why"]))
     if data:
         parts.append(block("Needs more data", checklist(data)))
-    if prereqs:
+    if prereqs and at_end:
+        parts.append(block("What is left", bullets(prereqs)))
+    elif prereqs:
         parts.append(block("On hold while" if gate_step else "Ready when", checklist(prereqs)))
     if holds:  # the gate's blockers the plan row does not carry itself: observations, not boxes to tick
-        parts.append(block("Also on hold while", bullets(holds)))
-    org = _text(doc.get("org_domain"))
+        parts.append(block("Also left" if at_end else "Also on hold while", bullets(holds)))
     meta = ("for %s" % esc(org)) if org else ""
     return section("next-step", "The next step", ['<div class="step">%s</div>' % "".join(parts)], meta)
 
@@ -589,7 +822,7 @@ def domain_rows(doc, plan, head):
 
 def domain_row(e):
     r = e["row"]
-    step = marks(r.get("next_step")) + id_tags(e["ids"])
+    step = marks(_text(r.get("next_step"))) + id_tags(e["ids"])
     return ('<tr><td class="name">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>'
             % (name_html(e["name"], e["org"]), policy_cell(r.get("policy_today")),
                gate_cell(r.get("gate"), r.get("gate_text")), step, marks(_text(r.get("mailflow_text")) or "not measured")))
@@ -597,22 +830,24 @@ def domain_row(e):
 
 def domains_section(doc, plan, head):
     """Per domain: grouped by organization (headline first) when the rows
-    say which, one row per name; then the mail-flow note and the gate's notes
-    next_steps.md shows under its table."""
+    say which, one row per name - an organization's group row only where it
+    holds two names or more; a one-domain organization is a plain row in
+    its place - then the mail-flow note and the gate's notes next_steps.md
+    shows under its table. On a phone each row reads as a block, the column
+    names as its labels."""
     entries, grouped = domain_rows(doc, plan, head)
     parts = []
     if entries:
-        heads = ("Domain", "Policy", "Gate", "Next step", "Mail flow")
         if grouped:
             bodies = []
             for org, members in itertools.groupby(entries, key=lambda e: e["org"]):
                 members = list(members)
-                bodies.append('<tbody><tr class="org"><th colspan="5" scope="colgroup">%s <span class="count">%s'
-                              '</span></th></tr>%s</tbody>'
-                              % (esc(org), _counted(len(members), "domain"), "".join(domain_row(e) for e in members)))
-            parts.append(table(heads, bodies))
+                group_row = ('<tr class="org"><th colspan="5" scope="colgroup">%s <span class="count">%s</span></th></tr>'
+                             % (esc(org), _counted(len(members), "domain"))) if len(members) > 1 else ""
+                bodies.append("<tbody>%s%s</tbody>" % (group_row, "".join(domain_row(e) for e in members)))
+            parts.append(table(DOMAIN_HEADS, bodies, cls="stack"))
         else:
-            parts.append(table(heads, [domain_row(e) for e in entries]))
+            parts.append(table(DOMAIN_HEADS, [domain_row(e) for e in entries], cls="stack"))
         note = _text(_dict(doc.get("mailflow")).get("note"))
         if note:
             parts.append('<p class="note">%s</p>' % marks(note))
@@ -628,7 +863,8 @@ def domains_section(doc, plan, head):
             items = [marks(n["text"]) for n in notes]
         parts.append('<div class="group"><p class="note">%s</p><ul class="lines note">%s</ul></div>'
                      % (lead, "".join("<li>%s</li>" % i for i in items)))
-    return section("domains", "Per domain", parts)
+    none = doc.get("per_domain") == []  # a document that lists no domain says so, as next_steps.md does
+    return section("domains", "Per domain", parts, empty=NO_DOMAINS if none else NOT_IN_RUN)
 
 
 def _label(e):
@@ -645,9 +881,11 @@ def _headlines(entries):
 def _note_line(entries, cap=None):
     """The entries that are notes, not headlines, in next_steps.md's words
     ('name xN (label)', the first NOTES_CAP of them, then how many more);
-    a damaged entry is shown as it is, never a reason to fail."""
+    a damaged entry shows '?' where its name or count should be, never a
+    reason to fail and never Python's None."""
     cap = next_steps.NOTES_CAP if cap is None else cap
-    text = ", ".join("%s x%s (%s)" % (e.get("name"), _num(e.get("count")), _label(e)) for e in entries[:cap])
+    text = ", ".join("%s x%s (%s)" % (_text(e.get("name")) or "?", _count(e.get("count")), _label(e))
+                     for e in entries[:cap])
     if len(entries) > cap:
         text += " (+%d more in report.json)" % (len(entries) - cap)
     return text
@@ -655,24 +893,59 @@ def _note_line(entries, cap=None):
 
 def _subjects(e):
     out = []
-    for s in _list(e.get("subjects"))[:2]:
-        s = str(s)
+    for s in _texts(e.get("subjects"))[:2]:
         if len(s) > SUBJECT_MAX:  # cut at a word, so no number is left half shown
             s = (s[:SUBJECT_MAX].rsplit(" ", 1)[0] or s[:SUBJECT_MAX]) + "..."
         out.append('<span class="subject">"%s"</span>' % marks(s))
     return "".join(out)
 
 
+def failing_kept(failing):
+    """[(block, line)]: What is failing's other sentences (formal
+    exceptions, new senders, a log without verdicts, nothing failing), as
+    next_steps.md writes them - its lines without the lists the tables
+    carry - each with the FAILING_BLOCKS key of the list it sits under
+    (None for a line outside every list), so the page keeps a 'formally
+    excepted ... not counted above' line right after the table it
+    qualifies. A list whose data the document lacks keeps its lines."""
+    out, skipping, current = [], False, None
+    for line in _list(failing.get("lines")):
+        s = line.strip() if isinstance(line, str) else ""
+        if not s:
+            skipping, current = False, None
+            continue
+        block_key = next((key for title, key in FAILING_BLOCKS if s.startswith(title) and s.endswith(":")), None)
+        if block_key is not None:
+            current = block_key
+            skipping = isinstance(failing.get(block_key), list)
+            if skipping:
+                continue
+        if skipping and (s.startswith("- **") or s.startswith("- Notes, not headlines")):
+            continue
+        out.append((current, s[2:] if s.startswith("- ") else s))
+    return out
+
+
+def failing_rest(failing):
+    """What is failing's other sentences, in next_steps.md's order (failing_kept without the blocks)."""
+    return [line for _, line in failing_kept(failing)]
+
+
 def failing_tables(failing):
     """The headline entries of next_steps.md's What is failing lists as
     tables, each followed by its notes line (the entries under the headline
-    threshold, as next_steps.md writes it)."""
+    threshold, as next_steps.md writes it) and by the document's own lines
+    that belong to that list (a formal exception it does not count)."""
+    kept = failing_kept(failing)
+
+    def own(key):
+        return [line for k, line in kept if k == key]
     parts = []
     env = [e for e in _list(failing.get("by_envelope")) if isinstance(e, dict)]
     head, rest = _headlines(env)
     rows = []
     for e in head:
-        senders = [s for s in _list(e.get("senders")) if isinstance(s, str)]
+        senders = _texts(e.get("senders"))
         n = _num(e.get("sender_count")) or len(senders)
         detail = []
         if n:
@@ -680,71 +953,57 @@ def failing_tables(failing):
         if senders:
             detail.append("such as %s" % esc(", ".join(senders[:2])))
         rows.append('<tr><td class="name">%s</td><td class="num">%s</td><td>%s</td><td>%s%s</td></tr>'
-                    % (esc(e.get("name")), esc(_num(e.get("count"))), esc(_label(e)), "; ".join(detail), _subjects(e)))
+                    % (plain_name(e.get("name")), esc(_count(e.get("count"))), esc(_label(e)), "; ".join(detail),
+                       _subjects(e)))
     parts.append(failing_block("By envelope domain", "who actually handed the mail over", rows,
                                ("Envelope domain", "Messages", "Label", "Senders"), rest,
-                               "Notes, not headlines (under %d each): " % next_steps.HEADLINE_MIN))
+                               "Notes, not headlines (under %d each): " % next_steps.HEADLINE_MIN,
+                               extra=own("by_envelope")))
     snd = [e for e in _list(failing.get("by_sender")) if isinstance(e, dict)]
     head, rest = _headlines(snd)
     rows = ['<tr><td class="name">%s</td><td class="num">%s</td><td>%s</td><td>%s</td><td class="name">%s</td></tr>'
-            % (esc(e.get("name")), esc(_num(e.get("count"))), esc(_label(e)), _subjects(e), esc(_text(e.get("envelope"))))
+            % (plain_name(e.get("name")), esc(_count(e.get("count"))), esc(_label(e)), _subjects(e),
+               plain_name(e.get("envelope")) if _text(e.get("envelope")) else "")
             for e in head]
     parts.append(failing_block("By sender address", "what the reader sees in From", rows,
                                ("Sender", "Messages", "Label", "Subjects", "Envelope"), rest,
-                               "Notes, not headlines (under %d each): " % next_steps.HEADLINE_MIN))
+                               "Notes, not headlines (under %d each): " % next_steps.HEADLINE_MIN,
+                               extra=own("by_sender")))
     out = [e for e in _list(failing.get("outside")) if isinstance(e, dict)]
     head, rest = _headlines(out)
     rows = []
     for e in head:
         disp = ", ".join("%s %s" % (_num(v), k) for k, v in _dict(e.get("dispositions")).items() if _num(v))
         rows.append('<tr><td class="name">%s</td><td class="num">%s</td><td class="name">%s</td><td>%s</td><td>%s</td></tr>'
-                    % (esc(e.get("name")), esc(_num(e.get("count"))),
-                       esc(", ".join(str(h) for h in _list(e.get("header_from"))[:2]) or "?"), esc(_label(e)), esc(disp)))
+                    % (plain_name(e.get("name")), esc(_count(e.get("count"))),
+                       esc(", ".join(_texts(e.get("header_from"))[:2]) or "?"), esc(_label(e)), esc(disp)))
     notes = ("Notes, not headlines: " + _note_line(rest, len(rest))) if rest else ""  # next_steps.md lists them all
     parts.append(failing_block("From the outside", "aggregate reports; these counts include forwarded copies and "
                                "cannot be deduplicated", rows, ("Source", "Failing", "As", "Label", "Receivers"),
-                               [], "", notes))
+                               [], "", notes, extra=own("outside")))
     return [p for p in parts if p]
 
 
-def failing_block(title, sub, rows, heads, rest, lead, notes=""):
-    """One What is failing list: its title, the table of headline rows, the notes line."""
+def failing_block(title, sub, rows, heads, rest, lead, notes="", extra=()):
+    """One What is failing list: its title, the table of headline rows, the
+    notes line, then the document's lines that belong to it (extra). A list
+    with no table keeps only those lines, in its place."""
     if rest:
         notes = lead + _note_line(rest)
     if not rows and not notes:
-        return ""
+        return bullets(extra) if extra else ""
     inner = table(heads, rows, numeric=(1,)) if rows else ""
     if notes:
         inner += '<p class="note">%s</p>' % esc(notes)
+    if extra:
+        inner += bullets(extra)
     return '<div class="group"><h3>%s <span class="sub">%s</span></h3>%s</div>' % (esc(title), esc(sub), inner)
-
-
-def failing_rest(failing):
-    """What is failing's other sentences (formal exceptions, new senders, a
-    log without verdicts, nothing failing), as next_steps.md writes them: its
-    lines without the lists the tables carry. A list whose data the document
-    lacks keeps its lines."""
-    out, skipping = [], False
-    for line in _list(failing.get("lines")):
-        s = line.strip() if isinstance(line, str) else ""
-        if not s:
-            skipping = False
-            continue
-        block_key = next((key for title, key in FAILING_BLOCKS if s.startswith(title) and s.endswith(":")), None)
-        if block_key is not None:
-            skipping = isinstance(failing.get(block_key), list)
-            if skipping:
-                continue
-        if skipping and (s.startswith("- **") or s.startswith("- Notes, not headlines")):
-            continue
-        out.append(s[2:] if s.startswith("- ") else s)
-    return out
 
 
 def failing_section(doc):
     failing = _dict(doc.get("failing"))
     parts = failing_tables(failing)
-    rest = failing_rest(failing)
+    rest = [line for key, line in failing_kept(failing) if key is None]
     if rest:
         parts.append(bullets(rest))
     notes = _texts(failing.get("notes"))
@@ -753,30 +1012,51 @@ def failing_section(doc):
     return section("failing", "What is failing", parts)
 
 
+def _id_order(ref):
+    """A plan row's place by its id's digits, compared as (length, digits) without leading zeros: no int() of a
+    damaged id that runs to thousands of digits, and P-7 still before P-12."""
+    m = re.match(r"^P-(\d+)$", _text(ref))
+    digits = (m.group(1).lstrip("0") or "0") if m else ""
+    return (len(digits), digits)
+
+
 def _action_key(item, idx, head):
     """An owner's items in the order the reader works them: by kind, a plan
     row by its plan order, then by the first domain it concerns, then as the
     document listed them."""
     kind = _text(item.get("kind"))
-    order = 0
-    if kind == "dns":
-        m = re.match(r"^P-(\d+)$", _text(item.get("ref")))
-        order = int(m.group(1)) if m else 0
+    order = _id_order(item.get("ref")) if kind == "dns" else (0, "")
     names = _texts(item.get("domains"))
     return (ACTION_RANK.get(kind, 6), order, dkey(names[0], head) if names else (), idx)
 
 
 def action_item(item):
-    ref = _text(item.get("ref"))
-    return '<li><span class="hook">%s</span> %s%s</li>' % (marks(item.get("hook")), marks(item.get("action")),
-                                                        (" " + tag(ref)) if ref else "")
+    """One owner's item: its hook, then what to do and its reference. An item
+    from a plan row that names its prerequisites apart (summary and
+    prerequisites in next_steps.json) reads as its summary, then a compact
+    checklist of what must be true before it is applied - the same words
+    next_steps.md puts in its '(before applying: ...)' clause."""
+    ref = ref_tags(item.get("ref"))
+    hook = '<span class="hook">%s</span>' % marks(_text(item.get("hook")))
+    summary, prereqs = _text(item.get("summary")), item.get("prerequisites")
+    if summary and isinstance(prereqs, list):
+        head = "%s %s%s" % (hook, marks(summary), (" " + ref) if ref else "")
+        checks = _texts(prereqs)
+        if not checks:
+            return "<li>%s</li>" % head
+        return ('<li class="item"><p>%s</p><div class="pre"><p class="k">Before applying</p>%s</div></li>'
+                % (head, checklist(checks, "checklist compact")))
+    return '<li>%s %s%s</li>' % (hook, marks(_text(item.get("action"))), (" " + ref) if ref else "")
 
 
 def owner_group(g, head):
-    """One owner with its channel and its items. Items that say which
-    organization they concern (next_steps.json from round 12 on) are grouped
-    by it when they span more than one: the headline's first, then each by
-    name, the tenant-wide ones last."""
+    """One owner with its channel and its items. A group that spans two
+    organizations or more and holds GROUP_BY_ORG items or more is grouped
+    by organization, as next_steps.md groups it (the headline's first, then
+    each by name, the tenant-wide ones last); an organization's line heads
+    its items only where it holds two or more - a single item stays a plain
+    item in its place. A smaller group, or one whose items name no
+    organization (an older next_steps.json), stays one list."""
     items = [(i, it) for i, it in enumerate(_list(g.get("items"))) if isinstance(it, dict)]
     if not items:
         return ""
@@ -786,27 +1066,37 @@ def owner_group(g, head):
         buckets = {}
         for i, it in items:
             buckets.setdefault(_norm(it.get("org")), []).append((i, it))
-        orgs = sorted((o for o in buckets if o), key=lambda o: dkey(o, head)) + ([""] if "" in buckets else [])
-        if len(orgs) > 1:
-            body = []
-            for o in orgs:
+        named = sorted((o for o in buckets if o), key=lambda o: dkey(o, head))
+        if len(named) > 1 and len(items) >= next_steps.GROUP_BY_ORG:
+            body, plain = [], []
+            for o in named + ([""] if "" in buckets else []):
                 members = sorted(buckets[o], key=lambda t: _action_key(t[1], t[0], head))
-                body.append('<p class="org-head">%s <span class="count">%s</span></p><ul class="lines">%s</ul>'
+                if len(members) < 2:
+                    plain += members
+                    continue
+                if plain:
+                    body.append('<ul class="lines">%s</ul>' % "".join(action_item(it) for _, it in plain))
+                    plain = []
+                body.append('<div class="org-block"><p class="org-head">%s <span class="count">%s</span></p>'
+                            '<ul class="lines">%s</ul></div>'
                             % (esc(o) if o else "Tenant-wide", _counted(len(members), "item"),
                                "".join(action_item(it) for _, it in members)))
+            if plain:
+                body.append('<ul class="lines">%s</ul>' % "".join(action_item(it) for _, it in plain))
             return '<div class="owner">%s%s</div>' % (title, "".join(body))
     members = sorted(items, key=lambda t: _action_key(t[1], t[0], head))
     return '<div class="owner">%s<ul class="lines">%s</ul></div>' % (title, "".join(action_item(it) for _, it in members))
 
 
 def owners_section(doc, head):
-    parts = [owner_group(g, head) for g in _list(doc.get("actions_by_owner")) if isinstance(g, dict)]
-    parts = [p for p in parts if p]
-    failing = _dict(doc.get("failing"))
-    if not parts and (failing.get("excepted") or failing.get("outside_excepted")):
-        parts = ['<p class="empty">%s</p>' % NOT_IN_RUN,
-                 '<p class="note">No plan changes, and every failure this run names is formally excepted in '
-                 'audit.toml (What is failing lists them).</p>']
+    """What happens next, by owner. A document that lists no item says what
+    next_steps.md says there - nothing to do this week, and why - in its
+    own words; Not in this run. only when the document has no such list."""
+    groups = doc.get("actions_by_owner")
+    parts = [p for p in (owner_group(g, head) for g in _list(groups) if isinstance(g, dict)) if p]
+    if not parts and isinstance(groups, list):
+        parts = ['<p class="empty">%s</p>' % marks(line[2:] if line.startswith("- ") else line)
+                 for line in next_steps.render_actions([], _dict(doc.get("failing")))]
     return section("owners", "What happens next, by owner", parts)
 
 
@@ -815,60 +1105,70 @@ def ask_section(doc):
     return section("ask", "The ask", ['<div class="ask"><p>%s</p></div>' % marks(text)] if text else [])
 
 
-def _record_rank(c):
-    """A domain's records in the order a publisher reads them: its _dmarc
-    record first, then its own name (SPF), then _domainkey names, then the rest."""
-    host, dom = _norm(c.get("hostname")), _norm(c.get("domain"))
-    if host == "_dmarc." + dom:
-        return 0
-    if host == dom:
-        return 1
-    if "_domainkey" in host:
-        return 2
-    return 3
-
-
 def _priority(c):
     p = c.get("priority")
     return p if isinstance(p, int) and not isinstance(p, bool) else None
 
 
-def _row_key(c, idx, head):
-    """The plan's rows by priority, then DNS host (unknown last), then zone,
-    then domain - the zones and the domains in the one domain order, so a
-    delegated zone sits right after its organization's own - then record."""
-    p = _priority(c)
-    host = _text(c.get("zone_host"))
-    return ((0, p) if p is not None else (1, 0), (1, "") if host.lower() in ("", "unknown") else (0, host.lower()),
-            dkey(_text(c.get("zone")) or _text(c.get("domain")), head), dkey(c.get("domain"), head),
-            _record_rank(c), _norm(c.get("hostname")), idx)
+def plan_order(changes, head):
+    """plan.json's rows in the plan's own order, plan.row_key (priority, DNS
+    host with unknown last, zone and domain in the one order, record,
+    hostname) - the order plan.py numbered the ids in, and the one plan.md,
+    todo.md and verify.md follow - whatever order the file lists them in.
+    Each row is read through a clean copy, so a damaged priority or name
+    sorts last instead of stopping the sort."""
+    def safe(c):
+        p = _priority(c)
+        return {"priority": p if p is not None else math.inf, "zone_host": _text(c.get("zone_host")),
+                "zone": _text(c.get("zone")), "domain": _text(c.get("domain")), "hostname": _text(c.get("hostname"))}
+    try:
+        return [c for _, c in sorted(enumerate(changes), key=lambda t: (plan_mod.row_key(safe(t[1]), head), t[0]))]
+    except Exception:  # a key the plan's own sort cannot read: as plan.json lists them
+        return list(changes)
 
 
-def record_card(c, head):
-    """One plan row as a record card: id, kind and domain; what it does in
-    plain words; host name, type, value, current value, TTL and rollback;
-    the prerequisites as a checklist; the why, muted."""
+def record_card(c, n):
+    """One plan row as a record card (its id on the page is its place, n):
+    id, kind and domain; what it does in plain words; the host name, type
+    and TTL side by side, then the value, the current value and the
+    rollback; the prerequisites as a compact checklist; the why, muted."""
     kind = _text(c.get("kind"))
     rid = _text(c.get("id"))
     head_parts = [tag(rid, "tag rid") if rid else "", '<span class="k">%s</span>' % esc(plan_mod.KIND_LABEL.get(kind, kind)),
                   '<span class="name">%s</span>' % name_html(c.get("domain")),
-                  "".join(" " + tag(f) for f in _texts(c.get("finding_ids")))]
-    fields = (("Host name", '<span class="mono">%s</span>' % esc(c.get("hostname"))),
-              ("Type", '<span class="mono">%s</span>' % esc(c.get("record"))),
-              ("Value", '<pre class="value">%s</pre>' % esc(c.get("value"))),
-              ("Current", '<span class="mono muted">%s</span>' % esc(c.get("current"))),
-              ("TTL", '<span class="mono">%s</span>' % esc(c.get("ttl"))),
-              ("Rollback", marks(c.get("rollback"))))
-    parts = ['<div class="card-head">%s</div>' % "".join(p for p in head_parts if p)]
+                  " ".join(tag(f) for f in _texts(c.get("finding_ids")))]
+    fields = (("Host name", '<span class="mono">%s</span>' % plain_name(c.get("hostname")), ""),
+              ("Type", '<span class="mono">%s</span>' % esc(_shown(c.get("record"))), ""),
+              ("TTL", '<span class="mono">%s</span>' % esc(_shown(c.get("ttl"))), ""),
+              ("Value", '<pre class="value">%s</pre>' % esc(_shown(c.get("value"))), " wide"),
+              ("Current", '<span class="mono muted">%s</span>' % esc(_shown(c.get("current"))), " wide"),
+              ("Rollback", marks(_shown(c.get("rollback"))), " wide"))
+    parts = ['<div class="card-head">%s</div>' % " ".join(p for p in head_parts if p)]
     if _text(c.get("human_summary")):
         parts.append("<p>%s</p>" % marks(c["human_summary"]))
-    parts.append('<dl class="fields">%s</dl>' % "".join("<dt>%s</dt><dd>%s</dd>" % (esc(k), v) for k, v in fields))
+    parts.append('<dl class="fields">%s</dl>' % "".join('<div class="field%s"><dt>%s</dt><dd>%s</dd></div>'
+                                                       % (wide, esc(k), v) for k, v, wide in fields))
     prereqs = _texts(c.get("prerequisites"))
     if prereqs:
-        parts.append('<div class="group"><p class="k">Before applying</p>%s</div>' % checklist(prereqs))
+        parts.append('<div class="pre"><p class="k">Before applying</p>%s</div>' % checklist(prereqs, "checklist compact"))
     if _text(c.get("why")):
         parts.append('<p class="why">%s</p>' % marks(c["why"]))
-    return '<article class="card">%s</article>' % "".join(parts)
+    return '<article class="card" id="%s">%s</article>' % (CARD_ID % n, "".join(parts))
+
+
+def plan_index(rows):
+    """Every row at a glance, in the cards' order: its id (a link to its
+    card), priority, host name, kind and how many checks wait before it -
+    so a publisher scans the whole plan at once and jumps to one row."""
+    body = []
+    for n, c in enumerate(rows, 1):
+        kind = _text(c.get("kind"))
+        checks = len(_texts(c.get("prerequisites")))
+        body.append('<tr><td><a href="#%s">%s</a></td><td class="num">%s</td><td class="name">%s</td><td>%s</td>'
+                    '<td class="num">%s</td></tr>'
+                    % (CARD_ID % n, esc(_text(c.get("id")) or "row %d" % n), esc(_shown(c.get("priority")) or "?"),
+                       plain_name(c.get("hostname")), esc(plan_mod.KIND_LABEL.get(kind, kind)), checks or "none"))
+    return table(("Id", "Priority", "Host name", "Kind", "Checks"), body, numeric=(1, 4), cls="index")
 
 
 def address_note(plan):
@@ -886,21 +1186,27 @@ def address_note(plan):
 
 
 def dns_section(plan, head):
-    """DNS changes, from plan.json when the run has one: the holds first, as
-    what to decide first, then one record card per row, grouped by priority
-    (in plan.py's words), DNS host and zone, in domain order."""
+    """DNS changes, from plan.json when the run has one, laid out as plan.md
+    lays it out: every row at a glance (each a link to its card), the holds
+    as what to decide first, then one record card per row, grouped by
+    priority (in plan.py's words), DNS host and zone, in the plan's own
+    order. A plan that proposes nothing says so; Not in this run. means the
+    run has no plan."""
     if not isinstance(plan, dict):
         return section("dns", "DNS changes", [])
     changes = [c for c in _list(plan.get("changes")) if isinstance(c, dict)]
     holds = [h for h in _list(plan.get("holds")) if isinstance(h, dict)]
     if not changes and not holds:
-        return section("dns", "DNS changes", [])
+        return section("dns", "DNS changes", [], empty=EMPTY_PLAN)
+    rows = plan_order(changes, head)
     parts = [address_note(plan)]
+    if rows:
+        parts.append(block("At a glance", plan_index(rows)))
     if holds:
         ordered = sorted(enumerate(holds), key=lambda t: (dkey(t[1].get("domain"), head), t[0]))
         parts.append(block("Decide first", '<ul class="lines">%s</ul>' % "".join(
-            "<li>%s: %s</li>" % (name_html(h.get("domain")), marks(h.get("reason"))) for _, h in ordered)))
-    rows = [c for _, c in sorted(enumerate(changes), key=lambda t: _row_key(t[1], t[0], head))]
+            "<li>%s: %s</li>" % (name_html(h.get("domain")), marks(_text(h.get("reason")))) for _, h in ordered)))
+    place = {id(c): n for n, c in enumerate(rows, 1)}
     for prio, in_prio in itertools.groupby(rows, key=_priority):
         title = "Priority %s" % prio if prio is not None else "Priority not stated"
         words = plan_mod.PRIORITY_LABEL.get(prio, "")
@@ -909,7 +1215,8 @@ def dns_section(plan, head):
             zones = []
             for zone, in_zone in itertools.groupby(in_host, key=lambda c: _text(c.get("zone")) or org_of(c.get("domain"))):
                 zones.append('<p class="zone"><span class="k">Zone</span><span class="mono">%s</span></p>'
-                             '<div class="cards">%s</div>' % (esc(zone), "".join(record_card(c, head) for c in in_zone)))
+                             '<div class="cards">%s</div>' % (esc(zone), "".join(record_card(c, place[id(c)])
+                                                                                 for c in in_zone)))
             inner.append('<div class="group"><h4>DNS host: %s</h4>%s</div>' % (esc(host), "".join(zones)))
         parts.append('<div class="group"><h3>%s%s</h3>%s</div>'
                      % (esc(title), (' <span class="count">%s</span>' % esc(words)) if words else "", "".join(inner)))
@@ -931,8 +1238,11 @@ def _question_key(q, idx, head, located):
 def questions_section(doc, head):
     """Open questions, one group per kind with its count, in the order the
     reader takes them: blockers, prerequisites, holds, gaps, the unverified
-    heuristics, the items with no owner, then any other kind by name."""
-    qs = [q for q in _list(doc.get("open_questions")) if isinstance(q, dict) and _text(q.get("question"))]
+    heuristics, the items with no owner, then any other kind by name. A
+    document whose list is empty says what next_steps.md says: None from
+    this run."""
+    raw = doc.get("open_questions")
+    qs = [q for q in _list(raw) if isinstance(q, dict) and _text(q.get("question"))]
     located = any("org" in q or "domains" in q for q in qs)
     words = dict(QUESTION_KINDS)
     known = [k for k, _ in QUESTION_KINDS]
@@ -952,7 +1262,8 @@ def questions_section(doc, head):
         title = words.get(k) or k.replace("_", " ").capitalize()
         parts.append('<div class="group"><h3>%s <span class="count">%s</span></h3><ul class="lines">%s</ul></div>'
                      % (esc(title), len(members), "".join(items)))
-    return section("questions", "Open questions", parts)
+    return section("questions", "Open questions", parts, empty=NO_QUESTIONS if isinstance(raw, list) and not raw
+                   else NOT_IN_RUN)
 
 
 def glossary_section(doc):
@@ -1047,24 +1358,56 @@ def read_json(path, required):
         doc = json.loads(text)
     except json.JSONDecodeError as exc:
         raise BriefError("%s is not valid JSON (%s at line %d)" % (path, exc.msg, exc.lineno)) from exc
+    except RecursionError:
+        raise BriefError("%s is nested too deeply to read" % path) from None
     if not isinstance(doc, dict):
         raise BriefError("%s is not one JSON object" % path)
     return doc
 
 
+def write_atomic(target, text):
+    """text into target, all or nothing: encoded first, written to a file
+    beside it, then moved into its place. A failure on the way (a disk that
+    fills, a character UTF-8 cannot carry) leaves the page that was there
+    untouched and no half-written one."""
+    target = Path(target)
+    data = text.encode("utf-8", errors="replace")
+    tmp = target.with_name(".%s.%d.tmp" % (target.name, os.getpid()))
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def write_run(run_dir, out=None, fragment=False):
     """brief.html for a run folder: its next_steps.json (required) and its
     plan.json (when there) in, the page written to out (default
-    RUN_DIR/brief.html). collect.py and the command line both build it here,
-    so a rerun on the same files gives the same bytes. Returns the path."""
+    RUN_DIR/brief.html), all or nothing. collect.py and the command line
+    both build it here, so a rerun on the same files gives the same bytes.
+    Returns the path."""
     run = next_steps.repo_path(run_dir)
     doc = read_json(run / "next_steps.json", True)
     plan = read_json(run / "plan.json", False)
     target = next_steps.repo_path(out) if out else run / "brief.html"
-    text = render(doc, plan, fragment)
-    with open(target, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
+    write_atomic(target, render(doc, plan, fragment))
     return target
+
+
+def _console():
+    """Print what a console code page cannot show as an escape, never a
+    UnicodeEncodeError: a Windows console or pipe is often cp1252, and a
+    run folder or an --out name may hold any character."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
 def die(msg):
@@ -1073,6 +1416,7 @@ def die(msg):
 
 
 def main(argv=None):
+    _console()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run_dir", metavar="RUN_DIR", help="a run folder holding next_steps.json (and plan.json), "
                                                        "for example audit-out/latest")
