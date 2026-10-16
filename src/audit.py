@@ -615,6 +615,48 @@ def mark_excepted(maillog_doc, active):
         v["excepted"] = hit["match"] if hit else False
 
 
+SENDER_DOMAIN = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)+")
+
+
+def sender_rank(address, count, headline=None, messages=None):
+    """The one key every list of senders ranked by a count sorts by: the
+    count (genuine failures), then the messages behind it when the list
+    carries them (the census's own rank: the busier stream first), a tie by
+    the sender's domain (an envelope domain is its own) in the one order
+    every list of names follows (domain_key with the headline; a
+    placeholder such as '(no sender)' after the names), then by the
+    address itself."""
+    text = str(address if address is not None else "")
+    dom = _norm_name(text.rpartition("@")[2])
+    dom = dom if SENDER_DOMAIN.fullmatch(dom) else ""
+    busy = messages if isinstance(messages, int) and not isinstance(messages, bool) else 0
+    return (-count, -busy, not dom, domain_key(dom, headline), text)
+
+
+def top_senders(counter, n=5, headline=None):
+    """The n busiest (sender, count) pairs of a Counter in sender_rank order:
+    never Counter.most_common, whose ties fall in the order the rows came."""
+    return sorted(counter.items(), key=lambda kv: sender_rank(kv[0], kv[1], headline))[:n]
+
+
+def rank_top_senders(maillog_doc, headline=None):
+    """MAILFLOW-001's evidence names the busiest failing senders across the
+    whole log as dedupe.py ranked them, before any headline was chosen: a
+    tie there falls in mail-log row order. Once the gate has chosen the
+    headline, the same senders and counts are ranked again in sender_rank
+    order, the headline's organization first, so report.md, todo.md and
+    verify.md name the senders next_steps.md names. In place; nothing
+    else in the evidence changes."""
+    verdicts = [v for v in _dict(maillog_doc).get("verdicts") or [] if isinstance(v, dict)]
+    senders = Counter(v.get("sender") for v in verdicts if v.get("genuine_failure"))
+    for f in _dict(maillog_doc).get("findings") or []:
+        if not (isinstance(f, dict) and f.get("id") == "MAILFLOW-001" and isinstance(f.get("evidence"), str)):
+            continue
+        head, sep, _ = f["evidence"].partition("; top senders: ")
+        if sep and senders:
+            f["evidence"] = head + sep + "; ".join("%s x%d" % kv for kv in top_senders(senders, 5, headline))
+
+
 def _counters(verdicts):
     """dedupe.summarize-style counters over one slice of verdicts, plus the
     senders behind its genuine failures. passing_messages had a copy pass
@@ -625,7 +667,10 @@ def _counters(verdicts):
     marks mark_excepted puts on the verdicts), of which the counts above
     still hold every one. message_ids: the distinct Message-IDs among them,
     the grain the tenant's mail flow counts at (a logical message is one per
-    recipient); None when the verdicts do not carry their Message-ID."""
+    recipient); None when the verdicts do not carry their Message-ID. The
+    top senders run by their failures, a tie by the sender's domain in the
+    one order (one slice holds one organization's names: no headline is
+    needed), then by address - never in mail-log row order."""
     failing = [v for v in verdicts if v.get("genuine_failure")]
     by_likely = Counter(v.get("likely") or "unknown" for v in failing)
     senders = Counter((v.get("sender") or "?").lower() for v in failing)
@@ -643,9 +688,9 @@ def _counters(verdicts):
            "delivered_despite_fail": sum(1 for v in verdicts if v.get("delivered_despite_fail")),
            "blocked_despite_pass": sum(1 for v in verdicts if v.get("blocked_despite_pass")),
            "by_likely": {k: by_likely.get(k, 0) for k in dedupe.LIKELY_LABELS},
-           "top_senders": [{"sender": s, "genuine_failures": n} for s, n in senders.most_common(5)],
+           "top_senders": [{"sender": s, "genuine_failures": n} for s, n in top_senders(senders)],
            # the busiest senders among the failures no exception covers: the ones still failing
-           "top_senders_after": [{"sender": s, "genuine_failures": n} for s, n in left.most_common(5)],
+           "top_senders_after": [{"sender": s, "genuine_failures": n} for s, n in top_senders(left)],
            "excepted": len(excepted),
            "excepted_by_likely": {k: exc_likely.get(k, 0) for k in dedupe.LIKELY_LABELS},
            "excepted_delivered": sum(1 for v in excepted if v.get("delivered_despite_fail"))}
@@ -1732,14 +1777,15 @@ def reword_for_reject(findings, gate):
     return findings
 
 
-def _cut_words(cuts):
+def _cut_words(cuts, headline=None):
     """What the mail-log line says of the organizations collect.py cut
     (maillog_cuts): the rows kept are a floor for one the row budget cut,
     and incomplete for one with an hour at the API cap (a truncated hour
     keeps an arbitrary part of its legs, so its failures are not
-    verified); '' when nothing was cut."""
+    verified); '' when nothing was cut. The organizations run in the one
+    order every list of names follows, the headline's first."""
     said = []
-    for org, info in sorted(_dict(cuts).items()):
+    for org, info in sorted(_dict(cuts).items(), key=lambda kv: (domain_key(kv[0], headline), str(kv[0]))):
         info = _dict(info)
         if info.get("api_cap_hours"):
             said.append(f"incomplete for {org} (an hour at the API cap: {', '.join(str(h) for h in info['api_cap_hours'])}"
@@ -1759,13 +1805,16 @@ def verified_vs_inferred(report):
     inferred (heuristic labels, gate reasoning, unverified findings). The
     mail-log line names the organizations collect.py cut (the rows kept are
     a floor, or incomplete at the API cap), and the full-window line says
-    what rests on which count."""
+    what rests on which count. Every list of names runs in the one order,
+    the gate's headline first."""
     verified, inferred = [], []
+    headline = gate_headline(report)
     dns_reports = report["dns"] or {}
     if dns_reports:
-        ok = [d for d, r in dns_reports.items()
-              if "error" not in (r.get("spf_status"), r.get("dmarc_status"), r.get("mx_status"))]
-        failed = [d for d in dns_reports if d not in ok]
+        ok = order_domains([d for d, r in dns_reports.items()
+                            if "error" not in (r.get("spf_status"), r.get("dmarc_status"), r.get("mx_status"))],
+                           headline)
+        failed = order_domains([d for d in dns_reports if d not in ok], headline)
         if ok:
             verified.append(f"live DNS answers for {', '.join(ok)} (SPF, DMARC, DKIM selector probes, MX)")
         if failed:
@@ -1778,7 +1827,8 @@ def verified_vs_inferred(report):
         c = report["maillog"]["counters"]
         verified.append(f"mail log: {c['raw_rows']} rows deduplicated to {c['logical_messages']} logical "
                         f"messages, {c['genuine_failures']} genuine failures, "
-                        f"{c['delivered_despite_fail']} delivered despite fail" + _cut_words(maillog_cuts(report)))
+                        f"{c['delivered_despite_fail']} delivered despite fail"
+                        + _cut_words(maillog_cuts(report), headline))
         bd = report["maillog"].get("by_domain") or {}
         if bd:
             named = [d for d in bd if d != OTHER]
@@ -1787,7 +1837,7 @@ def verified_vs_inferred(report):
                             f"{len(named)} audited domain(s) have rows, "
                             f"{(bd.get(OTHER) or {}).get('logical_messages', 0)} message(s) under {OTHER}")
         wt = _dict(report["maillog"].get("window_totals"))
-        for org, info in sorted(_dict(wt.get("orgs")).items()):
+        for org, info in _md_order(_dict(wt.get("orgs")).items(), headline):
             tot = _window_sums(_dict(info).get("by_domain"))
             verified.append(f"full-window totals for {org}, counted in advanced hunting over "
                             f"{_hours_text(_window_hours(wt))} (maillog.window_totals): "
@@ -1942,6 +1992,68 @@ def _names(items, cap=3):
     return ", ".join(items[:-1]) + " and " + items[-1]
 
 
+def from_counts(rua):
+    """{source IP: {From domain: messages}} from the aggregate reports'
+    per-source table (rua.by_source_ip): what ranks the From domains one
+    source sends as. {} when the report carries no such table; a damaged
+    row counts nothing, never an error."""
+    out = {}
+    rows = _dict(rua).get("by_source_ip")
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or not isinstance(row.get("source_ip"), str):
+            continue
+        counts = out.setdefault(row["source_ip"], {})
+        for h in row.get("header_from") if isinstance(row.get("header_from"), list) else []:
+            if isinstance(h, dict) and isinstance(h.get("domain"), str) and _norm_name(h["domain"]):
+                n = _count(h.get("count"))
+                counts[_norm_name(h["domain"])] = counts.get(_norm_name(h["domain"]), 0) + max(n or 0, 0)
+    return out
+
+
+def from_names(names, counts=None, headline=None, cap=2):
+    """The From domains an aggregate-report source sends as, named the way
+    every file names them: ranked by the source's messages as each (counts,
+    one source's entry from from_counts; without it the order given, which
+    is rua_parse's count order), a tie in the one order every list of names
+    follows (domain_key with the headline), the first cap named and the
+    rest counted - 'example.org, a.shop.example.org and 1 more' - so no
+    name a source fails as is dropped without a word. '' when it names
+    none."""
+    seen = {}
+    for n in names or ():
+        if isinstance(n, str) and _norm_name(n) and _norm_name(n) not in seen:
+            seen[_norm_name(n)] = n.strip()
+    keys = list(seen)
+    counts = counts if isinstance(counts, dict) else {}
+    if counts:
+        keys.sort(key=lambda k: (-(counts.get(k) or 0), domain_key(k, headline), k))
+    shown = [seen[k] for k in keys[:cap]]
+    more = len(keys) - len(shown)
+    return ", ".join(shown) + (" and %d more" % more if more > 0 else "")
+
+
+def finding_order(f, headline=None, severity=True):
+    """Where a finding sits in a list of findings (the delta's new and
+    resolved ones): the most severe first when severity is ranked, then the
+    domain a DNS finding's source names in the one order every list of names
+    follows (domain_key with the headline), a source that names no domain
+    after them, then the source and the id as text. A damaged field compares
+    as its spelling, never as an error."""
+    f = f if isinstance(f, dict) else {}
+    src = str(f.get("source") if f.get("source") is not None else "")
+    dom = _norm_name(src[4:]) if src.startswith("dns:") else ""
+    sev = f.get("severity")
+    rank = -SEVERITY_RANK.get(sev, 0) if severity and isinstance(sev, str) else 0
+    return (rank, not dom, domain_key(dom, headline) if dom else (), src, str(f.get("id") or ""))
+
+
+def gate_headline(report):
+    """The headline domain the gate chose for a report (gate.headline_domain),
+    which every list of names in report.md and the delta leads with; None
+    when the report has none."""
+    return _norm_name(_dict(_dict(report).get("gate")).get("headline_domain")) or None
+
+
 # how an older report names a cut organization: collect.py's notes, copied into the caveats, and the
 # maillog.truncation clauses it builds from them (41h, or 2d when the hours fall on whole days)
 CUT_TEXTS = (
@@ -2063,8 +2175,13 @@ def build_delta(report, previous):
     is None when either side lacks the data, when the two mail logs cover
     spans that cannot be compared, or when collect.py cut an organization's
     mail log in either run (maillog.cuts: the row budget or the API cap left
-    a floor over the hours kept); notes say why."""
+    a floor over the hours kept); notes say why. Every list of names in it
+    runs in the one order every list follows, the gate's headline first:
+    the cut organizations and their notes, the organizations audited in one
+    run only, and the findings (new ones the most severe first, then by
+    the domain each names)."""
     notes = []
+    headline = gate_headline(report)
     now_ml, prev_ml = _dict(report.get("maillog")), _dict(previous.get("maillog"))
     now_c, prev_c = _dict(now_ml.get("counters")), _dict(prev_ml.get("counters"))
     both = bool(now_c and prev_c)
@@ -2081,7 +2198,7 @@ def build_delta(report, previous):
     # log's own span can stay at 30 days. A span is never taken for a cut: only the recorded cut counts
     now_cut, prev_cut = maillog_cuts(report), maillog_cuts(previous)
     cut_orgs = {org: {"now": now_cut.get(org), "previous": prev_cut.get(org)}
-                for org in sorted(set(now_cut) | set(prev_cut))}
+                for org in order_domains(set(now_cut) | set(prev_cut), headline)}
     cut_families = {discover.org_domain(org) for org in cut_orgs} if both else set()
     for org, sides in cut_orgs.items() if both else ():
         notes.append(_cut_note(org, sides["now"], sides["previous"]))
@@ -2091,7 +2208,7 @@ def build_delta(report, previous):
     prev_g = _dict(_dict(previous.get("gate")).get("domains"))
     now_orgs = {discover.org_domain(_norm_name(d)) for d in now_g if _norm_name(d)}
     prev_orgs = {discover.org_domain(_norm_name(d)) for d in prev_g if _norm_name(d)}
-    orgs_not_shared = sorted(now_orgs ^ prev_orgs) if both and now_g and prev_g else []
+    orgs_not_shared = order_domains(now_orgs ^ prev_orgs, headline) if both and now_g and prev_g else []
     if orgs_not_shared:
         notes.append("%s audited in one of the two runs only: the whole log's failure counts cover different "
                      "organizations and are not compared (the per-domain counts of the organizations in both "
@@ -2147,9 +2264,9 @@ def build_delta(report, previous):
                 "title": f.get("title")}
 
     findings_new = sorted((brief(now_f[k], k) for k in now_f if k not in prev_f),
-                          key=lambda f: (-SEVERITY_RANK.get(f["severity"], 0), f["source"], f["id"]))
+                          key=lambda f: finding_order(f, headline))
     findings_resolved = sorted((brief(prev_f[k], k) for k in prev_f if k not in now_f),
-                               key=lambda f: (f["source"], f["id"]))
+                               key=lambda f: finding_order(f, headline, severity=False))
     policy_changes, gate_changes = {}, {}
     for d, g in now_g.items():
         p = prev_g.get(d)
@@ -2181,7 +2298,8 @@ def build_delta(report, previous):
             if held:
                 senders[:] = [s for s in senders if s not in held]
                 notes.append("%d sender%s under %s not listed as %s: %s cut mail log may simply have missed %s"
-                             % (len(held), "" if len(held) == 1 else "s", _names(sorted({_sender_org(s) for s in held})),
+                             % (len(held), "" if len(held) == 1 else "s",
+                                _names(order_domains({_sender_org(s) for s in held}, headline)),
                                 word, whose, "it" if len(held) == 1 else "them"))
     # every name under a cut org lost the same hours, quiet or busy, with or without rows on either side;
     # a domain under another org keeps its delta. Rows under no audited domain may be any org's: they
@@ -2373,6 +2491,8 @@ def build_report(domains=(), rua_paths=(), maillog=None, header_files=(), offlin
     report.update(tenant_docs)
     report["gate"] = gate_verdict(dns_reports, rua_doc, maillog_doc, domains, headers_doc, tenant_docs,
                                   domain_sources, headline, volume, exceptions, marked=True)
+    if maillog_doc:  # the headline is known now: the whole log's top senders lead with its organization
+        rank_top_senders(maillog_doc, gate_headline(report))
     findings = reword_for_reject(flatten_findings(report), report["gate"])
     report["findings"] = findings
     by_sev, by_area = {}, {}
@@ -2856,7 +2976,10 @@ def _md_window_totals(L, report, headline=None):
             L.append(f"  - (+{len(rows) - 10} more in report.json)")
 
 
-def _md_census(L, cs):
+def _md_census(L, cs, headline=None):
+    """The census's busiest failing envelopes and senders: by genuine failures, then messages, a tie in the one
+    order every list of names follows (sender_rank: the envelope's domain, the sender's, the headline's
+    organization first), never in the plain text order the census keeps a tie in."""
     L.append("## Failing senders (census)")
     L.append("")
     L.append(f"Top {CENSUS_TOP} of each list, worst first; the full census is in report.json "
@@ -2869,8 +2992,11 @@ def _md_census(L, cs):
         L.append(f"- {CENSUS_UNAVAILABLE}")
         L.append("")
         return
-    env = [r for r in env_all if r["genuine_failures"]]
-    snd = [r for r in snd_all if r["genuine_failures"]]
+    env = sorted((r for r in env_all if r["genuine_failures"]),
+                 key=lambda r: sender_rank(r["envelope_domain"], r["genuine_failures"], headline, r.get("messages")))
+    snd = sorted((r for r in snd_all if r["genuine_failures"]),
+                 key=lambda r: sender_rank(r["sender"], r["genuine_failures"], headline, r.get("messages"))
+                 + (str(r["envelope_domain"]),))
 
     def excepted(r):  # what a formal exception covers of the entry's failures
         return f" ({r['excepted']} formally excepted)" if r.get("excepted") else ""
@@ -2912,7 +3038,8 @@ def _md_delta(L, dl, headline=None):
             why.append("mail-log spans not comparable")
             said += 1
     if why:
-        withheld = "n/a (%s, see the note%s below)" % (" and ".join(why), "s" if said > 1 else "")
+        # each reason names its own organizations: '; ' keeps one reason's names apart from the next one's
+        withheld = "n/a (%s, see the note%s below)" % ("; ".join(why), "s" if said > 1 else "")
     elif any("is not a whole number" in str(n) for n in dl.get("notes") or []):
         withheld = "n/a (a count that is no whole number, see the note below)"
     else:
@@ -2937,11 +3064,15 @@ def _md_delta(L, dl, headline=None):
         L.append("- per domain: " + "; ".join(f"{d} {signed(_dict(v).get('genuine_failures'), 'n/a')} genuine, "
                                               f"{signed(_dict(v).get('delivered_despite_fail'), 'n/a')} delivered despite fail"
                                               for d, v in _md_order(bd.items(), headline)))
-    new = [f for f in dl.get("findings_new") or [] if isinstance(f, dict)]
+    # the findings the most severe first, then by the domain each names in the one order (a delta stored by an
+    # earlier version is put in that order here too)
+    new = sorted((f for f in dl.get("findings_new") or [] if isinstance(f, dict)),
+                 key=lambda f: finding_order(f, headline))
     L.append(f"- new findings ({len(new)}): " + (", ".join(
         f"[{f.get('severity')}] {f.get('id')} ({_display_source(f.get('source'))})" for f in new[:10]) + more(new)
         if new else "none"))
-    gone = [f for f in dl.get("findings_resolved") or [] if isinstance(f, dict)]
+    gone = sorted((f for f in dl.get("findings_resolved") or [] if isinstance(f, dict)),
+                  key=lambda f: finding_order(f, headline, severity=False))
     L.append(f"- resolved findings ({len(gone)}): " + (", ".join(
         f"{f.get('id')} ({_display_source(f.get('source'))})" for f in gone[:10]) + more(gone) if gone else "none"))
     pc = _dict(dl.get("policy_changes"))
@@ -3094,8 +3225,10 @@ def render_md(report):
         so = report["rua"]["spf_only_senders"]
         if so:
             L.append("- SPF-only senders (break on forwarding):")
+            counts = from_counts(report["rua"])
             for f in so:
-                L.append(f"  - {f['source_ip']}: {f['spf_only']} msgs as {', '.join(f['header_from'][:2])}")
+                names = from_names(f["header_from"], counts.get(f["source_ip"]), headline)
+                L.append(f"  - {f['source_ip']}: {f['spf_only']} msgs as {names}")
         L.append("")
 
     _md_mailflow(L, report, headline)
@@ -3143,7 +3276,7 @@ def render_md(report):
         _md_window_totals(L, report, headline)
         L.append("")
         if report["maillog"].get("census"):
-            _md_census(L, report["maillog"]["census"])
+            _md_census(L, report["maillog"]["census"], headline)
 
     if report["headers"]:
         L.append("## Message headers")

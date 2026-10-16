@@ -45,14 +45,16 @@ try:
 except ImportError:
     dns = None
 
+from dns_audit import TWO_LEVEL_SUFFIXES
+
 ROOT = Path(__file__).resolve().parent.parent
 DOH_URL = "https://dns.google/resolve"
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
-# Common two-level public suffixes so the organizational domain is right.
-TWO_LEVEL = {"co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au",
-             "co.jp", "co.nz", "com.br", "com.mx", "co.za", "com.sg", "com.hk",
-             "co.in", "co.kr", "com.tr", "com.ar"}
+# The two-level public suffixes under which the organizational domain is three labels: the DNS audit's own
+# table, the one the DMARC walk stops at, so every file names the organization the audit itself uses (a
+# second, shorter table here once made com.tw an organization and grouped unrelated domains under it)
+TWO_LEVEL = TWO_LEVEL_SUFFIXES
 
 # NS name fragment -> hosting provider. Order matters; first match wins.
 ZONE_HOSTS = [

@@ -262,12 +262,15 @@ def test_the_per_domain_rows_run_in_order_and_merge_only_next_to_each_other(run)
 def test_an_owners_items_run_by_kind_then_organization_and_a_big_group_is_grouped(run):
     groups = {g["owner"]: g["items"] for g in run["doc"]["actions_by_owner"]}
     items = groups[next_steps.UNASSIGNED]
-    assert all(set(i) >= {"domains", "org"} for g in groups.values() for i in g)
-    # the zero-risk bundle, the plan rows in plan order, sender fixes, overrides, outside sources, other findings
-    assert [i["kind"] for i in items] == ["p1summary"] + ["dns"] * 4 + ["sender"] * 3 + ["override"] * 4 + [
+    assert all(set(i) >= {"domains", "org", "orgs"} for g in groups.values() for i in g)
+    # the zero-risk bundles (one per organization), the plan rows in plan order, sender fixes, overrides, outside
+    # sources, other findings
+    assert [i["kind"] for i in items] == ["p1summary"] * 2 + ["dns"] * 4 + ["sender"] * 3 + ["override"] * 4 + [
         "spoof", "stream", "spoof", "spf_only", "finding", "finding"]
     assert items[0]["domains"] == ["dev.support.example.com", "e.example.com", "m.example.com", "news.example.com",
-                                   "t.example.com", "example.net", "mail.example.net"] and items[0]["org"] == "example.com"
+                                   "t.example.com"] and items[0]["org"] == "example.com"
+    assert (items[1]["domains"], items[1]["org"], items[1]["ref"]) == (["example.net", "mail.example.net"],
+                                                                      "example.net", "plan P-08 to P-09")
     assert [i["ref"] for i in items if i["kind"] == "dns"] == ["P-10", "P-11", "P-12", "P-13"]
     # within a kind: the headline's organization first, then by domain, then as they were ranked
     assert [i["hook"] for i in items if i["kind"] == "sender"] == [
@@ -280,9 +283,11 @@ def test_an_owners_items_run_by_kind_then_organization_and_a_big_group_is_groupe
     body = section(run["md"], "What happens next, by owner")
     start = body.index("- **%s**" % next_steps.UNASSIGNED)
     heads = [l for l in body[start:] if l.startswith("  - **")]
-    assert heads == ["  - **example.com** - 11 items", "  - **example.net** - 6 items", "  - **Tenant-wide** - 1 item"]
+    assert heads == ["  - **example.com** - 11 items", "  - **example.net** - 7 items", "  - **Tenant-wide** - 1 item"]
     under = body[start + 1:]
-    assert under[1].startswith("    - **7 zero-risk monitoring records** ready to publish")
+    assert under[1].startswith("    - **5 zero-risk monitoring records for example.com** ready to publish")
+    net = under.index("  - **example.net** - 7 items")
+    assert under[net + 1] == "    - **2 zero-risk monitoring records for example.net** ready to publish (plan P-08 to P-09)"
     assert all(l.startswith(("  - **", "    - **")) for l in under if l)
     # a small group stays flat
     assert body[:2] == ["", "- **Brand team** (#brand)"]
@@ -304,13 +309,13 @@ def test_the_open_questions_run_by_kind_then_organization_and_are_grouped_by_kin
     asked = [next(i for i in ids if "(%s," % i in q["question"]) for q in unverified[1:]]
     assert asked == sorted(asked, key=ids.index)
     owned = [q for q in qs if q["kind"] == "unassigned"]
-    assert [q["org"] for q in owned] == ["example.com"] * 11 + ["example.net"] * 6 + [""]
+    assert [q["org"] for q in owned] == ["example.com"] * 11 + ["example.net"] * 7 + [""]
     assert owned[-1]["question"] == "Who owns this: Partner bypass (RULES-002)?"
     # next_steps.md: one bold line per kind, in plain words, with its count, and the questions under it
     body = [l for l in section(run["md"], "Open questions") if l and l != "---"]
     assert [l for l in body if l.startswith("**")] == [
         "**Blockers (3)**", "**Prerequisites (9)**", "**Plan holds (2)**", "**Not verified yet (4)**",
-        "**Needs an owner (18)**"]
+        "**Needs an owner (19)**"]
     holds = body.index("**Plan holds (2)**")
     assert body[holds + 1].startswith("- example.com: %s" % HOLD) and body[holds + 2].startswith("- brand.example: ")
 

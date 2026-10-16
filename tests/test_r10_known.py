@@ -590,10 +590,15 @@ def test_k1_k2_next_steps_names_the_append_and_the_lookups_still_owed(monkeypatc
     assert ("| `shop.example` | p=none | needs more data | add the toolkit's report address to rua or move to "
             "p=quarantine at pct=25, one a week (plan %s, %s) |" % (a["id"], s["id"])) in doc
     assert "add rua reporting" not in doc
-    # the zero-risk records: the two whose own record nobody saw wait on a lookup, and the document says so
-    assert ("- **%d zero-risk monitoring records** ready to publish, of which 2 (%s, %s) need a lookup first: the "
-            "name may have a record of its own already (plan %s to %s)" % (len(p1), q["id"], f["id"], p1[0], p1[-1])
-            in doc)
+    # the zero-risk records, one item per organization (round 12: an organization's line holds its own records):
+    # the two whose own record nobody saw wait on a lookup, and corp.example's item says so
+    corp = [c["id"] for c in plan["changes"] if c["priority"] == 1 and c["domain"].endswith("corp.example")]
+    assert ("- **%d zero-risk monitoring records for corp.example** ready to publish, of which 2 (%s, %s) need a lookup "
+            "first: the name may have a record of its own already (plan %s to %s)"
+            % (len(corp), q["id"], f["id"], corp[0], corp[-1]) in doc)
+    assert ("- **1 zero-risk monitoring record for brand.example** ready to publish (plan %s)" % b["id"] in doc
+            and "- **1 zero-risk monitoring record for shop.example** ready to publish (plan %s)" % a["id"] in doc)
+    assert len(corp) + 2 == len(p1)
     assert ("approval to publish the %d zero-risk records (plan %s to %s) in the next DNS change window, of which 2 "
             "need a lookup of the name's own _dmarc record first (publish only if it has none)"
             % (len(p1), p1[0], p1[-1])) in doc

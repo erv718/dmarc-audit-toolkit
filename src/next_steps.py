@@ -65,6 +65,7 @@ from pathlib import Path
 
 import audit  # the delta's own rules: the recorded cuts, a window's span, which spans compare
 import dedupe  # the overrides that let a delivered failure in, in plain words
+from dns_audit import TWO_LEVEL_SUFFIXES  # the one table of two-label public suffixes
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = "0.5"
@@ -239,11 +240,11 @@ def read_json(path, what, expect=dict):
 
 
 def org_domain(name):
-    """Registrable domain, with the common two-label public suffixes (same table as plan.py)."""
+    """Registrable domain, under the two-label public suffixes the DNS audit
+    knows (dns_audit.TWO_LEVEL_SUFFIXES, the one table discover.py and
+    plan.py read too): the organization every file of the run names."""
     labels = (name or "").split(".")
-    two = {"co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.jp", "co.nz",
-           "com.br", "com.mx", "co.za", "com.sg", "com.hk", "co.in", "co.kr", "com.tr", "com.ar"}
-    if len(labels) > 2 and ".".join(labels[-2:]) in two:
+    if len(labels) > 2 and ".".join(labels[-2:]) in TWO_LEVEL_SUFFIXES:
         return ".".join(labels[-3:])
     return ".".join(labels[-2:]) if len(labels) >= 2 else name
 
@@ -470,10 +471,12 @@ SENDER_KEYS = ("_key", "sender", "addr", "address", "sender_address", "from", "n
 
 def _entries(obj, name_keys):
     """A summary list (list of dicts) or map (name -> count or dict) as
-    [{name, count, likely, ...}] worst first, entries with no genuine failures
-    dropped (audit.py's census lists clean senders too); None when the shape
-    is not understood. The census's exception counts ride along (excepted,
-    likely_counts, likely_after, ...) for _after_exceptions."""
+    [{name, count, likely, ...}] worst first, a tie by the name's domain in
+    the one order (audit.sender_rank, no headline: a reader that has one
+    sorts again), entries with no genuine failures dropped (audit.py's
+    census lists clean senders too); None when the shape is not understood.
+    The census's exception counts ride along (excepted, likely_counts,
+    likely_after, ...) for _after_exceptions."""
     if isinstance(obj, dict):
         items = []
         for k, v in obj.items():
@@ -526,7 +529,18 @@ def _entries(obj, name_keys):
             if isinstance(it.get(src), str) and it[src] and dst not in entry:
                 entry[dst] = it[src].strip().lower()
         out.append(entry)
-    return sorted(out, key=lambda e: (-e["count"], e["name"]))
+    return _ranked(out)
+
+
+def _ranked(entries, headline=None):
+    """Entries ({name, count, ...}) worst first, then by the messages behind
+    them when the census counted those, a tie by the name's domain (an
+    address's, or an envelope domain itself) in the one order every list of
+    names follows, the headline's organization first, then by name
+    (audit.sender_rank): every list here ranked by a count sorts by it, as
+    report.md's census and summary.txt's do, so a tie names the same
+    entries in every file."""
+    return sorted(entries, key=lambda e: audit.sender_rank(e["name"], e["count"], headline, e.get("messages")))
 
 
 def _dominant(labels):
@@ -538,7 +552,9 @@ def _dominant(labels):
     return label if n * 2 > sum(c.values()) else "mixed"
 
 
-def _from_verdicts(genuine):
+def _from_verdicts(genuine, headline=None):
+    """(envelopes, senders) worst first (_ranked, the headline's organization first on a tie), from the
+    genuine failures themselves when the report carries no census."""
     by_env, by_sender = OrderedDict(), OrderedDict()
     for v in genuine:
         env = (v.get("envelope_domain") or "(no envelope domain)").lower()
@@ -558,10 +574,7 @@ def _from_verdicts(genuine):
     senders = [{"name": k, "count": len(s["labels"]), "likely": _dominant(s["labels"]),
                 "domain": s["domain"], "envelope": s["envelopes"].most_common(1)[0][0],
                 "subjects": [x for x, _ in s["subjects"].most_common(2)]} for k, s in by_sender.items()]
-
-    def key(e):
-        return (-e["count"], e["name"])
-    return sorted(envs, key=key), sorted(senders, key=key)
+    return _ranked(envs, headline), _ranked(senders, headline)
 
 
 def _stamp(value):
@@ -658,13 +671,14 @@ def _carries_exceptions(obj):
     return any(isinstance(r, dict) and "excepted" in r for r in rows)
 
 
-def _after_exceptions(entries, what):
+def _after_exceptions(entries, what, headline=None):
     """(left, excepted) for census entries that carry the exception counts:
     each entry keeps the failures no exception covers, labelled by what is
     left (likely_after), and an envelope names the senders still failing
     through it; an entry with nothing left drops out. excepted: one
     {name, domain, envelope, count} per stream an exception covered, so the
-    excepted messages are listed once, as such."""
+    excepted messages are listed once, as such. Both worst first, a tie in
+    the one order (_ranked)."""
     left, excepted = [], []
     for e in entries:
         n_exc = min(e.get("excepted") or 0, e["count"])
@@ -680,16 +694,18 @@ def _after_exceptions(entries, what):
             e["sender_count"] = e["senders_after"]
             e["senders"] = [e["sample_sender_after"]] if e.get("sample_sender_after") else []
         left.append(e)
-    left.sort(key=lambda e: (-e["count"], e["name"]))
-    excepted.sort(key=lambda e: (-e["count"], e["name"], str(e.get("envelope") or "")))
+    left = _ranked(left, headline)
+    excepted.sort(key=lambda e: audit.sender_rank(e["name"], e["count"], headline) + (str(e.get("envelope") or ""),))
     return left, excepted
 
 
 def maillog_view(report, headline=None):
     """What the document needs from the mail log: summaries when the report
     carries them, else derived from the verdicts. None when there is no mail log.
-    The envelope domains run worst first, a tie in the one order every list
-    of names follows (audit.domain_key, the headline's organization first).
+    The envelope domains, the senders, the senders delivered despite failing
+    and the excepted streams each run worst first, a tie in the one order
+    every list of names follows (_ranked: the domain in audit.domain_key
+    order, the headline's organization first, then the name).
 
     The lists that name senders are what the formal exceptions left: the
     census counts the excepted failures per stream (audit.py marks every
@@ -736,27 +752,28 @@ def maillog_view(report, headline=None):
         by_sender = _entries(snd_obj, SENDER_KEYS) if snd_obj is not None else None
         counted = _carries_exceptions(snd_obj) and by_sender is not None
         if counted:
-            by_sender, excepted = _after_exceptions(by_sender, "sender")
+            by_sender, excepted = _after_exceptions(by_sender, "sender", headline)
             if by_env is not None:
-                by_env = _after_exceptions(by_env, "envelope")[0]
+                by_env = _after_exceptions(by_env, "envelope", headline)[0]
     elif isinstance(census, list):
         by_env = _entries(census, ENV_KEYS)
     if by_env is not None or by_sender is not None:
         view["basis"] = "census"
     if (by_env is None or by_sender is None) and verdicts:
         # the verdicts themselves: the ones an exception covers carry its mark and are listed apart
-        v_env, v_snd = _from_verdicts([v for v in genuine if not v.get("excepted")])
+        v_env, v_snd = _from_verdicts([v for v in genuine if not v.get("excepted")], headline)
         if by_sender is None:
             counted = any("excepted" in v for v in genuine)
             gone = Counter(((v.get("sender") or "(no sender)").lower(), (v.get("domain") or "").lower(),
                             (v.get("envelope_domain") or "(blank)").lower()) for v in genuine if v.get("excepted"))
             excepted = [{"name": s, "domain": d, "envelope": e, "count": n}
-                        for (s, d, e), n in sorted(gone.items(), key=lambda kv: (-kv[1], kv[0]))]
+                        for (s, d, e), n in sorted(gone.items(), key=lambda kv: audit.sender_rank(
+                            kv[0][0], kv[1], headline) + kv[0])]
         by_env = by_env if by_env is not None else v_env
         by_sender = by_sender if by_sender is not None else v_snd
         view["basis"] = view["basis"] or "verdicts"
-    view["by_envelope"] = sorted(by_env or [], key=lambda e: (-e["count"], audit.domain_key(e["name"], headline)))
-    view["by_sender"] = by_sender or []
+    view["by_envelope"] = _ranked(by_env or [], headline)
+    view["by_sender"] = _ranked(by_sender or [], headline)
     view["census_missing"] = by_env is None and by_sender is None
     view["excepted"] = excepted
     view["exceptions_counted"] = counted
@@ -801,7 +818,7 @@ def maillog_view(report, headline=None):
                             by.setdefault(s, Counter())[str(reason)] += _n(k)
     view["ddf_senders"] = [dict({"name": s, "count": n, "domain": (s.rpartition("@")[2] if "@" in s else ""),
                                  "envelope": env_of.get(s, "")}, **({"by": dict(by[s])} if by.get(s) else {}))
-                           for s, n in sorted(ddf.items(), key=lambda kv: (-kv[1], kv[0]))]
+                           for s, n in sorted(ddf.items(), key=lambda kv: audit.sender_rank(kv[0], kv[1], headline))]
     view["delivered_excepted"] = ddf_excepted
     # the whole log's overrides, over every delivered failure as the count beside them (excepted or not); the
     # export recorded the overrides when the counter is there (empty when none was named) or a verdict carries one
@@ -842,13 +859,14 @@ def _split(s):
     return out
 
 
-def _by_address(entries, delivered=None):
+def _by_address(entries, delivered=None, headline=None):
     """Census streams merged per address, each with what it has left per
     group (likes: own, spoof, unclear, from _split): an address with
     failures under two labels is named under both, with each count. An
     address with nothing left drops out. delivered: {address: messages
     delivered despite failing} (the view's ddf_senders), carried along so
-    a spoof the policy was supposed to stop is never called handled."""
+    a spoof the policy was supposed to stop is never called handled. Worst
+    first, a tie in the one order (_ranked)."""
     merged = {}
     delivered = delivered or {}
     for s in entries:
@@ -863,22 +881,21 @@ def _by_address(entries, delivered=None):
         e.update(likes=dict(likes), likely=likes.most_common(1)[0][0] if likes else UNCLEAR)
         if e["count"] > 0:
             out.append(e)
-    return sorted(out, key=lambda e: (-e["count"], e["name"]))
+    return _ranked(out, headline)
 
 
-def _groups(senders):
+def _groups(senders, headline=None):
     """{own, spoof, unclear} for the one-liner: every address with what it
-    has left under that group, worst first, with how many of its messages
-    reached a mailbox despite failing."""
+    has left under that group, worst first (a tie in the one order,
+    _ranked), with how many of its messages reached a mailbox despite
+    failing."""
     groups = {OWN: [], SPOOF: [], UNCLEAR: []}
     for s in senders:
         for label, n in (s.get("likes") or {s.get("likely"): s.get("count") or 0}).items():
             if n > 0:
                 groups[_group(label)].append({"name": s["name"], "count": n, "domain": s.get("domain"),
                                               "likely": _group(label), "delivered": s.get("delivered") or 0})
-    for g in groups.values():
-        g.sort(key=lambda e: (-e["count"], e["name"]))
-    return groups
+    return {k: _ranked(g, headline) for k, g in groups.items()}
 
 
 def _delivered_of(view):
@@ -946,12 +963,14 @@ def _excepted_ips(report):
     return {str(ip) for ip in ips if ip} if isinstance(ips, list) else set()
 
 
-def streams(view, rua, own=None, excepted_ips=()):
+def streams(view, rua, own=None, excepted_ips=(), headline=None):
     """The one-liner's senders: the organization domain's own (from
     maillog.by_domain), else every sender in the census 'across all audited
     domains', else source IPs from the aggregate reports when there is no mail
     log, less the ones the gate formally excepted (excepted_ips). An address
-    is named in every group where it has failures left, with that many."""
+    is named in every group where it has failures left, with that many; a
+    source by the From domains it fails as (audit.from_names). A tie names
+    the headline's organization first."""
     if own is not None:
         groups = _groups(own["senders"])
         scope = "unaudited subdomains" if own.get("subdomains") else "own domain"
@@ -963,7 +982,7 @@ def streams(view, rua, own=None, excepted_ips=()):
                 "by_likely": own["by_likely"], "top_senders": own["top_senders"],
                 "subdomains": own.get("subdomains") or []}
     if view is not None and (view["by_sender"] or view["genuine_failures"] is not None):
-        groups = _groups(_by_address(view["by_sender"], _delivered_of(view)))
+        groups = _groups(_by_address(view["by_sender"], _delivered_of(view), headline), headline)
         excepted = view.get("excepted") or []
         out = {"basis": "mail log", "scope": "all audited domains", "window": view.get("window"),
                "excepted": sum(e["count"] for e in excepted), "excepted_reduced": True,
@@ -975,9 +994,12 @@ def streams(view, rua, own=None, excepted_ips=()):
     if isinstance(rua, dict):
         skip = {str(ip) for ip in excepted_ips or ()}
         fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict) and str(s.get("source_ip")) not in skip]
+        counts = audit.from_counts(rua)
 
         def conv(s):
-            return {"name": "%s as %s" % (s.get("source_ip", "?"), ", ".join(s.get("header_from") or [])[:60] or "?"),
+            names = audit.from_names(s.get("header_from") if isinstance(s.get("header_from"), list) else [],
+                                     counts.get(str(s.get("source_ip"))), headline)
+            return {"name": "%s as %s" % (s.get("source_ip", "?"), names or "?"),
                     "count": _n(s.get("fail")) if _n(s.get("fail")) is not None else (_n(s.get("count")) or 0),
                     "likely": _group(s.get("likely"))}
         groups = {OWN: [], SPOOF: [], UNCLEAR: []}
@@ -1605,6 +1627,37 @@ def _ordered(names, headline=None):
     return audit.order_domains([_domain_of(n) for n in names or ()], headline)
 
 
+# how collect.py's cut clauses (maillog.truncation) and its caveats name the organization each is about
+ORG_NAMED = (re.compile(r"^mail log: (\S+) "), re.compile(r"^mail log for (\S+) "),
+             re.compile(r"\bfor ([^\s;]+)$"), re.compile(r"^an hour of (\S+) \("))
+
+
+def _org_named(text):
+    """The organization one of collect.py's cut clauses or caveats is about
+    ('row budget kept only the newest 41h for brand.example', 'an hour of
+    example.org (6h..5h ago) is truncated at the API cap', 'mail log:
+    example.org row budget reached ...'); '' for any other text."""
+    for rx in ORG_NAMED:
+        m = rx.search(str(text or ""))
+        if m and _domain_of(m.group(1)):
+            return _domain_of(m.group(1))
+    return ""
+
+
+def order_by_org(texts, headline=None):
+    """Texts that each name one organization (collect.py's cut clauses and
+    caveats, which follow the order it pulled them in) in the one order of
+    those organizations, the headline's first; two about one organization
+    keep their order. Any text that names none leaves the list as given:
+    nothing is moved on a guess."""
+    texts = list(texts)
+    orgs = [_org_named(t) for t in texts]
+    if not all(orgs):
+        return texts
+    order = sorted(range(len(texts)), key=lambda i: (audit.domain_key(org_domain(orgs[i]), headline), i))
+    return [texts[i] for i in order]
+
+
 def policy_tags(report, domain):
     dns_doc = (report.get("dns") or {}).get(domain) or {}
     if dns_doc.get("dmarc"):
@@ -1733,7 +1786,7 @@ def _part(senders, labels):
     how many of its messages reached a mailbox despite failing."""
     out = [{"name": s["name"], "count": sum((s.get("likes") or {}).get(k, 0) for k in labels),
             "delivered": s.get("delivered") or 0} for s in senders]
-    return sorted((s for s in out if s["count"] > 0), key=lambda s: (-s["count"], s["name"]))
+    return _ranked(s for s in out if s["count"] > 0)  # one organization's addresses: no headline needed
 
 
 def _delivered(entries):
@@ -2247,13 +2300,17 @@ def where_we_stand(report, view, trend, window=None, policy=None, headline=None)
         if view["truncation"]:
             # the row budget keeps whole hours, so its count is a floor; an hour at the API row cap keeps an
             # arbitrary part of its legs (a passing copy can be dropped, so failures can be overcounted) and a failed
-            # pull keeps nothing: those say what audit says of them, never "a floor"
+            # pull keeps nothing: those say what audit says of them, never "a floor". collect.py writes its cut
+            # clauses in the order it pulled the organizations: they name them in the one order here, as every
+            # other list in this sentence does
+            cut_text = "; ".join(order_by_org(str(view["truncation"]).split("; "), headline))
+            data["truncation"] = cut_text
             cuts = audit.maillog_cuts(report)
             odd = any(audit._cut_hours_capped(i) or (isinstance(i, dict) and i.get("reason") in ("api cap", "not pulled"))
                       for i in cuts.values())
-            said = audit._cut_words(cuts) if odd else ""
-            text += ("; the log export was cut short (%s)%s" % (view["truncation"], said) if said else
-                     "; the log export was cut short (%s), so this count is a floor" % view["truncation"])
+            said = audit._cut_words(cuts, headline) if odd else ""
+            text += ("; the log export was cut short (%s)%s" % (cut_text, said) if said else
+                     "; the log export was cut short (%s), so this count is a floor" % cut_text)
         full = full_window(report)
         if full:  # beside the floor, never instead of it: every verdict still rests on the rows kept
             full["orgs"] = audit.order_domains(full["orgs"], headline)
@@ -2317,6 +2374,7 @@ def where_we_stand(report, view, trend, window=None, policy=None, headline=None)
         lines.append("**Mail refused or quarantined by receivers: outside view not in this run** "
                      "(no aggregate reports were read)")
     caveats = [str(c) for c in (report.get("caveats") or []) if c] if isinstance(report.get("caveats"), list) else []
+    caveats = order_by_org(caveats, headline)  # one per cut organization, in the one order
     data["caveats"] = caveats
     for c in caveats:
         lines.append("**Caveat:** %s" % c)
@@ -2370,7 +2428,28 @@ def _note_line(entries, cap=NOTES_CAP):
     return text
 
 
-def what_is_failing(report, view):
+# the line that names the entries at HEADLINE_MIN or more beyond the TOP_ENTRIES headlines, and the notes line
+MORE_LINE = "Also at %d or more each: " % HEADLINE_MIN
+NOTES_LINE = "Notes, not headlines (under %d each): " % HEADLINE_MIN
+
+
+def headline_split(entries):
+    """(head, more, notes) for one What is failing list, worst first: the
+    first TOP_ENTRIES entries with HEADLINE_MIN messages or more are the
+    headlines, the other entries at HEADLINE_MIN or more are named apart
+    (MORE_LINE), and only the entries under HEADLINE_MIN are notes - so the
+    notes line's 'under 10 each' is true. brief.py lays out the same split."""
+    big = [e for e in entries if (_n(e.get("count")) or 0) >= HEADLINE_MIN]
+    return big[:TOP_ENTRIES], big[TOP_ENTRIES:], [e for e in entries if (_n(e.get("count")) or 0) < HEADLINE_MIN]
+
+
+def what_is_failing(report, view, headline=None):
+    """What is failing, as data and as lines: the mail log's envelope domains
+    and senders, the outside view's failing sources (each named with the
+    From domains it fails as), the excepted ones listed once, and the
+    failing senders new since the previous run; each list split by
+    headline_split, its notes capped at NOTES_CAP. headline: the
+    organization a tie names first."""
     rua = report.get("rua") if isinstance(report.get("rua"), dict) else None
     lines, data = [], {"basis": None, "by_envelope": [], "by_sender": [], "outside": [], "notes": []}
     if view is None and not rua:
@@ -2398,13 +2477,14 @@ def what_is_failing(report, view):
                 entries = view[key]
                 if not entries:
                     continue
-                head = [e for e in entries if e["count"] >= HEADLINE_MIN][:TOP_ENTRIES]
-                rest = [e for e in entries if e not in head]
+                head, more, rest = headline_split(entries)
                 lines.append("%s:" % title)
                 for e in head:
                     lines.append("- " + _entry_bullet(e, what))
+                if more:
+                    lines.append("- " + MORE_LINE + _note_line(more))
                 if rest:
-                    lines.append("- Notes, not headlines (under %d each): %s" % (HEADLINE_MIN, _note_line(rest)))
+                    lines.append("- " + NOTES_LINE + _note_line(rest))
                 data[key] = entries
                 lines.append("")
             if lines and lines[-1] == "":
@@ -2417,12 +2497,15 @@ def what_is_failing(report, view):
     if rua:
         fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict)]
         skip = _excepted_ips(report)
+        counts = audit.from_counts(rua)
         out, excepted = [], []
         for s in fs:
             fail = _n(s.get("fail")) if _n(s.get("fail")) is not None else (_n(s.get("count")) or 0)
             e = {"name": s.get("source_ip") or "?", "count": fail, "total": _n(s.get("count")),
                  "likely": _likely(s.get("likely")), "header_from": list(s.get("header_from") or []),
                  "dispositions": s.get("dispositions") if isinstance(s.get("dispositions"), dict) else {}}
+            # every From domain it fails as, the busiest first, a tie in the one order: the line and the brief name them
+            e["as"] = audit.from_names(e["header_from"], counts.get(str(s.get("source_ip"))), headline)
             (excepted if str(s.get("source_ip")) in skip else out).append(e)
         data["outside"] = out
         if excepted:  # listed once, as what they are: not sources to chase
@@ -2432,16 +2515,16 @@ def what_is_failing(report, view):
         if out:
             lines.append("From the outside (aggregate reports; these counts include forwarded copies and cannot be "
                          "deduplicated):")
-            head = [e for e in out if e["count"] >= HEADLINE_MIN][:TOP_ENTRIES]
-            rest = [e for e in out if e not in head]
+            head, more, rest = headline_split(out)
             for e in head:
                 disp = ", ".join("%d %s" % (_n(v) or 0, k) for k, v in (e["dispositions"] or {}).items() if _n(v))
                 lines.append("- **%s - %d failing %s as %s** %s%s" % (
-                    e["name"], e["count"], _plural(e["count"], "message"), ", ".join(e["header_from"][:2]) or "?",
+                    e["name"], e["count"], _plural(e["count"], "message"), e["as"] or "?",
                     LIKELY_WORDS.get(e["likely"], "unclear"), (" (receivers: %s)" % disp) if disp else ""))
+            if more:
+                lines.append("- " + MORE_LINE + _note_line(more))
             if rest:
-                lines.append("- Notes, not headlines: %s" % ", ".join(
-                    "%s x%d (%s)" % (e["name"], e["count"], LIKELY_WORDS.get(e["likely"], "unclear")) for e in rest))
+                lines.append("- Notes, not headlines: %s" % _note_line(rest))
             if excepted:
                 lines.append("- Formally excepted in audit.toml and not counted above: %s" % _note_line(excepted))
         elif excepted:
@@ -2451,10 +2534,10 @@ def what_is_failing(report, view):
             lines.append("From the outside (aggregate reports): no source fails with volume.")
     dl = report.get("delta") if isinstance(report.get("delta"), dict) else None
     if dl and isinstance(dl.get("new_senders"), list):
-        new = _entries(dl["new_senders"], SENDER_KEYS) or []
+        new = _ranked(_entries(dl["new_senders"], SENDER_KEYS) or [], headline)
         gone = []
         if _carries_exceptions(dl["new_senders"]):  # the census rows say what an exception covered
-            new, gone = _after_exceptions(new, "sender")
+            new, gone = _after_exceptions(new, "sender", headline)
         day = _day(dl.get("previous_generated_utc")) or "date unknown"
         n = sum(e["count"] for e in gone)
         if new:
@@ -2680,6 +2763,97 @@ ACTION_ORDER = {"p1summary": 0, "dns": 1, "sender": 2, "override": 3, "stream": 
                 "finding": 5}
 # an owner group this big that spans two organizations or more is shown with one line per organization
 GROUP_BY_ORG = 6
+# where an owner group files an item that concerns several organizations, and one that concerns none
+SEVERAL_ORGS, TENANT_WIDE = "Several organizations", "Tenant-wide"
+# outside sources of one owner with the same finding and the same diagnosis become one item from this many on
+FOLD_SOURCES = 4
+# what an outside source's action says, for one source and for several folded into one item
+STREAM_ACTIONS = {
+    OWN: ("DKIM-sign the system behind this IP with an aligned d=: receivers see it fail",
+          "DKIM-sign the systems behind these IPs with an aligned d=: receivers see them fail"),
+    UNCLEAR: ("find out whose system this IP is: receivers see it fail and the heuristic could not tell spoof from "
+              "our own",
+              "find out whose systems these IPs are: receivers see them fail and the heuristic could not tell spoof "
+              "from our own")}
+
+
+def _orgs_of(domains):
+    """The organizations a list of domain names concerns, each once, in the
+    list's order (an item's domains are in the one order already)."""
+    return list(dict.fromkeys(org_domain(_dom(d)) for d in domains or () if _dom(d)))
+
+
+def _item_orgs(item):
+    """The organizations an owner's item concerns: its orgs when the
+    document carries them, else its one org (a document from before they
+    were recorded), else none."""
+    if isinstance(item.get("orgs"), list):
+        return [_dom(o) for o in item["orgs"] if _dom(o)]
+    return [_dom(item.get("org"))] if _dom(item.get("org")) else []
+
+
+def _signs_once(text):
+    """An outside source's signs without its own counts ('(40 msgs)', '12
+    msgs', 'x3'), so one sentence holds for every source folded with it."""
+    text = re.sub(r"\s*\(\d+(?: of \d+)? msgs?\)", "", text)
+    text = re.sub(r"\b\d+ msgs?\b", "messages", text)
+    return re.sub(r"\s+x\d+(?=$|[;,)])", "", text).strip()
+
+
+def _fold_key(item):
+    """What two outside sources share when they are one diagnosis: the
+    finding they come under and the action once the source's IP and its
+    counts are blanked."""
+    src = item.get("_source") or {}
+    text = str(item.get("action") or "").replace(str(src.get("ip") or "\0"), "<ip>")
+    text = re.sub(r"\b\d+(?: of \d+)? msgs?\b", "N msgs", text)
+    text = re.sub(r"(?<=\sx)\d+\b", "N", text)
+    return (item.get("ref"), text)
+
+
+def _fold_streams(items, counts, headline=None):
+    """One owner's outside-source items with FOLD_SOURCES or more of them
+    under one finding and one diagnosis (_fold_key) folded into one item:
+    how many sources, their failing messages and the From domains they fail
+    as, the busiest STREAM_NAMES with their counts and how many more
+    report.md lists, and the signs once (_signs_once). Fewer sources, and
+    every other item, stay as they are; the fold takes the first source's
+    place."""
+    groups = OrderedDict()
+    for it in items:
+        if it.get("kind") == "stream" and it.get("_source"):
+            groups.setdefault(_fold_key(it), []).append(it)
+    out = []
+    for it in items:
+        if it.get("kind") != "stream" or not it.get("_source"):
+            out.append(it)
+            continue
+        same = groups[_fold_key(it)]
+        if len(same) < FOLD_SOURCES:
+            out.append(it)
+            continue
+        if it is not same[0]:
+            continue  # folded into the first one
+        srcs = sorted((s["_source"] for s in same), key=lambda s: (-s["fail"], s["ip"]))
+        total = sum(s["fail"] for s in srcs)
+        # each From domain weighs the messages the sources sent as it (rua.by_source_ip), else the failing
+        # messages of the sources that name it
+        weight, names = Counter(), []
+        for s in srcs:
+            own = counts.get(s["ip"]) or {}
+            for h in s["hf"]:
+                names.append(h)
+                weight[_dom(h)] += own.get(_dom(h), 0) if own else s["fail"]
+        as_names = audit.from_names(names, dict(weight), headline)
+        top = ", ".join("%s x%d" % (s["ip"], s["fail"]) for s in srcs[:STREAM_NAMES])
+        more = len(srcs) - STREAM_NAMES
+        signs = _signs_once(srcs[0]["signs"])
+        action = STREAM_ACTIONS[srcs[0]["label"]][1] + ((" (%s)" % signs) if signs else "")
+        action += "; the busiest: %s%s" % (top, ("; %d more in report.md" % more) if more > 0 else "")
+        out.append(dict(it, hook="%d outside sources - %d failing %s as %s" % (
+            len(srcs), total, _plural(total, "message"), as_names or "?"), action=action,
+            domains=_ordered(names, headline)))
+    return out
 
 
 def _item_key(item, pos, headline=None, plan_pos=0):
@@ -2716,15 +2890,17 @@ def build_actions(report, plan, view, owners, headline=None):
                           "is_dmarc": str(c.get("hostname") or "").startswith("_dmarc."), "lookup": looks_first(c),
                           "keeps": keeps_policy(c)})
         else:
-            action = plain(step_label(c))
+            summary = plain(step_label(c))
             why = plain(str(c.get("human_summary") or c.get("why") or "").strip())  # plan.py's plain words first
             if why:
-                action += " - " + why
-            pre = reword_prereqs(prereqs_of(c))
-            if pre:
-                action += " (before applying: %s)" % _join(pre)
+                summary += " - " + why
+            pre = [p for p in reword_prereqs(prereqs_of(c)) if p]  # what _join words: an empty condition is none
+            action = summary + ((" (before applying: %s)" % _join(pre)) if pre else "")
+            # the same item in parts, for a reader that lays the conditions out as a checklist: the action without
+            # its before-applying clause, and the conditions in the row's order, worded as the clause words them
             items.append({"kind": "dns", "keys": keys, "ref": c.get("id"), "domain": dom, "hook": dom, "action": action,
-                          "domains": [dom] if dom else [], "plan_pos": pos})
+                          "summary": summary, "prerequisites": list(pre), "domains": [dom] if dom else [],
+                          "plan_pos": pos})
         for fid in c.get("finding_ids") or []:
             covered.add(("dns:" + dom, fid))
 
@@ -2739,7 +2915,7 @@ def build_actions(report, plan, view, owners, headline=None):
                 own_all.append(dict(s, count=ours, likely=OWN if split.get(OWN, 0) >= split.get(UNCLEAR, 0) else UNCLEAR))
             if split.get(SPOOF, 0) > 0:
                 spoof.append(dict(s, count=split[SPOOF]))
-        own_all.sort(key=lambda s: (-s["count"], s["name"]))
+        own_all = _ranked(own_all, headline)  # the cap below keeps the headline's senders on a tie
         for s in own_all[:SENDER_ITEMS_CAP]:
             hook = "%s - %d %s" % (s["name"], s["count"], _plural(s["count"], "message"))
             subj = ('subjects like "%s"' % str(s["subjects"][0])[:60]) if s.get("subjects") else ""
@@ -2811,6 +2987,7 @@ def build_actions(report, plan, view, owners, headline=None):
             covered.add(("maillog", "MAILFLOW-002"))
 
     rua = report.get("rua") if isinstance(report.get("rua"), dict) else None
+    counts = audit.from_counts(rua)  # each source's messages per From domain: what ranks the names it fails as
     if rua:
         skip = _excepted_ips(report)  # formally excepted: listed once in What is failing, never work
         fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict) and str(s.get("source_ip")) not in skip]
@@ -2823,18 +3000,18 @@ def build_actions(report, plan, view, owners, headline=None):
             if label == SPOOF:
                 spoof_fs.append((s, hf, fail))
                 continue
-            hook = "%s - %d failing %s as %s" % (s.get("source_ip") or "?", fail, _plural(fail, "message"),
-                                                 ", ".join(hf[:2]) or "?")
-            if label == OWN:
-                action = "DKIM-sign the system behind this IP with an aligned d=: receivers see it fail"
-            else:
-                action = ("find out whose system this IP is: receivers see it fail and the heuristic could not "
-                          "tell spoof from our own")
+            ip = str(s.get("source_ip") or "?")
+            hook = "%s - %d failing %s as %s" % (ip, fail, _plural(fail, "message"),
+                                                 audit.from_names(hf, counts.get(ip), headline) or "?")
+            label = OWN if label == OWN else UNCLEAR
+            action = STREAM_ACTIONS[label][0]
             sig = plain("; ".join(str(x) for x in (s.get("likely_signals") or [])[:2]))
             if sig:  # whole: the signal that decided the label is often the second one
                 action += " (%s)" % sig
+            # what the fold of sources that share this diagnosis needs (_fold_streams); never written out
             items.append({"kind": "stream", "keys": hf + [org_domain(h) for h in hf], "ref": ref,
-                          "hook": hook, "action": action, "domains": _ordered(hf, headline)})
+                          "hook": hook, "action": action, "domains": _ordered(hf, headline),
+                          "_source": {"ip": ip, "fail": fail, "hf": hf, "label": label, "signs": sig}})
         if spoof_fs:
             total = sum(f for _, _, f in spoof_fs)
             disp = Counter()
@@ -2902,34 +3079,58 @@ def build_actions(report, plan, view, owners, headline=None):
         if not g["items"]:
             continue
         p1 = [i for i in g["items"] if i["kind"] == "p1record"]
-        rest = [i for i in g["items"] if i["kind"] != "p1record"]
-        lines = []
-        if p1:
-            ids = [i["ref"] for i in p1 if i["ref"]]
-            # a record that keeps a name at the policy it follows today is zero-risk too, but not monitoring
-            keeps = sum(1 for i in p1 if i.get("keeps"))
-            what = ("DMARC" if keeps else "monitoring") if all(i["is_dmarc"] for i in p1) else \
-                ("DMARC and hygiene" if keeps else "monitoring and hygiene")
-            # a record for a name whose own _dmarc record nobody saw waits on a lookup: a second record breaks it
-            looks = [i["ref"] or i["domain"] for i in p1 if i.get("lookup")]
-            lines.append({"hook": "%d zero-risk %s %s" % (len(p1), what, _plural(len(p1), "record")),
-                          "action": "ready to publish" + (", of which %d (%s) %s a lookup first: the name may have a "
-                                                          "record of its own already" % (
-                                                              len(looks), ", ".join(looks),
-                                                              "needs" if len(looks) == 1 else "need") if looks else "")
-                          + ("; %d %s a subdomain at the p=quarantine it follows today, not a p=none monitoring "
-                             "record" % (keeps, "keeps" if keeps == 1 else "keep") if keeps else ""),
-                          "ref": ("plan " + id_range(ids)) if ids else None,
-                          "kind": "p1summary", "domains": _ordered([i["domain"] for i in p1], headline)})
+        rest = _fold_streams([i for i in g["items"] if i["kind"] != "p1record"], counts, headline)
+        lines = [_p1_summary(part, org, headline) for org, part in _p1_parts(p1, headline)]
         for i in rest:
-            lines.append({"hook": i["hook"], "action": i["action"], "ref": i["ref"], "kind": i["kind"],
-                          "matched_by": i.get("matched_by"), "domains": list(i.get("domains") or [])})
+            line = {"hook": i["hook"], "action": i["action"], "ref": i["ref"], "kind": i["kind"],
+                    "matched_by": i.get("matched_by"), "domains": list(i.get("domains") or [])}
+            if "summary" in i:  # a plan row: the action in parts as well
+                line.update(summary=i["summary"], prerequisites=list(i["prerequisites"]))
+            lines.append(line)
         plan_pos = [0] * (len(lines) - len(rest)) + [i.get("plan_pos", 0) for i in rest]
         for line in lines:
+            # org: the organization of the item's first domain; orgs: every organization it concerns, so a reader
+            # files an item that concerns several under neither one alone
             line["org"] = org_domain(_dom(line["domains"][0])) if line["domains"] else ""
+            line["orgs"] = _orgs_of(line["domains"])
         order = sorted(range(len(lines)), key=lambda k: _item_key(lines[k], k, headline, plan_pos[k]))
         out.append({"owner": g["owner"], "channel": g["channel"], "items": [lines[k] for k in order]})
     return out
+
+
+def _p1_parts(p1, headline=None):
+    """One owner's zero-risk rows by organization, the headline's first:
+    [(org, rows)], one part per organization, so each organization's line
+    lists its own records; ('', rows) when they all sit under one."""
+    by = OrderedDict()
+    for i in p1:
+        by.setdefault(org_domain(_dom(i["domain"])) if _dom(i["domain"]) else "", []).append(i)
+    if len(by) < 2:
+        return [("", p1)] if p1 else []
+    return [(o, by[o]) for o in sorted(by, key=lambda o: (not o, audit.domain_key(o, headline)))]
+
+
+def _p1_summary(p1, org="", headline=None):
+    """The one item for an owner's zero-risk rows (of one organization, org,
+    when the owner's rows span several: its hook names it): how many, what
+    kind, which wait on a lookup, which keep a policy, and their plan ids."""
+    ids = [i["ref"] for i in p1 if i["ref"]]
+    # a record that keeps a name at the policy it follows today is zero-risk too, but not monitoring
+    keeps = sum(1 for i in p1 if i.get("keeps"))
+    what = ("DMARC" if keeps else "monitoring") if all(i["is_dmarc"] for i in p1) else \
+        ("DMARC and hygiene" if keeps else "monitoring and hygiene")
+    # a record for a name whose own _dmarc record nobody saw waits on a lookup: a second record breaks it
+    looks = [i["ref"] or i["domain"] for i in p1 if i.get("lookup")]
+    return {"hook": "%d zero-risk %s %s%s" % (len(p1), what, _plural(len(p1), "record"),
+                                              (" for %s" % org) if org else ""),
+            "action": "ready to publish" + (", of which %d (%s) %s a lookup first: the name may have a "
+                                            "record of its own already" % (
+                                                len(looks), ", ".join(looks),
+                                                "needs" if len(looks) == 1 else "need") if looks else "")
+            + ("; %d %s a subdomain at the p=quarantine it follows today, not a p=none monitoring "
+               "record" % (keeps, "keeps" if keeps == 1 else "keep") if keeps else ""),
+            "ref": ("plan " + id_range(ids)) if ids else None,
+            "kind": "p1summary", "domains": _ordered([i["domain"] for i in p1], headline)}
 
 
 def _action_line(item, pad):
@@ -2943,9 +3144,12 @@ def render_actions(groups, failing=None, headline=None):
     data) says why nothing is left when the exceptions took it all. An owner
     group of GROUP_BY_ORG items or more that spans two organizations or more
     gets one line per organization (the headline's first, then by name)
-    with its items under it in their order, and the tenant-wide items last
-    under Tenant-wide; a smaller group, or one an older document's items
-    carry no organization for, stays one flat list in its order."""
+    with the items that concern that organization alone under it in their
+    order, then the items that concern several under Several organizations
+    (an organization's own line never holds another's records), and the
+    tenant-wide items last under Tenant-wide; a smaller group, or one an
+    older document's items carry no organization for, stays one flat list
+    in its order."""
     L = []
     if not any(g["items"] for g in groups):
         if (failing or {}).get("excepted") or (failing or {}).get("outside_excepted"):
@@ -2955,12 +3159,13 @@ def render_actions(groups, failing=None, headline=None):
     for g in groups:
         L.append("- **%s**" % g["owner"] + (" (%s)" % g["channel"] if g["channel"] else ""))
         items = g["items"]
-        orgs = audit.order_domains(sorted({_dom(i.get("org")) for i in items if _dom(i.get("org"))}), headline)
+        orgs = audit.order_domains(sorted({o for i in items for o in _item_orgs(i)}), headline)
         if len(items) < GROUP_BY_ORG or len(orgs) < 2:
             L += [_action_line(i, "  ") for i in items]
             continue
-        parts = [(o, [i for i in items if _dom(i.get("org")) == o]) for o in orgs]
-        parts.append(("Tenant-wide", [i for i in items if not _dom(i.get("org"))]))
+        parts = [(o, [i for i in items if _item_orgs(i) == [o]]) for o in orgs]
+        parts.append((SEVERAL_ORGS, [i for i in items if len(_item_orgs(i)) > 1]))
+        parts.append((TENANT_WIDE, [i for i in items if not _item_orgs(i)]))
         for name, part in parts:
             if part:
                 L.append("  - **%s** - %d %s" % (name, len(part), _plural(len(part), "item")))
@@ -3238,7 +3443,7 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
     if not since and isinstance(changed, dict) and changed.get("to") == policy and changed.get("from"):
         since = date  # the delta shows the policy changed in this very run
     own = own_domain_view(report, view, org)
-    strm = streams(view, rua, own, _excepted_ips(report))
+    strm = streams(view, rua, own, _excepted_ips(report), head)
     if strm is not None and own is not None and not own.get("subdomains"):
         spoof_n = (strm.get("by_likely") or {}).get(SPOOF, 0)
         if spoof_n:  # the plan's split: a lure word in the subject is a strong sign; the envelope or a billing word is not
@@ -3255,7 +3460,7 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
                           trend_from_metrics(metrics, report, view) if metrics else None])
     trend = apply_comparability(trend, delta, report, view, head)
     stand = where_we_stand(report, view, trend, window, policy, head)
-    failing, failing_lines = what_is_failing(report, view)
+    failing, failing_lines = what_is_failing(report, view, head)
     domains = per_domain(report, plan, head)
     groups = build_actions(report, plan, view, owners, head)
     ask = build_ask(plan, org, nxt, policy)

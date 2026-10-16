@@ -70,14 +70,35 @@ def load(path):
         die("%s is not valid JSON: %s" % (path, err))
 
 
-def finding_keys(report):
-    return {(f.get("source") or f.get("domain") or "", f.get("id"))
-            for f in _rows(_d(report).get("findings")) if isinstance(f, dict)}
+def finding_rows(report):
+    """{(source, id): {"source", "id", "severity"}} over a report's findings, the
+    way the delta lists them: what a summary compares when the run carries no
+    delta of its own."""
+    out = {}
+    for f in _rows(_d(report).get("findings")):
+        if isinstance(f, dict):
+            key = (str(f.get("source") or f.get("domain") or ""), str(f.get("id") or ""))
+            out.setdefault(key, {"source": key[0], "id": key[1], "severity": f.get("severity")})
+    return out
 
 
-def delta_finding_keys(entries):
-    """(source, id) pairs from a delta's findings_new or findings_resolved list, in its order."""
-    return [((f.get("source") or ""), f.get("id")) for f in entries or [] if isinstance(f, dict)]
+def findings_text(rows, severity=True):
+    """'example.com DKIM-009, e.example.com DKIM-009 (major); t.example.com
+    DMARC-004 (minor)': findings as a summary names them, in the order given;
+    with severity, each run of findings that share one is followed by it,
+    so a list ranked by severity says why it runs as it does."""
+    parts, run, sev = [], [], None
+    for f in rows:
+        text = "%s %s" % (str(f.get("source") or "").replace("dns:", ""), f.get("id"))
+        this = f.get("severity") if severity and isinstance(f.get("severity"), str) else None
+        if run and this != sev:
+            parts.append(", ".join(run) + (" (%s)" % sev if sev else ""))
+            run = []
+        run.append(text)
+        sev = this
+    if run:
+        parts.append(", ".join(run) + (" (%s)" % sev if sev else ""))
+    return "; ".join(parts)
 
 
 def source_ips(report):
@@ -188,14 +209,15 @@ def census_top(census, n=CENSUS_TOP, headline=None):
     (census_excepted counts the rest), and they decide which entries are the
     worst; a tie goes by messages, as the census ranks them, then in the one
     order every list of names follows (audit.domain_key, the headline's
-    organization first)."""
+    organization first): audit.sender_rank, the key next_steps.md's lists
+    sort by, so a tie names the same entries in both."""
     rows = []
     for r in _rows(census.get("by_envelope")):
         failing, label = _left(r) if isinstance(r, dict) else (0, None)
         if failing:
             rows.append(dict(r, genuine_failures=failing, likely=label))
-    rows.sort(key=lambda r: (-r["genuine_failures"], -_whole(r.get("messages")),
-                             audit.domain_key(str(r.get("envelope_domain") or ""), headline)))
+    rows.sort(key=lambda r: audit.sender_rank(str(r.get("envelope_domain") or ""), r["genuine_failures"], headline,
+                                              _whole(r.get("messages"))))
     if not rows:
         folded = {}
         for r in _rows(census.get("by_sender")):
@@ -548,7 +570,7 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
                         (" (%s)" % by) if by else "", _whole(_d(ml.get("by_likely")).get("likely_spoof"))))
     census = maillog.get("census")
     if isinstance(census, dict):
-        top, failing = census_top(census)
+        top, failing = census_top(census, headline=headline)
         gone = census_excepted(census)
         if top:
             lines.append("- top failing senders (census): " + ", ".join(top) + _more(len(top), failing)
@@ -582,16 +604,20 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
         if prev_gen:
             lines.append("- previous run: %s" % str(prev_gen)[:16].replace("T", " "))
         if dl:
-            new_f = delta_finding_keys(dl.get("findings_new"))
-            gone_f = delta_finding_keys(dl.get("findings_resolved"))
+            new_f = [f for f in _rows(dl.get("findings_new")) if isinstance(f, dict)]
+            gone_f = [f for f in _rows(dl.get("findings_resolved")) if isinstance(f, dict)]
         else:
-            now_f, prev_f = finding_keys(report), finding_keys(previous)
-            new_f, gone_f = sorted(now_f - prev_f), sorted(prev_f - now_f)
+            now_f, prev_f = finding_rows(report), finding_rows(previous)
+            new_f = [now_f[k] for k in now_f if k not in prev_f]
+            gone_f = [prev_f[k] for k in prev_f if k not in now_f]
+        # the most severe first, then by the domain each names in the one order (the headline's organization
+        # first); the severity is named after each run of findings that share it, so the order reads as one
+        new_f.sort(key=lambda f: audit.finding_order(f, headline))
+        gone_f.sort(key=lambda f: audit.finding_order(f, headline, severity=False))
         if new_f:
-            lines.append("- *new findings*: " + ", ".join("%s %s" % (str(d).replace("dns:", ""), i) for d, i in new_f[:8])
-                         + (" ..." if len(new_f) > 8 else ""))
+            lines.append("- *new findings*: " + findings_text(new_f[:8], True) + _more(min(len(new_f), 8), len(new_f)))
         if gone_f:
-            lines.append("- resolved: " + ", ".join("%s %s" % (str(d).replace("dns:", ""), i) for d, i in gone_f[:8]))
+            lines.append("- resolved: " + findings_text(gone_f[:8], False) + _more(min(len(gone_f), 8), len(gone_f)))
         if dl:
             pol, gch = _d(dl.get("policy_changes")), _d(dl.get("gate_changes"))
             for dom in sorted(set(pol) | set(gch), key=lambda d: (audit.domain_key(d, headline), str(d))):
@@ -611,7 +637,7 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
             if _number(dl.get("delivered_despite_fail")):
                 lines.append("- delivered despite failing vs last run: %+d" % dl["delivered_despite_fail"])
             new = {"by_sender": _rows(dl.get("new_senders"))}
-            top, failing = census_top(new)
+            top, failing = census_top(new, headline=headline)
             gone = census_excepted(new)
             if top:
                 lines.append("- *new failing senders*: " + ", ".join(top) + _more(len(top), failing) + _excepted_tail(gone))
