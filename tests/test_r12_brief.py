@@ -418,7 +418,7 @@ def test_per_domain_rows_follow_the_one_order_with_the_headline_first_whatever_t
     # one-domain organization (brand.example) is a plain row in its place, never a group row above an identical row
     assert re.findall(r'<tr class="org"><th colspan="5" scope="colgroup"><bdi>([^<]+)</bdi> <span class="count">'
                       r'([^<]+)</span>', sec) == [("example.net", "2 domains"), ("example.com", "5 domains")]
-    assert '<tbody><tr><td class="name"><span class="dn"><b>brand.</b><wbr><b>example</b></span></td>' in sec
+    assert '<tbody><tr><td class="name"><span class="dn keep"><b>brand.</b><b>example</b></span></td>' in sec
     # a merged row is expanded, and each name takes its own plan id from the plan
     rows = dict(zip(names_in(sec), re.findall(r"<tr><td.*?</tr>", sec)))
     assert '<span class="tag">P-04</span>' in rows["e.example.com"] and "P-05" not in rows["e.example.com"]
@@ -426,11 +426,11 @@ def test_per_domain_rows_follow_the_one_order_with_the_headline_first_whatever_t
     # without plan.json an id cannot be placed: it stays on each name of its row, as next_steps.md shows it
     loose = dict(zip(IN_ORDER, re.findall(r"<tr><td.*?</tr>", section_of(brief.render(estate_doc()), "domains"))))
     assert "P-04" in loose["m.example.com"] and "P-05" in loose["e.example.com"]
-    # the names: a subdomain's own labels in front, its organization muted; an apex bold; each label one piece with
-    # a break opportunity after its dot, so a name breaks only between labels
-    assert ('<td class="name"><span class="dn"><b>dev.</b><wbr><b>support.</b><wbr><span class="apex">example.</span>'
-            '<wbr><span class="apex">com</span></span></td>') in sec
-    assert '<td class="name"><span class="dn"><b>example.</b><wbr><b>com</b></span></td>' in sec
+    # the names: a subdomain's own labels in front, its organization muted; an apex bold; a name of NAME_KEEP
+    # characters or fewer is never cut (keep, no break opportunity: Edge breaks at a <wbr> even under nowrap)
+    assert ('<td class="name"><span class="dn keep"><b>dev.</b><b>support.</b><span class="apex">example.</span>'
+            '<span class="apex">com</span></span></td>') in sec
+    assert '<td class="name"><span class="dn keep"><b>example.</b><b>com</b></span></td>' in sec
     # policy and gate pills by the design's colors
     assert '<span class="pill warn">p=quarantine, pct=25</span>' in rows["example.com"]
     assert '<span class="pill ok">go</span>' in rows["example.com"]
@@ -493,9 +493,9 @@ def test_plan_rows_are_grouped_by_priority_host_and_zone_in_domain_order_whateve
     card = re.search(r'<article class="card" id="rec-8"><div class="card-head"><span class="tag rid">P-04</span>.*?'
                      r'</article>', sec).group(0)
     for part in ('<span class="k">publish</span>',
-                 '<b>shop.</b><wbr><span class="apex">example.</span><wbr><span class="apex">com</span>',
-                 '<div class="field"><dt>Host name</dt><dd><span class="mono"><span class="dn"><span>_dmarc.</span><wbr>'
-                 '<span>shop.</span><wbr><span>example.</span><wbr><span>com</span></span></span></dd></div>',
+                 '<b>shop.</b><span class="apex">example.</span><span class="apex">com</span>',
+                 '<div class="field"><dt>Host name</dt><dd><span class="mono"><span class="dn keep"><span>_dmarc.</span>'
+                 '<span>shop.</span><span>example.</span><span>com</span></span></span></dd></div>',
                  '<div class="field short"><dt>Type</dt><dd><span class="mono">TXT</span></dd></div>',
                  '<div class="field short"><dt>TTL</dt><dd><span class="mono">3600</span></dd></div>',
                  '<div class="field wide"><dt>Value</dt><dd><pre class="value">v=DMARC1; p=none; '
@@ -765,9 +765,13 @@ def test_a_domain_name_breaks_only_between_labels_and_the_domain_column_fits_a_t
     whole (class w), and only a longer one may break inside, where it must (class long) - checked in Edge from 360
     to 1280 px."""
     sec = section_of(brief.render(estate_doc(head="example.com")), "domains")
-    cell = re.search(r'<td class="name">(<span class="dn">.*?)</td>', sec).group(1)
+    cell = re.search(r'<td class="name">(<span class="dn(?: keep)?">.*?)</td>', sec).group(1)
     pieces = re.findall(r"<wbr>", cell)
-    assert len(pieces) == text_of(cell).count(".")  # one break opportunity per dot, and none anywhere else
+    keep = 'class="dn keep"' in cell
+    # a name of NAME_KEEP characters or fewer has no break opportunity at all; a longer one one per dot, no other
+    assert len(pieces) == (0 if keep else text_of(cell).count("."))
+    longer = brief.name_html("_dmarc.dev.support.example.com._report._dmarc.corp.example")
+    assert 'class="dn keep"' not in longer and longer.count("<wbr>") == text_of(longer).count(".")
     for name in ("dev.support.example.com", "mailer.billing-vendor.invalid", "a@b.example.com"):
         markup = brief.plain_name(name)
         runs = re.findall(r'<span(?: class="w")?>([^<]*)</span>', markup)

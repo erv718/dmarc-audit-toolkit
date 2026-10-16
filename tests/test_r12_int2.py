@@ -422,7 +422,8 @@ def test_ids_dates_and_names_in_running_text_never_split(tmp_path):
     assert brief.prose("before we move (plan P-14) on 2026-10-07") == (
         'before we move (plan <span class="d">P-14</span>) on <span class="d">2026-10-07</span>')
     long_name = "dev.support.example.com._report._dmarc.corp.example"
-    assert brief.prose("publish " + long_name) == "publish " + brief.plain_name(long_name)
+    assert brief.prose("publish " + long_name) == "publish " + brief.text_name(long_name)
+    assert brief.text_name(long_name).startswith('<span class="d dl">')  # moves whole; breaks between labels
     note = brief._note_line([{"name": "investor-relations.example.com", "count": 8, "likely": "likely_spoof"}])
     assert '<span class="w">investor-relations.</span>' in note  # a short label with a hyphen never breaks
 
@@ -437,7 +438,7 @@ def test_a_short_name_in_a_cell_is_one_piece_and_an_address_never_breaks_in_its_
         'it follows <span class="d">_dmarc.example.com</span>, effective p=reject')
     assert brief.text_name("noreply@example.com") == '<span class="d">noreply@example.com</span>'
     assert brief.plain_name("first.last@mail.example.com") == (
-        '<span class="dn"><span>first.last@</span><wbr><span>mail.</span><wbr><span>example.</span><wbr>'
+        '<span class="dn keep"><span>first.last@</span><span>mail.</span><span>example.</span>'
         '<span>com</span></span>')
     doc = {"failing": {"by_envelope": [{"name": "example.com", "count": 12, "sender_count": 1,
                                         "senders": ["noreply@example.com"], "likely": "likely_spoof"}],

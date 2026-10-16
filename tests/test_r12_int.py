@@ -384,7 +384,7 @@ def test_a_long_label_may_wrap_and_a_short_one_never_breaks():
     assert brief.plain_name("mailer.billing-vendor.invalid") == (
         '<span class="dn"><span>mailer.</span><wbr><span class="w">billing-vendor.</span><wbr><span>invalid</span>'
         '</span>')
-    assert brief.plain_name("198.51.100.7") == '<span class="dn"><span class="w">198.51.100.7</span></span>'
+    assert brief.plain_name("198.51.100.7") == '<span class="dn keep"><span class="w">198.51.100.7</span></span>'
     assert 'class="long"' in brief.plain_name("2001:db8:0:0:0:0:0:7334")  # an IPv6 one longer than a label
     rules = {sel: css for sel, css in re.findall(r"(?m)^(\.dn > [^{]+?) \{([^}]*)\}", brief.CSS)}
     assert "white-space" not in rules[".dn > *"] and "overflow-wrap: break-word" in rules[".dn > *"]
@@ -454,8 +454,10 @@ def test_a_sentence_in_a_per_domain_cell_breaks_a_name_between_its_labels():
     2, N2); the words and numbers are unchanged, and an IP address or a number with a dot stays whole."""
     said = "inherited from _dmarc.shop.example.org; 77.4% of 203.0.113.5's mail; see report.json"
     out = brief.prose(said)
-    assert ("<span>_dmarc.</span><wbr><span>shop.</span><wbr><span>example.</span><wbr><span>org</span></span>;" in out
-            and '<span class="d">report.json</span>' in out)
+    # a name of NAME_KEEP characters or fewer is one piece; a longer one moves whole and breaks between its labels
+    assert ('<span class="d">_dmarc.shop.example.org</span>;' in out and '<span class="d">report.json</span>' in out)
+    longer = brief.prose("it follows _dmarc.dev.support.example.com._report._dmarc.corp.example today")
+    assert '<span class="d dl"><span>_dmarc.</span><wbr><span>dev.</span><wbr>' in longer
     assert "77.4%" in out and "203.0.113.5" in out and text_of(out) == said
     assert brief.prose("**P-04** `_dmarc.example.com`") == (
         '<strong><span class="d">P-04</span></strong> <code><span class="d">_dmarc.example.com</span></code>')
@@ -613,7 +615,10 @@ def test_every_data_string_sits_in_its_own_bidi_isolate(estates):
     assert {"dn", "hook", "subject", "channel", "mono", "k", "d"} <= css_iso
     for cls, display in ATOMIC.items():
         assert re.search(r"(?m)^\.%s \{[^}]*display: %s;" % (cls, display), brief.CSS), cls
-    assert page.count(RLM) > 200 and "[U+200F]" not in page
+    assert page.count(RLM) > 200
+    # a direction mark has no place in a name (an address, a domain, a host): there it shows as a marker, and only
+    # there - every other string keeps its mark as itself, the last thing in its isolate
+    assert not marker_outside_names(page, "[U+200F]")
     for run in runs:
         bad = re.search(RLM + r"\s*[^\s]", run)
         assert not bad, repr(run[max(0, bad.start() - 60):bad.end() + 40])
@@ -697,7 +702,7 @@ def test_the_aggregate_report_one_liner_puts_each_count_with_its_source():
               "gate": {"headline_domain": "example.org", "domains": {"example.org": {"verdict": "no_go"}}}}
     doc = next_steps.build(report)
     assert ("2 of our own sending sources still fail (from the aggregate reports) (198.51.100.7 x110 as "
-            "example.org, a.shop.example.org and 1 more, 198.51.100.9 x85 as example.net, example.org)") in doc["one_liner"]
+            "example.org, a.shop.example.org and 1 more; 198.51.100.9 x85 as example.net, example.org)") in doc["one_liner"]
     assert "more x110" not in doc["one_liner"] and "example.org x85" not in doc["one_liner"]
     # next_steps.json keeps the source's name and count as they were
     assert doc["failing"]["streams"]["own"][0] == {"name": "198.51.100.7 as example.org, a.shop.example.org and 1 more",
@@ -850,3 +855,34 @@ def test_collect_writes_report_md_caveats_and_the_cut_clause_in_the_one_order(mo
     todo = md_section((latest / "todo.md").read_text(encoding="utf-8"), "Caveats")
     assert todo.index("shop.example row budget") < todo.index("corp.example row budget")
     assert attempts == []
+
+
+
+class _NameText(HTMLParser):
+    """Collects each text run with whether it sits inside a name (a span of class dn or d)."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack, self.runs = [], []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("wbr", "br", "meta", "link", "img", "input", "hr"):
+            return
+        cls = dict(attrs).get("class") or ""
+        self.stack.append(tag == "span" and (cls.split()[:1] in (["dn"], ["d"])))
+
+    def handle_endtag(self, tag):
+        if tag in ("wbr", "br", "meta", "link", "img", "input", "hr"):
+            return
+        if self.stack:
+            self.stack.pop()
+
+    def handle_data(self, data):
+        self.runs.append((data, any(self.stack)))
+
+
+def marker_outside_names(page, marker):
+    """The text runs outside every name that carry marker."""
+    p = _NameText()
+    p.feed(page)
+    return [t for t, inside in p.runs if marker in t and not inside]

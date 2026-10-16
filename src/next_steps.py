@@ -1941,8 +1941,10 @@ def gate_reasons(report, domain):
 def _named(entries, cap=3):
     """'name xN, ...' for the first cap entries; an outside source as 'IP xN as its From domains' (streams()
     keeps the two apart), so its count sits with the source it counts, never after the names it fails as."""
-    return ", ".join(("%s x%d as %s" % (s["source"], s["count"], s["as"])) if "as" in s and "source" in s
-                     else "%s x%d" % (s["name"], s["count"]) for s in entries[:cap])
+    parts = [("%s x%d as %s" % (s["source"], s["count"], s["as"])) if "as" in s and "source" in s
+             else "%s x%d" % (s["name"], s["count"]) for s in entries[:cap]]
+    # a source that fails as several From domains lists them with commas, so the sources part with semicolons
+    return ("; " if any(", " in p for p in parts) else ", ").join(parts)
 
 
 def _spoof_clause(policy, delivered=0):
@@ -2613,6 +2615,34 @@ def envelope_parts(e):
     return ([(str(env), None)] if env else []), 0
 
 
+def _own_source(view, s):
+    """What an own-system or unclear item quotes for one address (s, merged
+    per address): its own streams - the census streams of that address whose
+    failures carry the label our own system or unclear - the busiest giving
+    the subject and the envelope, every such envelope named when there are
+    two or more. An address that also fails through a spoofed stream never
+    lends that stream's lure subject or envelope to the item. s itself when
+    the view keeps no streams, or none carries the label."""
+    streams = view.get("sender_streams") if isinstance(view, dict) else None
+    if not isinstance(streams, list):
+        return s
+    own = []
+    for st in streams:
+        if isinstance(st, dict) and st.get("name") == s.get("name"):
+            split = _split(st)
+            n = split.get(OWN, 0) + split.get(UNCLEAR, 0)
+            if n > 0:
+                own.append((n, st))
+    if not own:
+        return s
+    own.sort(key=lambda t: -t[0])  # stable: the census order breaks a tie
+    out = dict(own[0][1])
+    out.pop("envelopes", None)
+    if len(own) > 1:
+        out["envelopes"] = [{"name": str(st.get("envelope") or "(blank)"), "count": n} for n, st in own]
+    return out
+
+
 def envelope_text(e):
     """'envelope example.com', or for an address whose failures came through
     several envelope domains 'envelopes mailer.vendor-one.invalid x6 and
@@ -2772,6 +2802,7 @@ def what_is_failing(report, view, headline=None):
         gone = []
         if _carries_exceptions(dl["new_senders"]):  # the census rows say what an exception covered
             new, gone = _after_exceptions(new, "sender", headline)
+        new = _per_address(new, headline=headline)  # one entry per address, its envelopes merged
         day = _day(dl.get("previous_generated_utc")) or "date unknown"
         n = sum(e["count"] for e in gone)
         if new:
@@ -3152,8 +3183,9 @@ def build_actions(report, plan, view, owners, headline=None):
         own_all = _ranked(own_all, headline)  # the cap below keeps the headline's senders on a tie
         for s in own_all[:SENDER_ITEMS_CAP]:
             hook = "%s - %d %s" % (s["name"], s["count"], _plural(s["count"], "message"))
-            subj = ('subjects like "%s"' % cut_subject(s["subjects"][0])) if s.get("subjects") else ""
-            env = envelope_text(s)
+            src = _own_source(view, s)  # its own streams' subject and envelopes, never a spoof stream's
+            subj = ('subjects like "%s"' % cut_subject(src["subjects"][0])) if src.get("subjects") else ""
+            env = envelope_text(src)
             detail = "; ".join(x for x in (subj, env) if x)
             if s["likely"] == OWN:
                 action = ("DKIM-sign this sender (or align its SPF): the messages failed with no passing copy "

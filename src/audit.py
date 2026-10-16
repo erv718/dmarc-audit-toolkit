@@ -1943,6 +1943,11 @@ def _sender_key(s):
     return tuple(None if s.get(k) is None else str(s.get(k)) for k in ("sender", "domain", "envelope_domain"))
 
 
+def _sender_addr(s):
+    """A census sender's address as the run compares it (lower-case; a damaged field compares as its spelling)."""
+    return str(s.get("sender") if s.get("sender") is not None else "").strip().lower()
+
+
 def _sender_org(s):
     """The organizational domain of a census sender's From domain (its address's, when the row has none)."""
     return discover.org_domain(str(s.get("domain") or "") or str(s.get("sender") or "").rpartition("@")[2])
@@ -2306,10 +2311,12 @@ def build_delta(report, previous):
                          "new_senders not computed")
     else:
         now_s, prev_s = [s for s in now_s if isinstance(s, dict)], [s for s in prev_s if isinstance(s, dict)]
-        prev_keys = {_sender_key(s) for s in prev_s}
-        now_keys = {_sender_key(s) for s in now_s}
-        new_senders = [s for s in now_s if _sender_key(s) not in prev_keys]
-        gone_senders = [s for s in prev_s if _sender_key(s) not in now_keys]
+        # a sender is its address, as a reader sees it in From: one the previous run saw through another
+        # envelope is not new, and one this run sees through any envelope is not gone
+        prev_keys = {_sender_addr(s) for s in prev_s}
+        now_keys = {_sender_addr(s) for s in now_s}
+        new_senders = [s for s in now_s if _sender_addr(s) not in prev_keys]
+        gone_senders = [s for s in prev_s if _sender_addr(s) not in now_keys]
         # a sender under an org the previous run cut may only have fallen outside the hours it kept, and one
         # under an org this run cut may only fall outside this run's: that makes it neither new nor gone
         for whose, cut, senders, word in (("the previous run's", prev_cut, new_senders, "new"),
@@ -3028,7 +3035,8 @@ def _md_census(L, cs, headline=None):
                  f"{r['senders']} sender(s), for example {r['sample_sender']}; {r['likely'] or 'n/a'}{excepted(r)}")
     if len(env) > CENSUS_TOP:
         L.append(f"  - (+{len(env) - CENSUS_TOP} more in report.json)")
-    L.append(f"- by sender: {len(snd)} failing, {len(snd_all) - len(snd)} clean")
+    L.append(f"- by sender and envelope (one row per address and envelope): {len(snd)} failing, "
+             f"{len(snd_all) - len(snd)} clean")
     for r in snd[:CENSUS_TOP]:
         L.append(f"  - {r['sender']} (envelope {r['envelope_domain']}): {r['genuine_failures']} failing of "
                  f"{r['messages']} message(s); {r['likely'] or 'n/a'}; \"{r['sample_subject'] or 'no subject'}\""

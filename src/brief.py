@@ -179,6 +179,7 @@ strong { font-weight: 650; }
 .caption { font-size: 0.875rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 .scope { font-size: 0.78rem; line-height: 1.4; color: var(--muted); font-variant-numeric: tabular-nums; }
 .d { white-space: nowrap; }
+.d.dl, .count.owner { display: inline-block; max-width: 100%; white-space: normal; vertical-align: top; }
 .pill { display: inline-block; font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.5;
   padding: 0 0.55rem; border: 1px solid currentColor; border-radius: 999px; white-space: nowrap; }
 .pill.ok { color: var(--ok); background: var(--ok-bg); }
@@ -193,6 +194,7 @@ strong { font-weight: 650; }
 .dn > * { overflow-wrap: break-word; }
 .dn > .w { white-space: nowrap; }
 .dn > .long { overflow-wrap: anywhere; }
+.dn.keep { white-space: nowrap; }
 .step { display: flex; flex-direction: column; gap: 0.75rem; }
 .step-label { font-size: 1.125rem; font-weight: 600; }
 .verdict { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.6rem; }
@@ -394,16 +396,34 @@ SHOWN_FORMAT = frozenset((0x200C, 0x200D, 0x200E, 0x200F, 0x061C, 0x00AD))
 FLAG_RX = re.compile("%s[%s-%s]+%s" % (chr(0x1F3F4), chr(0xE0020), chr(0xE007E), chr(0xE007F)))
 
 
+# The default-ignorable code points outside class Cf (Unicode's Default_Ignorable_Code_Point): the combining
+# grapheme joiner, the Hangul fillers, the Khmer inherent vowels, the Mongolian variation selectors and vowel
+# separator, the unassigned specials and the reserved block after the tags. They draw nothing, so two addresses
+# that differ by one look alike, and mail text has no use for them: each is marked wherever it is.
+IGNORABLE = ((0x034F, 0x034F), (0x115F, 0x1160), (0x17B4, 0x17B5), (0x180B, 0x180F), (0x3164, 0x3164),
+             (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A), (0xE0080, 0xE0FFF))
+# What a name (an address, a domain, a host name, an IP) marks besides: the characters real mail text needs
+# (SHOWN_FORMAT) and the variation selectors an emoji takes have no place in a DNS name or an address, where they
+# would only hide a look-alike.
+NAME_HIDDEN = ((0x200C, 0x200F), (0x061C, 0x061C), (0x00AD, 0x00AD), (0xFE00, 0xFE0F), (0xE0100, 0xE01EF))
+
+
+def _within(cp, ranges):
+    return any(a <= cp <= b for a, b in ranges)
+
+
 def marked(ch):
     """True for a character the page shows as a marker, [U+202E], never as
     itself: a format character mail text does not need (every Cf but
-    SHOWN_FORMAT), which reorders or hides the text around it, and a
+    SHOWN_FORMAT), which reorders or hides the text around it, a
+    default-ignorable code point that draws nothing (IGNORABLE), and a
     control other than tab and the line breaks. A tag character is marked
     on its own; inside a flag's emoji sequence it is text (flag_tags).
     scripts/check_doc.py names exactly these in a polished copy, wherever
-    they are."""
+    they are; a name marks NAME_HIDDEN as well (clean)."""
     cat = unicodedata.category(ch)
-    return (cat == "Cf" and ord(ch) not in SHOWN_FORMAT) or (cat == "Cc" and ch not in "\t\n\r")
+    return ((cat == "Cf" and ord(ch) not in SHOWN_FORMAT) or (cat == "Cc" and ch not in "\t\n\r")
+            or _within(ord(ch), IGNORABLE))
 
 
 def flag_tags(text):
@@ -415,7 +435,7 @@ def flag_tags(text):
     return frozenset(i for m in FLAG_RX.finditer(text) for i in range(m.start() + 1, m.end()))
 
 
-def clean(value):
+def clean(value, name=False):
     """Data as a reader may see it: a character marked() picks - U+202E,
     U+200B, U+2063, a control - becomes a visible marker, [U+202E]; a lone
     surrogate (JSON can spell one, UTF-8 cannot carry it) becomes U+FFFD;
@@ -433,7 +453,7 @@ def clean(value):
             out.append(ch)
         elif unicodedata.category(ch) == "Cs":
             out.append("\ufffd")
-        elif marked(ch) and i not in flag:
+        elif (marked(ch) or (name and _within(ord(ch), NAME_HIDDEN))) and i not in flag:
             out.append("[U+%04X]" % ord(ch))
         else:
             out.append(ch)
@@ -445,6 +465,12 @@ def esc(value):
     included, so no string from either file can open a tag, leave an
     attribute or turn the line around it."""
     return html.escape(clean(value), quote=True)
+
+
+def esc_name(value):
+    """A name (an address, a domain, a host, an IP) as HTML text: esc, with
+    the characters a name has no use for marked as well (clean name=True)."""
+    return html.escape(clean(value, name=True), quote=True)
 
 
 def iso(markup):
@@ -525,6 +551,11 @@ NAME_RUN_RX = re.compile(r"[^.@]*[.@]|[^.@]+")
 # shown, a stacked row on a 360px phone. A longer one - DNS allows 63 - may break inside where it must, so it never
 # passes the screen's edge or sets a table column's width on its own.
 LABEL_KEEP = 20
+# A name of this many characters or fewer is never cut anywhere: it fits a line of the narrowest place a name is
+# shown (a stacked row or a sentence on a 360px phone), so a line breaks before it, never inside it. A longer one
+# moves whole to the next line in a sentence (text_name) and breaks between its labels only when it is longer
+# than a whole line, or than its table column (name_html, plain_name).
+NAME_KEEP = 28
 BREAK_AT_RX = re.compile(r"[^\w.@]")  # a hyphen, a slash, a plus...: a character a browser may break a line after
 
 
@@ -578,14 +609,17 @@ def name_html(name, org=None):
     for run in _runs(text):
         end = pos + len(run)
         if end <= own:
-            parts.append(_piece("b", (_keep(run),), esc(run)))
+            parts.append(_piece("b", (_keep(run),), esc_name(run)))
         elif pos >= own:
-            parts.append(_piece("span", ("apex", _keep(run)), esc(run)))
+            parts.append(_piece("span", ("apex", _keep(run)), esc_name(run)))
         else:
             parts.append(_piece("span", (_keep(run),), '<b>%s</b><span class="apex">%s</span>'
-                                % (esc(text[pos:own]), esc(text[own:end]))))
+                                % (esc_name(text[pos:own]), esc_name(text[own:end]))))
         pos = end
-    return '<span class="dn">%s</span>' % "<wbr>".join(parts)
+    # a name of NAME_KEEP characters or fewer never breaks (keep): no break opportunity at all, since Edge and
+    # Chrome break at a <wbr> even under white-space: nowrap; its column is at least as wide as it
+    keep = len(text) <= NAME_KEEP
+    return '<span class="dn%s">%s</span>' % (" keep" if keep else "", ("" if keep else "<wbr>").join(parts))
 
 
 IP_RX = re.compile(r"[0-9.]+|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*")  # an IPv4 or IPv6 address: one piece
@@ -600,24 +634,29 @@ def plain_name(value):
     text = _text(value)
     if not text:
         return "?"
+    keep = " keep" if len(text) <= NAME_KEEP else ""  # never cut (no <wbr>): its column is at least as wide as it
     if IP_RX.fullmatch(text):
-        return '<span class="dn">%s</span>' % _piece("span", ("w" if len(text) <= LABEL_KEEP else "long",), esc(text))
-    return '<span class="dn">%s</span>' % "<wbr>".join(_piece("span", (_keep(r),), esc(r)) for r in _runs(text))
+        return '<span class="dn%s">%s</span>' % (keep, _piece("span", ("w" if len(text) <= LABEL_KEEP else "long",),
+                                                               esc_name(text)))
+    return '<span class="dn%s">%s</span>' % (keep, ("" if keep else "<wbr>").join(
+        _piece("span", (_keep(r),), esc_name(r)) for r in _runs(text)))
 
 
 def text_name(value):
     """A DNS name or an address where it sits among words - a sentence, a
-    note line, a list of names in a cell: one unbroken piece (class d) when
-    it is LABEL_KEEP characters or fewer, so a line breaks at the space
-    before it and never splits 'noreply@' from 'example.com' though the
-    whole fits; a longer one cut as plain_name cuts it, between its labels.
-    '?' when the document has none."""
+    note line, a list of names in a cell - so a line breaks at the space
+    before it, never inside it while the whole fits on the next line: one
+    unbroken piece (class d) when it is NAME_KEEP characters or fewer (or an
+    IP address); a longer one an inline block (class dl) that moves whole to
+    the next line and breaks between its labels only when it is longer than
+    a whole line. '?' when the document has none."""
     text = _text(value)
     if not text:
         return "?"
-    if len(text) <= LABEL_KEEP:
-        return '<span class="d">%s</span>' % esc(text)
-    return plain_name(text)
+    if IP_RX.fullmatch(text) or len(text) <= NAME_KEEP:
+        return '<span class="d">%s</span>' % esc_name(text)
+    return '<span class="d dl">%s</span>' % "<wbr>".join(_piece("span", (_keep(r),), esc_name(r))
+                                                         for r in _runs(text))
 
 
 # ------------------------------------------------------------------ small parts
@@ -1094,6 +1133,30 @@ def failing_kept(failing):
     return out
 
 
+def failing_sequence(failing):
+    """next_steps.md's What is failing in its own order: ("block", key)
+    where one of its lists starts (FAILING_BLOCKS), ("line", text) for a
+    sentence outside every list. The page puts each table where its list
+    starts and each sentence where next_steps.md has it, so a 'No genuine
+    failures in the mail log' line never moves below the outside table."""
+    seq, seen, current = [], set(), None
+    for line in _list(failing.get("lines")):
+        s = line.strip() if isinstance(line, str) else ""
+        if not s:
+            current = None
+            continue
+        key = next((k for title, k in FAILING_BLOCKS if s.startswith(title) and s.endswith(":")), None)
+        if key is not None:
+            current = key
+            if key not in seen:
+                seen.add(key)
+                seq.append(("block", key))
+            continue
+        if current is None:
+            seq.append(("line", s[2:] if s.startswith("- ") else s))
+    return seq
+
+
 def failing_rest(failing):
     """What is failing's other sentences, in next_steps.md's order (failing_kept without the blocks)."""
     return [line for _, line in failing_kept(failing)]
@@ -1169,7 +1232,7 @@ def failing_tables(failing):
     parts.append(failing_block("From the outside", "aggregate reports; these counts include forwarded copies and "
                                "cannot be deduplicated", rows, ("Source", "Failing", "As", "Label", "Receivers"),
                                more, notes, next_steps.OUTSIDE_NOTES_LINE, own("outside"), "list out"))
-    return [p for p in parts if p]
+    return dict(zip(("by_envelope", "by_sender", "outside"), parts))
 
 
 def failing_block(title, sub, rows, heads, more, notes, notes_lead, extra=(), cls=""):
@@ -1192,10 +1255,22 @@ def failing_block(title, sub, rows, heads, more, notes, notes_lead, extra=(), cl
 
 def failing_section(doc):
     failing = _dict(doc.get("failing"))
-    parts = failing_tables(failing)
-    rest = [line for key, line in failing_kept(failing) if key is None]
-    if rest:
-        parts.append(bullets(rest))
+    tables = failing_tables(failing)
+    parts, used, run = [], set(), []
+    for kind, value in failing_sequence(failing):
+        if kind == "line":
+            run.append(value)
+            continue
+        if run:
+            parts.append(bullets(run))
+            run = []
+        if tables.get(value):
+            parts.append(tables[value])
+        used.add(value)
+    if run:
+        parts.append(bullets(run))
+    # a list the document's lines never open (an older or a hand-made document): in the usual place, after
+    parts += [tables[k] for k in ("by_envelope", "by_sender", "outside") if k not in used and tables.get(k)]
     notes = _texts(failing.get("notes"))
     if notes:
         parts.append('<div class="group"><p class="note">Notes:</p>%s</div>' % bullets(notes, "lines note"))
@@ -1486,7 +1561,7 @@ def questions_section(doc, head):
         items = []
         for _, q in members:
             n = _num(q.get("count")) or 1
-            items.append('<li>%s%s <span class="count">owner: %s</span></li>'
+            items.append('<li>%s%s <span class="count owner">owner: %s</span></li>'
                          % (iso(prose(q["question"])), (' <span class="count">x %s</span>' % n) if n > 1 else "",
                             esc(_text(q.get("owner")) or "unassigned")))
         # a kind next_steps.py names in words is the page's own text; any other is the document's, isolated
