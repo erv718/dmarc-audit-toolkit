@@ -18,16 +18,21 @@ A browser prints it to PDF (A4 or Letter, light palette). The page is one
 self-contained file: no script, no font, no image, no link out, and a
 Content-Security-Policy that forbids them anyway. Part of the data is
 written by strangers (spoofed subject lines, display names, sender
-addresses), so every string from either file is HTML-escaped, a character
-that would hide or reorder the text around it (U+202E, a zero-width space)
-shows as a visible marker such as [U+202E], and the only marks honoured
-inside a string are the generator's own **bold** and `code`, converted
-after escaping. The same inputs give the same bytes. Every list of domains
-follows the run's one order (audit.domain_key): the headline organization
-(next_steps.json org_domain) first, then each organization by name, its
-organizational domain first and the names below it by name; the plan's
-records run in the plan's own order (plan.row_key), the order plan.md,
-todo.md and the plan ids follow.
+addresses), so every string from either file is HTML-escaped and set in a
+bidi isolate of its own, a character that would hide or reorder the text
+around it (U+202E, a zero-width space) shows as a visible marker such as
+[U+202E] - the marks real mail text needs (a joiner in an emoji, a
+direction mark in a right-to-left subject) show as themselves - and the
+only marks honoured inside a string are the generator's own **bold** and
+`code`, converted after escaping. The same inputs give the same bytes.
+Every list of domains follows the run's one order (audit.domain_key): the
+headline organization (next_steps.json org_domain) first, then each
+organization by name, its organizational domain first and the names below
+it by name; the plan's records run in the plan's own order (plan.row_key),
+the order plan.md, todo.md and the plan ids follow. What next_steps.md
+splits or groups, the page splits and groups with the same helpers
+(next_steps.headline_split, next_steps.owner_parts), so the two never
+disagree on a line or a count.
 
 Relative paths resolve from the repo root, as in every tool here. Exit
 codes: 0 written, 2 usage or input error. Never a traceback.
@@ -79,6 +84,12 @@ FAILING_BLOCKS = (("By envelope domain (", "by_envelope"), ("By sender address (
 SUBJECT_MAX = 100  # characters of a subject shown in a table cell; the rest is in next_steps.json
 # a per-domain row read as a block on a phone: the column names, fixed text in the style, never from the data
 DOMAIN_HEADS = ("Domain", "Policy", "Gate", "Next step", "Mail flow")
+# What is failing's tables, read as blocks the same way: each table's class and its columns' short names
+LIST_HEADS = (("env", ("Envelope", "Messages", "Label", "Senders")),
+              ("snd", ("Sender", "Messages", "Label", "Subjects", "Envelope")),
+              ("out", ("Source", "Failing", "As", "Label", "Receivers")))
+# the classes a table may carry (a fixed set): the per-domain table, the plan at a glance, What is failing's three
+TABLE_CLASSES = ("stack", "index") + tuple("list " + name for name, _ in LIST_HEADS)
 
 # The design plan: every color and font on the page comes from these tokens, light by default, dark when the
 # reader's system asks for it (or a host sets data-theme), and light again on paper.
@@ -105,6 +116,12 @@ def _stacked_labels():
     """The per-domain table's column names as the labels of a row read as a block (fixed text)."""
     return "".join('  table.stack td:nth-child(%d)::before { content: "%s"; }\n' % (i, h)
                    for i, h in enumerate(DOMAIN_HEADS, 1))
+
+
+def _list_labels():
+    """What is failing's tables' column names as the labels of a row read as a block (fixed text)."""
+    return "".join('  table.%s td:nth-child(%d)::before { content: "%s"; }\n' % (name, i, h)
+                   for name, heads in LIST_HEADS for i, h in enumerate(heads, 1))
 
 
 COMPONENTS = """\
@@ -140,6 +157,7 @@ strong { font-weight: 650; }
 .section-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 1rem; }
 .meta { font-family: var(--font-mono); font-size: 0.78rem; color: var(--muted); }
 .section p, .section li { max-width: 70ch; }
+.section-head .meta { max-width: none; }
 .group { display: flex; flex-direction: column; gap: 0.6rem; }
 .lines { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 0.45rem; }
 .lines > li { position: relative; padding-left: 1rem; }
@@ -159,7 +177,7 @@ strong { font-weight: 650; }
 .figure.na { font-size: 1.125rem; line-height: 2.05; font-weight: 400; color: var(--muted); }
 .caption { font-size: 0.875rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 .scope { font-size: 0.78rem; line-height: 1.4; color: var(--muted); font-variant-numeric: tabular-nums; }
-.scope .d { white-space: nowrap; }
+.d { white-space: nowrap; }
 .pill { display: inline-block; font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.5;
   padding: 0 0.55rem; border: 1px solid currentColor; border-radius: 999px; white-space: nowrap; }
 .pill.ok { color: var(--ok); background: var(--ok-bg); }
@@ -170,9 +188,10 @@ strong { font-weight: 650; }
   padding: 0 0.4rem; border: 1px solid var(--line); border-radius: 4px; color: var(--ink); overflow-wrap: anywhere; }
 .refs { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem; max-width: 100%; }
 .refs .muted { font-size: 0.875rem; }
-.dn, .hook, .subject, .channel { unicode-bidi: isolate; }
-.dn > * { white-space: nowrap; }
-.card .dn > * { display: inline-block; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.dn, .hook, .subject, .channel, .mono, .k, .d { unicode-bidi: isolate; }
+.dn > * { overflow-wrap: break-word; }
+.dn > .w { white-space: nowrap; }
+.dn > .long { overflow-wrap: anywhere; }
 .step { display: flex; flex-direction: column; gap: 0.75rem; }
 .step-label { font-size: 1.125rem; font-weight: 600; }
 .verdict { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.6rem; }
@@ -194,11 +213,11 @@ tr.org th { background: var(--sunken); font-family: var(--font-mono); font-weigh
 tbody + tbody > tr:first-child > * { border-top: 1px solid var(--muted); }
 .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 td.name { font-family: var(--font-mono); }
-table.stack td.name { min-width: 26ch; }
+table.stack td.name { width: 26ch; min-width: 26ch; }
 td.name b, .card-head .name b { font-weight: 600; }
 .apex { color: var(--muted); }
-.rest { display: block; font-size: 0.78rem; color: var(--muted); }
-.subject { display: block; }
+.rest { display: block; font-size: 0.78rem; color: var(--muted); text-wrap: balance; }
+.subject { display: block; overflow-wrap: anywhere; }
 .owner { display: flex; flex-direction: column; gap: 0.6rem; }
 .owner > h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.75rem; }
 .channel { font-family: var(--font-mono); font-size: 0.78rem; font-weight: 400; color: var(--muted); }
@@ -238,16 +257,34 @@ pre.value { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.875rem;
 @media (max-width: 40rem) {
   .term { grid-template-columns: minmax(0, 1fr); }
   .fields { grid-template-columns: minmax(0, 1fr); }
+}
+@media screen and (max-width: 48rem) {
   table.stack, table.stack tbody, table.stack tr, table.stack th, table.stack td { display: block; }
   table.stack thead { display: none; }
   table.stack tr { padding-block: 0.45rem; border-bottom: 1px solid var(--line); }
   table.stack tr.org { padding-block: 0; border-bottom: 0; }
   table.stack td { position: relative; min-width: 0; padding: 0.15rem 0 0.15rem 6.5rem; border: 0; }
+  table.stack td.name { width: auto; min-width: 0; }
   table.stack td::before { position: absolute; left: 0; top: 0.3rem; font-family: var(--font-mono); font-size: 0.7rem;
     letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
   table.stack tbody + tbody > tr:first-child > * { border-top: 0; }
   table.stack tbody + tbody { border-top: 1px solid var(--muted); }
 """ + _stacked_labels() + """\
+  table.list, table.list tbody, table.list tr, table.list td { display: block; }
+  table.list thead { display: none; }
+  table.list tr { padding-block: 0.45rem; border-bottom: 1px solid var(--line); }
+  table.list td { position: relative; min-width: 0; padding: 0.15rem 0 0.15rem 6.5rem; border: 0; text-align: left; }
+  table.list td::before { position: absolute; left: 0; top: 0.3rem; font-family: var(--font-mono); font-size: 0.7rem;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+""" + _list_labels() + """\
+  table.index, table.index tbody, table.index td { display: block; }
+  table.index thead { display: none; }
+  table.index tr { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; gap: 0.1rem 0.75rem;
+    align-items: baseline; padding-block: 0.45rem; border-bottom: 1px solid var(--line); }
+  table.index td { padding: 0; border: 0; text-align: left; }
+  table.index td.name { grid-column: 1 / -1; grid-row: 2; }
+  table.index td:nth-child(2)::before { content: "priority "; color: var(--muted); }
+  table.index td:nth-child(5)::before { content: "checks "; color: var(--muted); }
 }
 @page { margin: 16mm 14mm; }
 @media print {
@@ -337,16 +374,28 @@ def _counted(n, one, many=None):
 # ------------------------------------------------------------------ escaping: every string from the data goes here
 
 ODD_RX = re.compile(r"[^\t\n\r\x20-\x7e]")  # anything but printable ASCII and the three whitespace controls
+# The characters that reorder or hide the text around them: the bidi embeddings and overrides (U+202A to U+202E),
+# the bidi isolates (U+2066 to U+2069), and the zero-width ones a name or a number can hide behind (U+200B, U+2060,
+# U+FEFF). The other format characters shape real mail text and show as themselves: the joiners inside an emoji or
+# a Persian word (U+200D, U+200C), the direction marks of a right-to-left subject (U+200E, U+200F), a soft hyphen in
+# a display name (U+00AD) - each string sits in its own bidi isolate (iso), so a mark moves only its own text.
+HIDING = frozenset(range(0x202A, 0x202F)) | frozenset(range(0x2066, 0x206A)) | frozenset((0x200B, 0x2060, 0xFEFF))
+
+
+def marked(ch):
+    """True for a character the page shows as a marker, [U+202E], never as
+    itself: one that reorders or hides the text around it (HIDING), or a
+    control other than tab and the line breaks. scripts/check_doc.py names
+    exactly these in a polished copy, wherever they are."""
+    return ord(ch) in HIDING or (unicodedata.category(ch) == "Cc" and ch not in "\t\n\r")
 
 
 def clean(value):
-    """Data as a reader may see it. A character no reader can see, or one
-    that reorders the text around it - a Unicode format character such as
-    U+202E or U+200B, a control other than tab and the line breaks -
-    becomes a visible marker, [U+202E]; a lone surrogate (JSON can spell
-    one, UTF-8 cannot carry it) becomes U+FFFD. Text from mail can then
-    change only its own look: it can neither mirror nor hide the
-    generator's words, counts, ids or IPs around it."""
+    """Data as a reader may see it: a character marked() picks - U+202E,
+    U+200B, a control - becomes a visible marker, [U+202E]; a lone
+    surrogate (JSON can spell one, UTF-8 cannot carry it) becomes U+FFFD;
+    every other character is itself. Text from mail can then neither
+    mirror nor hide the generator's words, counts, ids or IPs around it."""
     text = "" if value is None else str(value)
     if not ODD_RX.search(text):
         return text
@@ -354,11 +403,9 @@ def clean(value):
     for ch in text:
         if " " <= ch <= "~" or ch in "\t\n\r":
             out.append(ch)
-            continue
-        cat = unicodedata.category(ch)
-        if cat == "Cs":
+        elif unicodedata.category(ch) == "Cs":
             out.append("\ufffd")
-        elif cat in ("Cf", "Cc"):
+        elif marked(ch):
             out.append("[U+%04X]" % ord(ch))
         else:
             out.append(ch)
@@ -372,9 +419,28 @@ def esc(value):
     return html.escape(clean(value), quote=True)
 
 
+def iso(markup):
+    """Markup made from one data string, in its own bidi isolate (<bdi>,
+    whose direction its own first letter sets): a right-to-left subject, or
+    a direction mark it carries, can reorder only its own text - never the
+    page's words, counts and ids after it. Every data string that shares
+    its line with anything else goes through here; one that is alone in its
+    block, or in an element the style isolates (a name, a hook, a pill, a
+    tag), is isolated already. '' stays ''."""
+    return "<bdi>%s</bdi>" % markup if markup else ""
+
+
+def iso_text(value):
+    """A data string as isolated HTML text: esc, then iso."""
+    return iso(esc(value))
+
+
 CODE_RX = re.compile(r"`([^`\n]+)`")
 BOLD_RX = re.compile(r"\*\*(.+?)\*\*")
 KEPT_RX = re.compile(r"<c(\d+)>")  # a code span set aside; '<' never survives escaping, so data cannot spell it
+# a DNS name or an address inside a sentence: labels joined by dots (and an @), the last one starting with a letter -
+# never a number such as 77.4 or an IP address such as 203.0.113.5
+NAME_IN_TEXT_RX = re.compile(r"(?<![\w.@-])[\w-]+(?:[.@][\w-]+)*\.[^\W\d][\w-]*")
 
 
 def marks(value):
@@ -392,6 +458,15 @@ def marks(value):
     return KEPT_RX.sub(lambda m: codes[int(m.group(1))], text)
 
 
+def prose(value):
+    """A data sentence for a table cell: marks, with a break opportunity
+    (<wbr>) after each dot and @ of every DNS name or address in it, so a
+    narrow column breaks '_dmarc.shop.example.org' between its labels and
+    a long name never sets the column's width on its own; numbers and IP
+    addresses stay whole. The text is unchanged."""
+    return NAME_IN_TEXT_RX.sub(lambda m: re.sub(r"([.@])", r"\1<wbr>", m.group(0)), marks(value))
+
+
 # ------------------------------------------------------------------ the one domain order, and names that break well
 
 def org_of(name):
@@ -407,22 +482,45 @@ def dkey(name, headline):
 
 
 NAME_RUN_RX = re.compile(r"[^.@]*[.@]|[^.@]+")
+# A label of this many characters or fewer (its dot included) is never cut: it fits the narrowest place a name is
+# shown, a stacked row on a 360px phone. A longer one - DNS allows 63 - may break inside where it must, so it never
+# passes the screen's edge or sets a table column's width on its own.
+LABEL_KEEP = 20
+BREAK_AT_RX = re.compile(r"[^\w.@]")  # a hyphen, a slash, a plus...: a character a browser may break a line after
 
 
 def _runs(text):
-    """A DNS name or an address cut after each dot and each @, the only
-    places it may break: 'dev.support.example.com' is dev. support.
-    example. com."""
+    """A DNS name or an address cut after each dot and each @, the places
+    it breaks: 'dev.support.example.com' is dev. support. example. com."""
     return NAME_RUN_RX.findall(text)
+
+
+def _keep(run):
+    """The class of one label's piece of a name (a fixed set): 'long' for a
+    label longer than LABEL_KEEP characters, which may break anywhere it
+    must; 'w' for a shorter one with a hyphen or another place a browser
+    would break a line at, kept whole; '' for one with no such place - it
+    never breaks, and wraps only if it cannot fit a line at all."""
+    if len(run) > LABEL_KEEP:
+        return "long"
+    return "w" if BREAK_AT_RX.search(run) else ""
+
+
+def _piece(tag, classes, markup):
+    """One piece of a name as an element: <b class="w">investor-relations.</b>, <span>example.</span>."""
+    classes = " ".join(c for c in classes if c)
+    return "<%s%s>%s</%s>" % (tag, (' class="%s"' % classes) if classes else "", markup, tag)
 
 
 def name_html(name, org=None):
     """A domain as the tables and cards show it: a subdomain's own labels in
     the foreground and its organization's part muted
     (<b>pay.</b><wbr><span class="apex">example.</span>...); an apex in
-    bold. Each label is one unbreakable piece with a break opportunity
-    after its dot, so a narrow column breaks the name only between labels,
-    never inside one."""
+    bold. A name breaks at the break opportunity after each dot, and a
+    label of LABEL_KEEP characters or fewer never inside (_keep): a narrow
+    column shows 'investor-relations.' / 'example.com', never 'investor-' /
+    'relations.example.com'; only a longer label breaks inside, where it
+    must, so it never passes the edge of its column or of the screen."""
     text = _text(name)
     if not text:
         return ""
@@ -436,28 +534,31 @@ def name_html(name, org=None):
     for run in _runs(text):
         end = pos + len(run)
         if end <= own:
-            parts.append("<b>%s</b>" % esc(run))
+            parts.append(_piece("b", (_keep(run),), esc(run)))
         elif pos >= own:
-            parts.append('<span class="apex">%s</span>' % esc(run))
+            parts.append(_piece("span", ("apex", _keep(run)), esc(run)))
         else:
-            parts.append('<span><b>%s</b><span class="apex">%s</span></span>' % (esc(text[pos:own]), esc(text[own:end])))
+            parts.append(_piece("span", (_keep(run),), '<b>%s</b><span class="apex">%s</span>'
+                                % (esc(text[pos:own]), esc(text[own:end]))))
         pos = end
     return '<span class="dn">%s</span>' % "<wbr>".join(parts)
 
 
-IP_RX = re.compile(r"[0-9.]+|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*")  # an IPv4 or IPv6 address: one piece, never cut
+IP_RX = re.compile(r"[0-9.]+|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*")  # an IPv4 or IPv6 address: one piece
 
 
 def plain_name(value):
     """A name or address with no emphasis (a sender, an envelope domain, a
-    record's host name), cut the same way: it breaks only after a dot or an
-    @, never inside a label; an IP address is one piece. '?' when the
-    document has none."""
+    record's host name), cut the same way: it breaks after a dot or an @,
+    never inside a label of LABEL_KEEP characters or fewer; an IP address
+    is one piece, never cut unless it is longer than that (an IPv6 one).
+    '?' when the document has none."""
     text = _text(value)
     if not text:
         return "?"
-    runs = [text] if IP_RX.fullmatch(text) else _runs(text)
-    return '<span class="dn">%s</span>' % "<wbr>".join("<span>%s</span>" % esc(r) for r in runs)
+    if IP_RX.fullmatch(text):
+        return '<span class="dn">%s</span>' % _piece("span", ("w" if len(text) <= LABEL_KEEP else "long",), esc(text))
+    return '<span class="dn">%s</span>' % "<wbr>".join(_piece("span", (_keep(r),), esc(r)) for r in _runs(text))
 
 
 # ------------------------------------------------------------------ small parts
@@ -489,7 +590,7 @@ def policy_cell(text):
     head, sep, rest = text.partition(" (")
     out = pill(policy_class(head), head)
     if sep:
-        out += '<span class="rest">(%s</span>' % marks(rest)
+        out += '<span class="rest">(%s</span>' % prose(rest)
     return out
 
 
@@ -502,7 +603,7 @@ def gate_cell(gate, gate_text):
     lead = next_steps.GATE_WORDS.get(gate, gate)
     rest = said[len(lead):] if said.startswith(lead) else said
     rest = rest.strip().lstrip(",").strip()
-    return pill(cls, word) + ('<span class="rest">%s</span>' % marks(rest) if rest else "")
+    return pill(cls, word) + ('<span class="rest">%s</span>' % prose(rest) if rest else "")
 
 
 def tag(text, cls="tag"):
@@ -576,14 +677,15 @@ def block(title, inner):
 def table(heads, body_rows, numeric=(), cls=""):
     """A table inside its scrolling wrapper: heads as column titles (fixed
     text), body_rows as already-built <tr> or <tbody> markup; cls one of the
-    page's fixed table classes (stack, index)."""
+    page's fixed table classes (TABLE_CLASSES), each of which reads as
+    blocks on a narrow screen, so no column is ever out of sight."""
     th = "".join('<th scope="col"%s>%s</th>' % (' class="num"' if i in numeric else "", esc(h))
                  for i, h in enumerate(heads))
     body = "".join(body_rows)
     if not body.startswith("<tbody"):
         body = "<tbody>%s</tbody>" % body
     return '<div class="table-wrap"><table%s><thead><tr>%s</tr></thead>%s</table></div>' % (
-        (' class="%s"' % cls) if cls in ("stack", "index") else "", th, body)
+        (' class="%s"' % cls) if cls in TABLE_CLASSES else "", th, body)
 
 
 def section(sid, title, parts, meta="", empty=NOT_IN_RUN):
@@ -613,7 +715,7 @@ def masthead(doc):
     sources = line[len(audience) + 1:].strip() if audience and line.startswith(audience + ".") else line
     parts = ['<p class="eyebrow">%s</p>' % "".join(eyebrow), "<h1>Status and next steps</h1>"]
     if audience:
-        parts.append('<p class="audience">%s.</p>' % marks(audience))
+        parts.append('<p class="audience">%s.</p>' % iso(marks(audience)))
     if sources:
         parts.append('<p class="sources">%s</p>' % marks(sources))
     parts.append('<p class="sources">%s</p>' % esc(VERIFY_LINE))
@@ -736,7 +838,10 @@ def stand_section(doc):
     """Where we stand: the figures as tiles, then every line of the section
     as next_steps.md writes it, the caveats with them. The heading's dates
     say whose window they are (the aggregate reports'), so no reader dates
-    the mail-log figures by them."""
+    the mail-log figures by them, and 'deduplicated' is said of the
+    mail-log counts alone ('aggregate reports 2026-09-18 to 2026-10-08;
+    mail-log counts deduplicated'): the same page says the aggregate
+    reports' counts cannot be. With no mail-log figure, the window alone."""
     st = _dict(doc.get("stand"))
     lines = _texts(st.get("lines"))
     for c in _texts(st.get("caveats")):  # an older document kept them apart from the lines
@@ -745,8 +850,10 @@ def stand_section(doc):
     parts = [stand_tiles(st), bullets(lines) if lines else ""]
     window = _dict(st.get("window"))
     text, source = _text(window.get("text")), _text(window.get("source"))
-    span = ("%s %s" % (source, text)) if text and source else (text or "this run's window")
-    meta = "%s, deduplicated" % esc(span) if any(parts) else ""
+    span = ("%s %s" % (iso_text(source), iso_text(text))) if text and source else (
+        iso_text(text) if text else "this run's window")
+    counted = any(_num(st.get(k)) is not None for k in ("genuine_failures", "delivered_despite_fail"))
+    meta = (span + ("; " + _unbroken("mail-log counts deduplicated") if counted else "")) if any(parts) else ""
     return section("stand", "Where we stand", parts, meta)
 
 
@@ -770,7 +877,7 @@ def next_step_section(doc):
     org = _text(doc.get("org_domain"))
     gate = ('<span class="k">Gate on</span><span class="mono">%s</span>' % esc(org)) if at_end and org else \
         '<span class="k">Gate</span>'
-    parts = ['<p class="step-label">%s%s</p>' % (marks(label), (" " + ref_tags(ref)) if ref else ""),
+    parts = ['<p class="step-label">%s%s</p>' % (iso(marks(label)), (" " + ref_tags(ref)) if ref else ""),
              '<p class="verdict">%s%s</p>' % (gate, pill(cls, word))]
     if _text(nxt.get("why")):
         parts.append('<p class="why">%s</p>' % marks(nxt["why"]))
@@ -822,10 +929,10 @@ def domain_rows(doc, plan, head):
 
 def domain_row(e):
     r = e["row"]
-    step = marks(_text(r.get("next_step"))) + id_tags(e["ids"])
+    step = iso(prose(_text(r.get("next_step")))) + id_tags(e["ids"])
     return ('<tr><td class="name">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>'
             % (name_html(e["name"], e["org"]), policy_cell(r.get("policy_today")),
-               gate_cell(r.get("gate"), r.get("gate_text")), step, marks(_text(r.get("mailflow_text")) or "not measured")))
+               gate_cell(r.get("gate"), r.get("gate_text")), step, prose(_text(r.get("mailflow_text")) or "not measured")))
 
 
 def domains_section(doc, plan, head):
@@ -834,8 +941,11 @@ def domains_section(doc, plan, head):
     holds two names or more; a one-domain organization is a plain row in
     its place - then the mail-flow note and the gate's notes next_steps.md
     shows under its table. On a phone each row reads as a block, the column
-    names as its labels."""
+    names as its labels. With no row, the section says what next_steps.md
+    says there - No domain was audited in this run. - above the gate's
+    notes too."""
     entries, grouped = domain_rows(doc, plan, head)
+    none = doc.get("per_domain") == []  # a document that lists no domain says so, as next_steps.md does
     parts = []
     if entries:
         if grouped:
@@ -843,7 +953,7 @@ def domains_section(doc, plan, head):
             for org, members in itertools.groupby(entries, key=lambda e: e["org"]):
                 members = list(members)
                 group_row = ('<tr class="org"><th colspan="5" scope="colgroup">%s <span class="count">%s</span></th></tr>'
-                             % (esc(org), _counted(len(members), "domain"))) if len(members) > 1 else ""
+                             % (iso_text(org), _counted(len(members), "domain"))) if len(members) > 1 else ""
                 bodies.append("<tbody>%s%s</tbody>" % (group_row, "".join(domain_row(e) for e in members)))
             parts.append(table(DOMAIN_HEADS, bodies, cls="stack"))
         else:
@@ -853,17 +963,18 @@ def domains_section(doc, plan, head):
             parts.append('<p class="note">%s</p>' % marks(note))
     notes = [n for n in _list(doc.get("audit_notes")) if isinstance(n, dict) and _text(n.get("text"))]
     if notes:
-        org = esc(_text(doc.get("org_domain")))
+        if not entries:  # the notes never stand in for the sentence that says why the table is missing
+            parts.append('<p class="empty">%s</p>' % esc(NO_DOMAINS if none else NOT_IN_RUN))
+        org = iso_text(_text(doc.get("org_domain")))
         if any(_text(n.get("holds")) for n in notes):
             lead = "From the audit on %s:" % org
-            items = ["%s (%s)" % (marks(n["text"]), marks(_text(n.get("holds")) or "information; it holds nothing"))
-                     for n in notes]
+            items = ["%s (%s)" % (iso(marks(n["text"])), iso(marks(n["holds"])) if _text(n.get("holds")) else
+                                  "information; it holds nothing") for n in notes]
         else:
             lead = "From the audit on %s (information; it holds nothing):" % org
             items = [marks(n["text"]) for n in notes]
         parts.append('<div class="group"><p class="note">%s</p><ul class="lines note">%s</ul></div>'
                      % (lead, "".join("<li>%s</li>" % i for i in items)))
-    none = doc.get("per_domain") == []  # a document that lists no domain says so, as next_steps.md does
     return section("domains", "Per domain", parts, empty=NO_DOMAINS if none else NOT_IN_RUN)
 
 
@@ -871,20 +982,14 @@ def _label(e):
     return next_steps.LIKELY_WORDS.get(_text(e.get("likely")) or "unknown", "unclear")
 
 
-def _headlines(entries):
-    """next_steps.md's split: the busiest entries with at least HEADLINE_MIN
-    messages are headlines (a few at most), the rest are notes."""
-    head = [e for e in entries if (_num(e.get("count")) or 0) >= next_steps.HEADLINE_MIN][:next_steps.TOP_ENTRIES]
-    return head, [e for e in entries if e not in head]
-
-
 def _note_line(entries, cap=None):
-    """The entries that are notes, not headlines, in next_steps.md's words
-    ('name xN (label)', the first NOTES_CAP of them, then how many more);
-    a damaged entry shows '?' where its name or count should be, never a
-    reason to fail and never Python's None."""
+    """Entries named on a line rather than in a table, in next_steps.md's
+    words and as markup ('name xN (label)', the first NOTES_CAP of them,
+    then how many more), each name in its own bidi isolate so nothing in it
+    moves the count after it; a damaged entry shows '?' where its name or
+    count should be, never a reason to fail and never Python's None."""
     cap = next_steps.NOTES_CAP if cap is None else cap
-    text = ", ".join("%s x%s (%s)" % (_text(e.get("name")) or "?", _count(e.get("count")), _label(e))
+    text = ", ".join("%s x%s (%s)" % (iso_text(_text(e.get("name")) or "?"), esc(_count(e.get("count"))), esc(_label(e)))
                      for e in entries[:cap])
     if len(entries) > cap:
         text += " (+%d more in report.json)" % (len(entries) - cap)
@@ -896,7 +1001,7 @@ def _subjects(e):
     for s in _texts(e.get("subjects"))[:2]:
         if len(s) > SUBJECT_MAX:  # cut at a word, so no number is left half shown
             s = (s[:SUBJECT_MAX].rsplit(" ", 1)[0] or s[:SUBJECT_MAX]) + "..."
-        out.append('<span class="subject">"%s"</span>' % marks(s))
+        out.append('<span class="subject">"%s"</span>' % iso(marks(s)))
     return "".join(out)
 
 
@@ -920,8 +1025,9 @@ def failing_kept(failing):
             skipping = isinstance(failing.get(block_key), list)
             if skipping:
                 continue
-        if skipping and (s.startswith("- **") or s.startswith("- Notes, not headlines")):
-            continue
+        if skipping and (s.startswith("- **") or s.startswith("- Notes, not headlines")
+                         or s.startswith("- " + next_steps.MORE_LINE)):
+            continue  # a line the table, the more line or the notes line under it says again
         out.append((current, s[2:] if s.startswith("- ") else s))
     return out
 
@@ -931,18 +1037,30 @@ def failing_rest(failing):
     return [line for _, line in failing_kept(failing)]
 
 
+def _as_names(e):
+    """The From domains an outside source fails as: the document's own words for them ("as", the busiest
+    first and the rest counted, as next_steps.md says them), else the first two it lists; each name breaking
+    between its labels only."""
+    said = _text(e.get("as"))
+    if said:
+        return iso(prose(said))
+    return ", ".join(plain_name(h) for h in _texts(e.get("header_from"))[:2]) or "?"
+
+
 def failing_tables(failing):
     """The headline entries of next_steps.md's What is failing lists as
-    tables, each followed by its notes line (the entries under the headline
-    threshold, as next_steps.md writes it) and by the document's own lines
-    that belong to that list (a formal exception it does not count)."""
+    tables, each split as next_steps.md splits it (next_steps.headline_split:
+    the first TOP_ENTRIES at HEADLINE_MIN messages or more in the table, the
+    others at HEADLINE_MIN or more on the MORE_LINE line, the rest on the
+    notes line, each entry once), then the document's own lines that belong
+    to that list (a formal exception it does not count)."""
     kept = failing_kept(failing)
 
     def own(key):
         return [line for k, line in kept if k == key]
     parts = []
     env = [e for e in _list(failing.get("by_envelope")) if isinstance(e, dict)]
-    head, rest = _headlines(env)
+    head, more, notes = next_steps.headline_split(env)
     rows = []
     for e in head:
         senders = _texts(e.get("senders"))
@@ -951,50 +1069,48 @@ def failing_tables(failing):
         if n:
             detail.append(esc(_counted(n, "sender address", "sender addresses")))
         if senders:
-            detail.append("such as %s" % esc(", ".join(senders[:2])))
+            detail.append("such as %s" % ", ".join(plain_name(s) for s in senders[:2]))
         rows.append('<tr><td class="name">%s</td><td class="num">%s</td><td>%s</td><td>%s%s</td></tr>'
                     % (plain_name(e.get("name")), esc(_count(e.get("count"))), esc(_label(e)), "; ".join(detail),
                        _subjects(e)))
     parts.append(failing_block("By envelope domain", "who actually handed the mail over", rows,
-                               ("Envelope domain", "Messages", "Label", "Senders"), rest,
-                               "Notes, not headlines (under %d each): " % next_steps.HEADLINE_MIN,
-                               extra=own("by_envelope")))
+                               ("Envelope domain", "Messages", "Label", "Senders"), more, notes,
+                               next_steps.NOTES_LINE, own("by_envelope"), "list env"))
     snd = [e for e in _list(failing.get("by_sender")) if isinstance(e, dict)]
-    head, rest = _headlines(snd)
+    head, more, notes = next_steps.headline_split(snd)
     rows = ['<tr><td class="name">%s</td><td class="num">%s</td><td>%s</td><td>%s</td><td class="name">%s</td></tr>'
             % (plain_name(e.get("name")), esc(_count(e.get("count"))), esc(_label(e)), _subjects(e),
                plain_name(e.get("envelope")) if _text(e.get("envelope")) else "")
             for e in head]
     parts.append(failing_block("By sender address", "what the reader sees in From", rows,
-                               ("Sender", "Messages", "Label", "Subjects", "Envelope"), rest,
-                               "Notes, not headlines (under %d each): " % next_steps.HEADLINE_MIN,
-                               extra=own("by_sender")))
+                               ("Sender", "Messages", "Label", "Subjects", "Envelope"), more, notes,
+                               next_steps.NOTES_LINE, own("by_sender"), "list snd"))
     out = [e for e in _list(failing.get("outside")) if isinstance(e, dict)]
-    head, rest = _headlines(out)
+    head, more, notes = next_steps.headline_split(out)
     rows = []
     for e in head:
-        disp = ", ".join("%s %s" % (_num(v), k) for k, v in _dict(e.get("dispositions")).items() if _num(v))
+        disp = ", ".join("%s %s" % (_num(v), iso_text(k)) for k, v in _dict(e.get("dispositions")).items() if _num(v))
         rows.append('<tr><td class="name">%s</td><td class="num">%s</td><td class="name">%s</td><td>%s</td><td>%s</td></tr>'
-                    % (plain_name(e.get("name")), esc(_count(e.get("count"))),
-                       esc(", ".join(_texts(e.get("header_from"))[:2]) or "?"), esc(_label(e)), esc(disp)))
-    notes = ("Notes, not headlines: " + _note_line(rest, len(rest))) if rest else ""  # next_steps.md lists them all
+                    % (plain_name(e.get("name")), esc(_count(e.get("count"))), _as_names(e), esc(_label(e)), disp))
     parts.append(failing_block("From the outside", "aggregate reports; these counts include forwarded copies and "
                                "cannot be deduplicated", rows, ("Source", "Failing", "As", "Label", "Receivers"),
-                               [], "", notes, extra=own("outside")))
+                               more, notes, next_steps.OUTSIDE_NOTES_LINE, own("outside"), "list out"))
     return [p for p in parts if p]
 
 
-def failing_block(title, sub, rows, heads, rest, lead, notes="", extra=()):
-    """One What is failing list: its title, the table of headline rows, the
-    notes line, then the document's lines that belong to it (extra). A list
-    with no table keeps only those lines, in its place."""
-    if rest:
-        notes = lead + _note_line(rest)
-    if not rows and not notes:
+def failing_block(title, sub, rows, heads, more, notes, notes_lead, extra=(), cls=""):
+    """One What is failing list: its title, the table of headline rows (cls:
+    its class in TABLE_CLASSES), the line of the others at HEADLINE_MIN or
+    more (next_steps.MORE_LINE) and the notes line (notes_lead,
+    next_steps.md's words for that list), each capped at NOTES_CAP as
+    next_steps.md caps it, then the document's lines that belong to it
+    (extra). A list with no table keeps only those lines, in its place."""
+    lines = [esc(lead) + _note_line(entries) for lead, entries in ((next_steps.MORE_LINE, more),
+                                                                   (notes_lead, notes)) if entries]
+    if not rows and not lines:
         return bullets(extra) if extra else ""
-    inner = table(heads, rows, numeric=(1,)) if rows else ""
-    if notes:
-        inner += '<p class="note">%s</p>' % esc(notes)
+    inner = table(heads, rows, numeric=(1,), cls=cls) if rows else ""
+    inner += "".join('<p class="note">%s</p>' % line for line in lines)
     if extra:
         inner += bullets(extra)
     return '<div class="group"><h3>%s <span class="sub">%s</span></h3>%s</div>' % (esc(title), esc(sub), inner)
@@ -1021,13 +1137,29 @@ def _id_order(ref):
 
 
 def _action_key(item, idx, head):
-    """An owner's items in the order the reader works them: by kind, a plan
-    row by its plan order, then by the first domain it concerns, then as the
-    document listed them."""
+    """An owner's items in the order next_steps.py gives them
+    (next_steps._item_key): by kind - the zero-risk records, the other plan
+    rows in plan order (their ids follow it), sender fixes, overrides,
+    outside and unknown sources, other findings, anything else last - then
+    by organization (the headline's first, a tenant-wide item after the
+    others) and the first domain it concerns, then as the document listed
+    them. A document the generator wrote is in this order already, so the
+    page keeps it item for item; one listed out of order is put back."""
     kind = _text(item.get("kind"))
     order = _id_order(item.get("ref")) if kind == "dns" else (0, "")
     names = _texts(item.get("domains"))
-    return (ACTION_RANK.get(kind, 6), order, dkey(names[0], head) if names else (), idx)
+    return (ACTION_RANK.get(kind, 6), order, not names, dkey(item.get("org"), head),
+            dkey(names[0] if names else "", head), idx)
+
+
+def _filed(item):
+    """What next_steps.owner_parts reads of an item - the organizations it
+    concerns - as text only (a damaged value reads as none, never as Python
+    spells it), with the item itself beside it."""
+    view = {"org": _text(item.get("org")), "item": item}
+    if isinstance(item.get("orgs"), list):
+        view["orgs"] = _texts(item["orgs"])
+    return view
 
 
 def action_item(item):
@@ -1040,52 +1172,40 @@ def action_item(item):
     hook = '<span class="hook">%s</span>' % marks(_text(item.get("hook")))
     summary, prereqs = _text(item.get("summary")), item.get("prerequisites")
     if summary and isinstance(prereqs, list):
-        head = "%s %s%s" % (hook, marks(summary), (" " + ref) if ref else "")
+        head = "%s %s%s" % (hook, iso(marks(summary)), (" " + ref) if ref else "")
         checks = _texts(prereqs)
         if not checks:
             return "<li>%s</li>" % head
         return ('<li class="item"><p>%s</p><div class="pre"><p class="k">Before applying</p>%s</div></li>'
                 % (head, checklist(checks, "checklist compact")))
-    return '<li>%s %s%s</li>' % (hook, marks(_text(item.get("action"))), (" " + ref) if ref else "")
+    return '<li>%s %s%s</li>' % (hook, iso(marks(_text(item.get("action")))), (" " + ref) if ref else "")
 
 
 def owner_group(g, head):
-    """One owner with its channel and its items. A group that spans two
-    organizations or more and holds GROUP_BY_ORG items or more is grouped
-    by organization, as next_steps.md groups it (the headline's first, then
-    each by name, the tenant-wide ones last); an organization's line heads
-    its items only where it holds two or more - a single item stays a plain
-    item in its place. A smaller group, or one whose items name no
+    """One owner with its channel and its items, in next_steps.md's order
+    (_action_key) and split as next_steps.md splits them - the same helper,
+    next_steps.owner_parts: a group of GROUP_BY_ORG items or more that
+    spans two organizations or more gets a line per organization (the
+    headline's first, then by name) with the items that concern it alone,
+    one item included, then Several organizations, then Tenant-wide, each
+    with its count; a smaller group, or one whose items name no
     organization (an older next_steps.json), stays one list."""
     items = [(i, it) for i, it in enumerate(_list(g.get("items"))) if isinstance(it, dict)]
     if not items:
         return ""
-    title = '<h3>%s%s</h3>' % (marks(_text(g.get("owner")) or next_steps.UNASSIGNED),
+    title = '<h3>%s%s</h3>' % (iso(marks(_text(g.get("owner")) or next_steps.UNASSIGNED)),
                                (' <span class="channel">%s</span>' % esc(g["channel"])) if _text(g.get("channel")) else "")
-    if any("org" in it for _, it in items):
-        buckets = {}
-        for i, it in items:
-            buckets.setdefault(_norm(it.get("org")), []).append((i, it))
-        named = sorted((o for o in buckets if o), key=lambda o: dkey(o, head))
-        if len(named) > 1 and len(items) >= next_steps.GROUP_BY_ORG:
-            body, plain = [], []
-            for o in named + ([""] if "" in buckets else []):
-                members = sorted(buckets[o], key=lambda t: _action_key(t[1], t[0], head))
-                if len(members) < 2:
-                    plain += members
-                    continue
-                if plain:
-                    body.append('<ul class="lines">%s</ul>' % "".join(action_item(it) for _, it in plain))
-                    plain = []
-                body.append('<div class="org-block"><p class="org-head">%s <span class="count">%s</span></p>'
-                            '<ul class="lines">%s</ul></div>'
-                            % (esc(o) if o else "Tenant-wide", _counted(len(members), "item"),
-                               "".join(action_item(it) for _, it in members)))
-            if plain:
-                body.append('<ul class="lines">%s</ul>' % "".join(action_item(it) for _, it in plain))
-            return '<div class="owner">%s%s</div>' % (title, "".join(body))
-    members = sorted(items, key=lambda t: _action_key(t[1], t[0], head))
-    return '<div class="owner">%s<ul class="lines">%s</ul></div>' % (title, "".join(action_item(it) for _, it in members))
+    ordered = [_filed(it) for _, it in sorted(items, key=lambda t: _action_key(t[1], t[0], head))]
+    body = []
+    for name, part in next_steps.owner_parts(ordered, head):
+        lines = '<ul class="lines">%s</ul>' % "".join(action_item(v["item"]) for v in part)
+        if name is None:
+            body.append(lines)
+            continue
+        label = esc(name) if name in (next_steps.SEVERAL_ORGS, next_steps.TENANT_WIDE) else iso_text(name)
+        body.append('<div class="org-block"><p class="org-head">%s <span class="count">%s</span></p>%s</div>'
+                    % (label, _counted(len(part), "item"), lines))
+    return '<div class="owner">%s%s</div>' % (title, "".join(body))
 
 
 def owners_section(doc, head):
@@ -1177,11 +1297,12 @@ def address_note(plan):
     rua = _text(plan.get("rua"))
     if plan.get("rua_is_placeholder"):
         return ('<p class="note"><strong>Set the reporting address.</strong> No existing record carried a rua, so new '
-                'records use the placeholder <code>%s</code>; plan.md says how to re-run with a real one.</p>' % esc(rua))
+                'records use the placeholder <code>%s</code>; plan.md says how to re-run with a real one.</p>'
+                % iso_text(rua))
     if plan.get("rua_derived"):
         return ('<p class="note"><strong>Check the reporting address.</strong> The run had no report address of its own, '
                 'so new records use <code>%s</code>, the rua most existing records already use; plan.md says more.</p>'
-                % esc(rua))
+                % iso_text(rua))
     return ""
 
 
@@ -1257,11 +1378,12 @@ def questions_section(doc, head):
         for _, q in members:
             n = _num(q.get("count")) or 1
             items.append('<li>%s%s <span class="count">owner: %s</span></li>'
-                         % (marks(q["question"]), (' <span class="count">x %s</span>' % n) if n > 1 else "",
+                         % (iso(marks(q["question"])), (' <span class="count">x %s</span>' % n) if n > 1 else "",
                             esc(_text(q.get("owner")) or "unassigned")))
-        title = words.get(k) or k.replace("_", " ").capitalize()
+        # a kind next_steps.py names in words is the page's own text; any other is the document's, isolated
+        title = esc(words[k]) if words.get(k) else iso_text(k.replace("_", " ").capitalize())
         parts.append('<div class="group"><h3>%s <span class="count">%s</span></h3><ul class="lines">%s</ul></div>'
-                     % (esc(title), len(members), "".join(items)))
+                     % (title, len(members), "".join(items)))
     return section("questions", "Open questions", parts, empty=NO_QUESTIONS if isinstance(raw, list) and not raw
                    else NOT_IN_RUN)
 
@@ -1277,35 +1399,36 @@ def glossary_section(doc):
 def footer(doc, with_plan=False):
     """The sources the document was built from, when the report was
     generated, and which version of the toolkit wrote it; with_plan says
-    whether the page read plan.json too."""
+    whether the page read plan.json too. Each value from the document (a
+    date, a tool, a path) is isolated from the words around it."""
     src = _dict(doc.get("sources"))
     facts = []
     when, tool = _text(src.get("report_generated_utc")), _text(src.get("report_tool"))
     if when:
-        facts.append("audit report generated %s%s" % (when, (" by " + tool) if tool else ""))
+        facts.append("audit report generated %s%s" % (iso_text(when), (" by " + iso_text(tool)) if tool else ""))
     if src.get("plan") is True:
-        facts.append("rollout plan (%s, %s)" % (_counted(_num(src.get("plan_changes")) or 0, "change"),
-                                                _counted(_num(src.get("plan_holds")) or 0, "hold")))
+        facts.append("rollout plan (%s, %s)" % (esc(_counted(_num(src.get("plan_changes")) or 0, "change")),
+                                                esc(_counted(_num(src.get("plan_holds")) or 0, "hold"))))
     elif src.get("plan") is False:
         facts.append("no rollout plan")
     runs = _num(src.get("metrics_runs"))
     if runs is not None:
-        facts.append("run history (%s)" % _counted(runs, "run"))
+        facts.append("run history (%s)" % esc(_counted(runs, "run")))
     if _text(src.get("previous_report")):
-        facts.append("previous report %s" % src["previous_report"].strip())
+        facts.append("previous report %s" % iso_text(src["previous_report"].strip()))
     if _text(src.get("owners_file")):
-        facts.append("owners file %s (%s)" % (src["owners_file"].strip(),
-                                              _counted(_num(src.get("owner_patterns")) or 0, "pattern")))
+        facts.append("owners file %s (%s)" % (iso_text(src["owners_file"].strip()),
+                                              esc(_counted(_num(src.get("owner_patterns")) or 0, "pattern"))))
     elif "owners_file" in src:
         facts.append("no owners file")
     made = _text(doc.get("tool")) or "next_steps.py"
     version = _text(doc.get("version"))
     lines = []
     if facts:
-        lines.append("<p>Sources: %s.</p>" % esc("; ".join(facts)))
+        lines.append("<p>Sources: %s.</p>" % "; ".join(facts))
     lines.append("<p>Written by %s%s from the run's own data and laid out by brief.py from next_steps.json%s: every "
                  "number traces to the run's files, and no sentence here was written by an AI.</p>"
-                 % (esc(made), (" " + esc(version)) if version else "", " and plan.json" if with_plan else ""))
+                 % (iso_text(made), (" " + iso_text(version)) if version else "", " and plan.json" if with_plan else ""))
     return '<footer id="footer" class="foot">%s</footer>' % "".join(lines)
 
 

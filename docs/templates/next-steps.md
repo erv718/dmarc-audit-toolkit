@@ -58,11 +58,16 @@ organization first, then each organization by name, its own domain before
 the names below it. A section the run left empty says what the document
 says there ("None from this run.", "Nothing to do this week: ..."); "Not in
 this run." means the run did not have its input. Text taken from mail
-(subject lines, sender addresses) is shown as data: a character that would
-hide or reorder the words around it appears as a marker such as [U+202E].
-The page is one file with no script, no font and no link out; open it in a
-browser and use Print to PDF for an A4 or Letter copy. Rebuild it after any
-change to the run's files:
+(subject lines, sender addresses) is shown as data, each piece set apart so
+it cannot move the words around it: a character that would hide or reorder
+them appears as a marker such as [U+202E], while the marks real mail text
+carries (a joiner in an emoji, a direction mark in a right-to-left subject)
+show as themselves. The owners' groups and What is failing's lists are split
+exactly as next_steps.md splits them, and on a narrow screen every table
+reads as labelled blocks, so no column is ever out of sight. The page is
+one file with no script, no font and no link out; open it in a browser and
+use Print to PDF for an A4 or Letter copy. Rebuild it after any change to
+the run's files:
 
 ```bash
 python src/brief.py audit-out/latest            # writes audit-out/latest/brief.html

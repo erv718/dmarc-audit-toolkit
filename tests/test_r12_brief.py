@@ -28,7 +28,7 @@ PAYLOADS = ("<img src=x onerror=alert(1)>", '"><script>alert(1)</script>', "**bo
 EM = chr(0x2014)  # an em dash, spelled as a number so this file stays ASCII
 TAGS = {"html", "head", "meta", "title", "style", "body", "main", "div", "nav", "section", "article", "footer", "h1",
         "h2", "h3", "h4", "p", "span", "b", "strong", "code", "pre", "a", "ol", "ul", "li", "dl", "dt", "dd", "table",
-        "thead", "tbody", "tr", "th", "td", "wbr"}
+        "thead", "tbody", "tr", "th", "td", "wbr", "bdi"}
 CARD_ID_RX = re.compile(r"rec-[1-9]\d*")  # a record card's id: its place in the DNS changes section, never data
 ATTRS = {"class", "id", "href", "lang", "charset", "name", "content", "http-equiv", "aria-label", "aria-hidden", "scope",
          "colspan"}
@@ -237,7 +237,7 @@ def test_the_brief_carries_the_documents_own_sentences(sample_run):
     for r in doc["per_domain"]:
         assert brief.marks(r["next_step"]) in section_of(page, "domains")
     audience, sources = doc["sources"]["audience"], doc["sources"]["audience_line"][len(doc["sources"]["audience"]) + 2:]
-    assert '<p class="audience">%s.</p>' % audience in page and brief.marks(sources) in page
+    assert '<p class="audience"><bdi>%s</bdi>.</p>' % audience in page and brief.marks(sources) in page
     assert brief.VERIFY_LINE == next_steps.render_md(doc).split("\n\n")[2]  # the pointer next_steps.md opens with
     # the tiles: genuine failures with the raw count beside them, and receivers' verdicts from spoofing_blocked
     st = doc["stand"]
@@ -298,7 +298,7 @@ def test_every_string_from_the_data_is_escaped_and_only_the_generators_marks_bec
     failing = section_of(page, "failing")
     assert "x&lt;img src=x onerror=alert(1)&gt;@" in failing and "x<img src=x onerror=alert(1)>@example.com" in \
         text_of(failing)
-    assert '"&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"' in section_of(page, "failing")
+    assert '"<bdi>&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;</bdi>"' in section_of(page, "failing")
     owners = section_of(page, "owners")
     assert text_of(owners).count("<img src=x onerror=alert(1)>") >= 2  # the owner and the hook, as text
 
@@ -315,7 +315,7 @@ def test_the_next_step_says_what_holds_it_and_a_missing_figure_is_never_a_zero()
                                "not_comparable": []}}}
     page = brief.render(doc)
     nxt = section_of(page, "next-step")
-    assert '<p class="step-label">raise pct to 50 <span class="tag">P-04</span></p>' in nxt
+    assert '<p class="step-label"><bdi>raise pct to 50</bdi> <span class="tag">P-04</span></p>' in nxt
     assert '<span class="k">Gate</span><span class="pill warn">not yet</span>' in nxt
     assert '<h3>Ready when</h3><ul class="checklist"><li><span class="box" aria-hidden="true"></span>' in nxt
     assert '<h3>Also on hold while</h3><ul class="lines"><li>3 messages reached a mailbox despite failing</li>' in nxt
@@ -383,8 +383,8 @@ def test_per_domain_rows_follow_the_one_order_with_the_headline_first_whatever_t
     assert names_in(sec) == IN_ORDER
     # a group row for each organization with two names or more, the headline's first, each with its count; a
     # one-domain organization (brand.example) is a plain row in its place, never a group row above an identical row
-    assert re.findall(r'<tr class="org"><th colspan="5" scope="colgroup">([^<]+) <span class="count">([^<]+)</span>',
-                      sec) == [("example.net", "2 domains"), ("example.com", "5 domains")]
+    assert re.findall(r'<tr class="org"><th colspan="5" scope="colgroup"><bdi>([^<]+)</bdi> <span class="count">'
+                      r'([^<]+)</span>', sec) == [("example.net", "2 domains"), ("example.com", "5 domains")]
     assert '<tbody><tr><td class="name"><span class="dn"><b>brand.</b><wbr><b>example</b></span></td>' in sec
     # a merged row is expanded, and each name takes its own plan id from the plan
     rows = dict(zip(names_in(sec), re.findall(r"<tr><td.*?</tr>", sec)))
@@ -404,8 +404,8 @@ def test_per_domain_rows_follow_the_one_order_with_the_headline_first_whatever_t
     assert '<span class="pill bad">no DMARC record</span>' in rows["brand.example"]
     assert '<span class="pill ok">p=reject</span>' in rows["example.net"]
     assert '<span class="pill warn">not yet</span>' in rows["example.net"]
-    assert ('<span class="pill bad">p=none</span><span class="rest">(inherited from _dmarc.example.com)</span>'
-            in rows["a.example.com"])
+    assert ('<span class="pill bad">p=none</span><span class="rest">(inherited from _dmarc.<wbr>example.<wbr>com)</span>'
+            in rows["a.example.com"])  # a name in the cell's text breaks between its labels, never sets the width
     assert '<span class="pill info">needs data</span>' in rows["a.example.com"]
     assert '<span class="pill info">not checked</span>' in rows["dev.support.example.com"]
     # whatever order the rows come in, the page is the same
@@ -508,19 +508,20 @@ def test_owners_and_open_questions_group_by_organization_and_kind():
            "open_questions": questions}
     page = brief.render(doc)
     owners = section_of(page, "owners")
-    assert '<h3>Mail team <span class="channel">#mail</span></h3>' in owners
-    # six items across two organizations: grouped as next_steps.md groups them, an organization's line only where it
-    # holds two items or more (example.net's one item and the tenant-wide one stay plain items, in their place)
-    assert re.findall(r'<p class="org-head">([^<]+) <span class="count">([^<]+)</span>', owners) == [
-        ("example.com", "4 items")]
+    assert '<h3><bdi>Mail team</bdi> <span class="channel">#mail</span></h3>' in owners
+    # six items across two organizations: grouped as next_steps.md groups them (next_steps.owner_parts), each
+    # organization's line with its count - one item included - and the tenant-wide item last under its own
+    assert re.findall(r'<p class="org-head">(?:<bdi>)?([^<]+)(?:</bdi>)? <span class="count">([^<]+)</span>',
+                      owners) == [("example.com", "4 items"), ("example.net", "1 item"), ("Tenant-wide", "1 item")]
     # within an organization: the zero-risk bundle, then the DNS changes in plan order, then the sender fixes
     assert re.findall(r'<span class="hook">([^<]+)</span>', owners) == [
         "3 zero-risk monitoring records", "example.com", "t.example.com", "news@example.com - 11 messages",
         "billing@example.net - 12 messages", "198.51.100.20 - 40 messages pass on SPF alone"]
     qs = section_of(page, "questions")
-    assert re.findall(r'<h3>([^<]+) <span class="count">(\d+)</span></h3>', qs) == [
+    assert re.findall(r'<h3>(?:<bdi>)?([^<]+)(?:</bdi>)? <span class="count">(\d+)</span></h3>', qs) == [
         ("Blockers", "1"), ("Prerequisites", "2"), ("Not verified yet", "1"), ("Needs an owner", "1"), ("Zeta", "1")]
-    prereqs = re.findall(r"<li>Can we confirm this before we publish \(plan (P-\d+)\)", qs)
+    assert "<h3><bdi>Zeta</bdi> " in qs and "<h3>Blockers " in qs  # a kind only the document names is its data
+    prereqs = re.findall(r"<li><bdi>Can we confirm this before we publish \(plan (P-\d+)\)", qs)
     assert prereqs == ["P-07", "P-05"]  # the headline's organization first
     assert '<span class="count">x 2</span>' in qs and qs.count("owner: unassigned") == len(questions)
 
@@ -528,14 +529,15 @@ def test_owners_and_open_questions_group_by_organization_and_kind():
 # ------------------------------------------------------------------ an older document, no plan, empty sections
 
 def strip_round12(doc):
-    """next_steps.json as a run before round 12 wrote it: no "org" on the per-domain rows, no "org" or
-    "domains" on the actions and the open questions."""
+    """next_steps.json as a run before round 12 wrote it: no "org" on the per-domain rows, no "org", "orgs" or
+    "domains" on the actions and no "org" or "domains" on the open questions."""
     doc = json.loads(json.dumps(doc))
     for r in doc.get("per_domain") or []:
         r.pop("org", None)
     for g in doc.get("actions_by_owner") or []:
         for i in g.get("items") or []:
             i.pop("org", None)
+            i.pop("orgs", None)
             i.pop("domains", None)
     for q in doc.get("open_questions") or []:
         q.pop("org", None)
@@ -721,17 +723,20 @@ def css_rule(selector):
 
 
 def test_a_domain_name_breaks_only_between_labels_and_the_domain_column_fits_a_typical_name():
-    """Each label is one unbreakable piece with a break opportunity after its dot, so a narrow column shows
-    'events.example.' / 'com', never 'events.example.c' / 'om' (checked in Edge at 1280 and 400 px)."""
+    """Each label is one piece with a break opportunity after its dot, so a narrow column shows 'events.example.' /
+    'com', never 'events.example.c' / 'om'; a label of LABEL_KEEP characters or fewer that holds a hyphen is kept
+    whole (class w), and only a longer one may break inside, where it must (class long) - checked in Edge from 360
+    to 1280 px."""
     sec = section_of(brief.render(estate_doc(head="example.com")), "domains")
     cell = re.search(r'<td class="name">(<span class="dn">.*?)</td>', sec).group(1)
     pieces = re.findall(r"<wbr>", cell)
     assert len(pieces) == text_of(cell).count(".")  # one break opportunity per dot, and none anywhere else
     for name in ("dev.support.example.com", "mailer.billing-vendor.invalid", "a@b.example.com"):
         markup = brief.plain_name(name)
-        runs = re.findall(r"<span>([^<]*)</span>", markup)
+        runs = re.findall(r'<span(?: class="w")?>([^<]*)</span>', markup)
         assert "".join(runs) == name and all(r.endswith((".", "@")) for r in runs[:-1]), runs
-    assert "white-space: nowrap" in css_rule(".dn > *")  # a label never breaks, not even at its hyphen
+    assert '<span class="w">billing-vendor.</span>' in brief.plain_name("mailer.billing-vendor.invalid")
+    assert "white-space: nowrap" in css_rule(".dn > .w")  # a short label never breaks, not even at its hyphen
     assert "overflow-wrap" not in css_rule("td.name")  # the old rule that broke a name anywhere is gone
     assert "min-width: 26ch" in css_rule("table.stack td.name")  # a typical name fits on one line at desktop width
 
@@ -754,14 +759,14 @@ def test_an_owner_item_from_a_plan_row_reads_as_its_summary_and_a_checklist():
               "kind": "sender", "domains": ["example.com"], "org": "example.com"}]
     doc = {"org_domain": "example.com", "actions_by_owner": [{"owner": "DNS team", "channel": "", "items": items}]}
     owners = section_of(brief.render(doc), "owners")
-    assert ('<li class="item"><p><span class="hook">example.com</span> move to p=reject - Move example.com to '
-            'reject. <span class="tag">P-12</span></p><div class="pre"><p class="k">Before applying</p>'
+    assert ('<li class="item"><p><span class="hook">example.com</span> <bdi>move to p=reject - Move example.com to '
+            'reject.</bdi> <span class="tag">P-12</span></p><div class="pre"><p class="k">Before applying</p>'
             '<ul class="checklist compact">') in owners
     assert owners.count('<span class="box" aria-hidden="true"></span>') == 2
     for p in pre:
         assert "<span>%s</span>" % p in owners
     assert "(before applying:" not in owners  # the parenthetical is gone, its parts are the checklist
-    assert ('<li><span class="hook">noreply@example.com - 12 messages</span> DKIM-sign this sender '
+    assert ('<li><span class="hook">noreply@example.com - 12 messages</span> <bdi>DKIM-sign this sender</bdi> '
             '<span class="tag">MAILFLOW-001</span></li>') in owners
 
 
@@ -820,11 +825,12 @@ def test_the_dns_section_opens_with_every_row_at_a_glance_each_linked_to_its_den
 
 
 def test_the_per_domain_table_reads_as_labelled_blocks_on_a_phone():
-    """Below 40rem each row is a block and each cell carries its column's name as a label, from the style (fixed
-    text, never from the data); checked in Edge at 400 px."""
+    """Below 48rem each row is a block and each cell carries its column's name as a label, from the style (fixed
+    text, never from the data); checked in Edge from 360 to 1280 px (a 5-column table no longer scrolls out of sight
+    between 641 and 768 px)."""
     sec = section_of(brief.render(estate_doc()), "domains")
     assert '<table class="stack">' in sec
-    phone = brief.CSS.split("@media (max-width: 40rem) {", 1)[1].split("\n}\n", 1)[0]
+    phone = brief.CSS.split("@media screen and (max-width: 48rem) {", 1)[1].split("\n}\n", 1)[0]
     assert "table.stack, table.stack tbody, table.stack tr, table.stack th, table.stack td { display: block; }" in phone
     assert "table.stack thead { display: none; }" in phone
     for i, head in enumerate(brief.DOMAIN_HEADS, 1):
@@ -865,10 +871,12 @@ def test_each_tile_says_what_it_counts_and_the_figures_line_up():
 
 def test_the_where_we_stand_heading_names_whose_window_its_dates_are():
     stand = section_of(brief.render(stand_doc()), "stand")
-    assert '<p class="meta">aggregate reports 2026-09-18 to 2026-10-08, deduplicated</p>' in stand
+    assert ('<p class="meta"><bdi>aggregate reports</bdi> <bdi>2026-09-18 to 2026-10-08</bdi>; <span class="d">'
+            'mail-log counts deduplicated</span></p>') in stand
     doc = stand_doc()
     doc["stand"]["window"] = {"text": "2026-09-18 to 2026-10-08"}  # an older document names no source
-    assert '<p class="meta">2026-09-18 to 2026-10-08, deduplicated</p>' in section_of(brief.render(doc), "stand")
+    assert ('<p class="meta"><bdi>2026-09-18 to 2026-10-08</bdi>; <span class="d">mail-log counts deduplicated</span></p>'
+            in section_of(brief.render(doc), "stand"))
 
 
 def test_a_long_list_of_plan_ids_is_one_tag_per_id_in_a_row_that_wraps():
@@ -988,10 +996,10 @@ def test_text_from_mail_cannot_reorder_or_hide_the_words_around_it():
         assert ch not in page
     assert "Your receipt 61[U+202E]" in page and "noreply@exa[U+200B]mple.com" in text_of(page)
     assert "[U+FEFF]example.com is at p=none." in page
-    assert "x[U+202E] x4 (unclear), 198.51.100.77 x5 (unclear)" in page
+    assert "<bdi>x[U+202E]</bdi> x4 (unclear), <bdi>198.51.100.77</bdi> x5 (unclear)" in page
     assert brief.esc("a" + chr(0xD800) + "b") == "a" + chr(0xFFFD) + "b"  # a lone surrogate JSON can spell
     assert brief.esc("tab\tand line\nbreaks") == "tab\tand line\nbreaks"
-    assert "unicode-bidi: isolate" in css_rule(".dn, .hook, .subject, .channel")
+    assert "unicode-bidi: isolate" in css_rule(".dn, .hook, .subject, .channel, .mono, .k, .d")
 
 
 def test_a_damaged_value_shows_as_nothing_or_a_question_mark_never_as_python_spells_it():
@@ -1239,9 +1247,13 @@ def test_check_doc_allows_the_counts_the_page_works_out_for_itself():
     import check_doc
     plan = {"changes": [dict(change("P-01", 1, "Route53", "example.com", "example.com", "_dmarc.example.com"),
                              prerequisites=["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"])]}
+    items = [{"hook": "x", "org": "example.com"}] * 17 + [{"hook": "y", "org": "example.net"}] * 3
     doc = {"org_domain": "example.com", "per_domain": [row(["example.com"], "example.com")],
-           "actions_by_owner": [{"owner": "DNS team", "items": [{"hook": "x", "org": "example.com"}] * 17}]}
-    assert {"13", "1", "17"} <= check_doc.derived_counts(doc, plan)
+           "actions_by_owner": [{"owner": "DNS team", "items": items}]}
+    assert {"13", "1", "17", "3"} <= check_doc.derived_counts(doc, plan)
+    # the counts are the lines next_steps.owner_parts gives the group: a group about one organization has none
+    doc["actions_by_owner"][0]["items"] = items[:17]
+    assert "17" not in check_doc.derived_counts(doc, plan)
     assert check_doc.derived_counts({"per_domain": "damaged"}, {"changes": [None, 7]}) == set()
 
 

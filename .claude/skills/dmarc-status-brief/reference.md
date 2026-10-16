@@ -37,7 +37,8 @@ Where we stand
 The ask
 <ask, verbatim>
 
-From the <date> run (brief.html, next_steps.json). Counts are deduplicated.
+From the <date> run (brief.html, next_steps.json). Mail-log counts are deduplicated; the receivers' counts
+come from aggregate reports and cannot be.
 ```
 
 Drop finding ids and the glossary for this layer; keep plan ids only where

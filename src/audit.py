@@ -633,28 +633,44 @@ def sender_rank(address, count, headline=None, messages=None):
     return (-count, -busy, not dom, domain_key(dom, headline), text)
 
 
-def top_senders(counter, n=5, headline=None):
+def top_senders(counter, n=5, headline=None, messages=None):
     """The n busiest (sender, count) pairs of a Counter in sender_rank order:
-    never Counter.most_common, whose ties fall in the order the rows came."""
-    return sorted(counter.items(), key=lambda kv: sender_rank(kv[0], kv[1], headline))[:n]
+    never Counter.most_common, whose ties fall in the order the rows came.
+    messages ({sender: logical messages}, when the caller counted them)
+    breaks a tie on the count as the census does: the busier stream first."""
+    messages = messages or {}
+    return sorted(counter.items(), key=lambda kv: sender_rank(kv[0], kv[1], headline, messages.get(kv[0])))[:n]
 
 
 def rank_top_senders(maillog_doc, headline=None):
     """MAILFLOW-001's evidence names the busiest failing senders across the
-    whole log as dedupe.py ranked them, before any headline was chosen: a
-    tie there falls in mail-log row order. Once the gate has chosen the
-    headline, the same senders and counts are ranked again in sender_rank
-    order, the headline's organization first, so report.md, todo.md and
-    verify.md name the senders next_steps.md names. In place; nothing
-    else in the evidence changes."""
+    whole log, and MAILFLOW-004's the busiest sender and label pairs, as
+    dedupe.py ranked them, before any headline was chosen: a tie there
+    falls in mail-log row order. Once the gate has chosen the headline, the
+    same senders and counts are ranked again with the key every list of
+    senders sorts by (sender_rank: the failures, then the messages behind
+    them - every logical message the sender sent, passing ones included,
+    as the census counts a stream - then the one order, the headline's
+    organization first), so report.md, todo.md and verify.md name the
+    senders next_steps.md and the census name, in their order. In place;
+    nothing else in the evidence changes."""
     verdicts = [v for v in _dict(maillog_doc).get("verdicts") or [] if isinstance(v, dict)]
-    senders = Counter(v.get("sender") for v in verdicts if v.get("genuine_failure"))
+    failing = [v for v in verdicts if v.get("genuine_failure")]
+    senders = Counter(v.get("sender") for v in failing)
+    labelled = Counter((v.get("sender"), v.get("likely")) for v in failing)
+    messages = Counter(v.get("sender") for v in verdicts)
     for f in _dict(maillog_doc).get("findings") or []:
-        if not (isinstance(f, dict) and f.get("id") == "MAILFLOW-001" and isinstance(f.get("evidence"), str)):
+        if not (isinstance(f, dict) and isinstance(f.get("evidence"), str)) or not senders:
             continue
-        head, sep, _ = f["evidence"].partition("; top senders: ")
-        if sep and senders:
-            f["evidence"] = head + sep + "; ".join("%s x%d" % kv for kv in top_senders(senders, 5, headline))
+        if f.get("id") == "MAILFLOW-001":
+            head, sep, _ = f["evidence"].partition("; top senders: ")
+            if sep:
+                f["evidence"] = head + sep + "; ".join("%s x%d" % kv for kv in top_senders(senders, 5, headline,
+                                                                                            messages))
+        elif f.get("id") == "MAILFLOW-004":
+            pairs = sorted(labelled.items(), key=lambda kv: sender_rank(kv[0][0], kv[1], headline, messages.get(
+                kv[0][0])) + (str(kv[0][1]),))
+            f["evidence"] = "; ".join("%s %s x%d" % (s, label, n) for (s, label), n in pairs[:5])
 
 
 def _counters(verdicts):

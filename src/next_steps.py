@@ -999,7 +999,10 @@ def streams(view, rua, own=None, excepted_ips=(), headline=None):
         def conv(s):
             names = audit.from_names(s.get("header_from") if isinstance(s.get("header_from"), list) else [],
                                      counts.get(str(s.get("source_ip"))), headline)
-            return {"name": "%s as %s" % (s.get("source_ip", "?"), names or "?"),
+            # source and as apart, so a line can put the count with the source it counts (_named): 'IP x110 as
+            # example.org, a.shop.example.org and 1 more', never after 'and 1 more' as if it counted that one
+            ip = str(s.get("source_ip", "?"))
+            return {"name": "%s as %s" % (ip, names or "?"), "source": ip, "as": names or "?",
                     "count": _n(s.get("fail")) if _n(s.get("fail")) is not None else (_n(s.get("count")) or 0),
                     "likely": _group(s.get("likely"))}
         groups = {OWN: [], SPOOF: [], UNCLEAR: []}
@@ -1764,7 +1767,10 @@ def gate_reasons(report, domain):
 
 
 def _named(entries, cap=3):
-    return ", ".join("%s x%d" % (s["name"], s["count"]) for s in entries[:cap])
+    """'name xN, ...' for the first cap entries; an outside source as 'IP xN as its From domains' (streams()
+    keeps the two apart), so its count sits with the source it counts, never after the names it fails as."""
+    return ", ".join(("%s x%d as %s" % (s["source"], s["count"], s["as"])) if "as" in s and "source" in s
+                     else "%s x%d" % (s["name"], s["count"]) for s in entries[:cap])
 
 
 def _spoof_clause(policy, delivered=0):
@@ -2428,9 +2434,11 @@ def _note_line(entries, cap=NOTES_CAP):
     return text
 
 
-# the line that names the entries at HEADLINE_MIN or more beyond the TOP_ENTRIES headlines, and the notes line
+# the line that names the entries at HEADLINE_MIN or more beyond the TOP_ENTRIES headlines, and the notes line (the
+# outside view's says no threshold: its counts are not the mail log's); brief.py writes the same words
 MORE_LINE = "Also at %d or more each: " % HEADLINE_MIN
 NOTES_LINE = "Notes, not headlines (under %d each): " % HEADLINE_MIN
+OUTSIDE_NOTES_LINE = "Notes, not headlines: "
 
 
 def headline_split(entries):
@@ -2524,7 +2532,7 @@ def what_is_failing(report, view, headline=None):
             if more:
                 lines.append("- " + MORE_LINE + _note_line(more))
             if rest:
-                lines.append("- Notes, not headlines: %s" % _note_line(rest))
+                lines.append("- " + OUTSIDE_NOTES_LINE + _note_line(rest))
             if excepted:
                 lines.append("- Formally excepted in audit.toml and not counted above: %s" % _note_line(excepted))
         elif excepted:
@@ -2784,11 +2792,11 @@ def _orgs_of(domains):
 
 
 def _item_orgs(item):
-    """The organizations an owner's item concerns: its orgs when the
-    document carries them, else its one org (a document from before they
-    were recorded), else none."""
+    """The organizations an owner's item concerns, each once: its orgs when
+    the document carries them, else its one org (a document from before
+    they were recorded), else none."""
     if isinstance(item.get("orgs"), list):
-        return [_dom(o) for o in item["orgs"] if _dom(o)]
+        return list(dict.fromkeys(_dom(o) for o in item["orgs"] if _dom(o)))
     return [_dom(item.get("org"))] if _dom(item.get("org")) else []
 
 
@@ -3139,17 +3147,36 @@ def _action_line(item, pad):
     return "%s- **%s** %s%s" % (pad, item["hook"], item["action"], ref)
 
 
+def owner_parts(items, headline=None):
+    """One owner's items as both renderers group them - next_steps.md here,
+    brief.html in brief.owner_group - so the two never disagree on a line
+    or a count: [(None, items)], one flat list in the items' order, for a
+    group under GROUP_BY_ORG items or one that concerns fewer than two
+    organizations; else [(name, items)], one part per organization (the
+    headline's first, then by name) with the items that concern it alone,
+    then SEVERAL_ORGS with the items that concern more than one (an
+    organization's own line never holds another's records), then
+    TENANT_WIDE with the ones that concern none - each part in the items'
+    order, only when it holds one, a single item included (its line says
+    whose it is: its hook need not name the domain). An item's
+    organizations are _item_orgs': an older document's items, with no
+    organization, keep the group flat. [] for no items."""
+    items = list(items)
+    orgs = audit.order_domains(sorted({o for i in items for o in _item_orgs(i)}), headline)
+    if len(items) < GROUP_BY_ORG or len(orgs) < 2:
+        return [(None, items)] if items else []
+    parts = [(o, [i for i in items if _item_orgs(i) == [o]]) for o in orgs]
+    parts.append((SEVERAL_ORGS, [i for i in items if len(_item_orgs(i)) > 1]))
+    parts.append((TENANT_WIDE, [i for i in items if not _item_orgs(i)]))
+    return [(name, part) for name, part in parts if part]
+
+
 def render_actions(groups, failing=None, headline=None):
     """The owner groups as markdown; failing (the document's What is failing
-    data) says why nothing is left when the exceptions took it all. An owner
-    group of GROUP_BY_ORG items or more that spans two organizations or more
-    gets one line per organization (the headline's first, then by name)
-    with the items that concern that organization alone under it in their
-    order, then the items that concern several under Several organizations
-    (an organization's own line never holds another's records), and the
-    tenant-wide items last under Tenant-wide; a smaller group, or one an
-    older document's items carry no organization for, stays one flat list
-    in its order."""
+    data) says why nothing is left when the exceptions took it all. Each
+    group is split as owner_parts splits it: a line per organization
+    ('  - **example.com** - 12 items', then Several organizations and
+    Tenant-wide) with its items under it, or one flat list."""
     L = []
     if not any(g["items"] for g in groups):
         if (failing or {}).get("excepted") or (failing or {}).get("outside_excepted"):
@@ -3158,18 +3185,12 @@ def render_actions(groups, failing=None, headline=None):
         return ["- Nothing to do this week: no plan changes and no actionable findings in this run."]
     for g in groups:
         L.append("- **%s**" % g["owner"] + (" (%s)" % g["channel"] if g["channel"] else ""))
-        items = g["items"]
-        orgs = audit.order_domains(sorted({o for i in items for o in _item_orgs(i)}), headline)
-        if len(items) < GROUP_BY_ORG or len(orgs) < 2:
-            L += [_action_line(i, "  ") for i in items]
-            continue
-        parts = [(o, [i for i in items if _item_orgs(i) == [o]]) for o in orgs]
-        parts.append((SEVERAL_ORGS, [i for i in items if len(_item_orgs(i)) > 1]))
-        parts.append((TENANT_WIDE, [i for i in items if not _item_orgs(i)]))
-        for name, part in parts:
-            if part:
-                L.append("  - **%s** - %d %s" % (name, len(part), _plural(len(part), "item")))
-                L += [_action_line(i, "    ") for i in part]
+        for name, part in owner_parts(g["items"], headline):
+            if name is None:
+                L += [_action_line(i, "  ") for i in part]
+                continue
+            L.append("  - **%s** - %d %s" % (name, len(part), _plural(len(part), "item")))
+            L += [_action_line(i, "    ") for i in part]
     return L
 
 

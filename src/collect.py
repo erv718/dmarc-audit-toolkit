@@ -808,6 +808,33 @@ def truncation_text(notes):
     return "; ".join(parts) or None
 
 
+def run_caveats(report, notes):
+    """The run's caveats from its mail-log notes - an hour still at the API
+    row cap dropped rows, a row budget kept only the newest hours: the
+    mail-log counts for that organization are a floor - stored in the
+    report as report["caveats"] and, as one clause, maillog.truncation
+    (the status document's 'cut short, so a floor' clause). Both name the
+    organizations in the one order every file follows, the headline's
+    first (next_steps.order_by_org), never in the order the pull reached
+    them, so report.md's Caveats, report.json and todo.md agree with
+    next_steps.md. Returns the caveats; [] when nothing was cut."""
+    caveats = []
+    for n in notes:
+        if "that hour is truncated" in n:
+            caveats.append("%s - mail-log counts for that domain are a floor and its failures are not verified" % n)
+        elif "row budget reached" in n:
+            caveats.append("%s - mail-log counts for that domain cover that span only" % n)
+    if not caveats:
+        return caveats
+    head = next_steps.headline_org(report)
+    caveats = next_steps.order_by_org(caveats, head)
+    report["caveats"] = caveats
+    cut = truncation_text(notes)
+    if cut and isinstance(report.get("maillog"), dict):
+        report["maillog"]["truncation"] = "; ".join(next_steps.order_by_org(cut.split("; "), head))
+    return caveats
+
+
 def headline_note(gate, orgs, volumes):
     """The run note on the headline signal, written from the gate the report
     chose rather than a guess at the fallback: the internal mail per org
@@ -1354,17 +1381,7 @@ def main():
         note(report["delta_error"])
     # an hour still at the API row cap dropped rows, and a row budget kept only the newest
     # hours: the mail-log counts for that domain are a floor, said so in the report too
-    caveats = []
-    for n in notes:
-        if "that hour is truncated" in n:
-            caveats.append("%s - mail-log counts for that domain are a floor and its failures are not verified" % n)
-        elif "row budget reached" in n:
-            caveats.append("%s - mail-log counts for that domain cover that span only" % n)
-    if caveats:
-        report["caveats"] = caveats
-        cut = truncation_text(notes)
-        if cut and isinstance(report.get("maillog"), dict):
-            report["maillog"]["truncation"] = cut  # the status document's 'cut short, so a floor' clause
+    caveats = run_caveats(report, notes)
     md = audit.render_md(report)
     if caveats:
         md += "\n## Caveats\n\n" + "\n".join("- " + c for c in caveats) + "\n"

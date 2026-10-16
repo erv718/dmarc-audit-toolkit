@@ -450,7 +450,7 @@ def test_c15_the_reports_likely_misconfigured_reads_as_our_own_system():
            "rua": rua, "maillog": None, "findings": [],
            "gate": audit.gate_verdict(dns("quarantine"), rua, None, ["example.com"])}
     doc, md = doc_md(rep)
-    assert "1 of our own sending sources still fails (from the aggregate reports) (198.51.100.20 as example.com x40)" \
+    assert "1 of our own sending sources still fails (from the aggregate reports) (198.51.100.20 x40 as example.com)" \
            in doc["one_liner"]
     assert "unclear" not in doc["one_liner"]
     assert "- **198.51.100.20 - 40 failing messages as example.com** looks like our own system misconfigured" in md

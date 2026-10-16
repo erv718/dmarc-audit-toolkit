@@ -23,10 +23,15 @@ own files, and names every token in the copy the run does not carry:
   - the punctuation and spacing the voice rules forbid: any dash but the
     hyphen (the em dash, the en dash, the minus sign and the other Unicode
     dashes), curly and angle quotes, the ellipsis characters, any space but
-    the plain one, and characters no reader can see; in a Markdown or text
-    copy an HTML entity counts as the character it renders (&mdash;). A
-    stretch the copy quotes ("...") that the run's files hold word for word
-    - a subject line as mail wrote it - keeps its own punctuation.
+    the plain one; in a Markdown or text copy an HTML entity counts as the
+    character it renders (&mdash;). A stretch the copy quotes ("...") that
+    the run's files hold word for word - a subject line as mail wrote it -
+    keeps its own punctuation
+  - the characters brief.html shows as a marker (brief.marked: one that
+    reorders or hides the words around it, such as U+202E or U+200B, and a
+    control), named wherever they are, quoted data too; the format
+    characters real mail text carries (a joiner in an emoji, a direction
+    mark in a right-to-left subject, a soft hyphen) are text, never named
 
 It checks what the copy says, not what it covers: 'P-02 to P-14' passes
 when both ends are real plan ids, whichever rows lie between them.
@@ -39,8 +44,8 @@ first (a digit in a folder name is not evidence). Some figures are derived
 rather than copied, and allowed: the pass rate as a percentage, the
 numbers of the mail log's span as next_steps.py words it, for the windows
 in report.json, and the counts brief.html works out (names per
-organization, items per organization in an owner group, checks before a
-plan row).
+organization, the items under each line of an owner group, checks before
+a plan row).
 
   python scripts/check_doc.py audit-out/latest/polished/leadership.md
   python scripts/check_doc.py polished-ticket.md --run audit-out/history/<run>
@@ -59,7 +64,6 @@ read, a run folder holding none of the run's files). Never a traceback.
 
 import argparse
 import bisect
-import collections
 import html
 import itertools
 import json
@@ -115,9 +119,11 @@ VOICE.update({code: ("a curly quote", "use a straight quote") for code in (0x201
 VOICE_BY_CLASS = {"Pd": ("a Unicode dash", "use a hyphen"), "Pi": ("an angle or curly quote", "use a straight quote"),
                   "Pf": ("an angle or curly quote", "use a straight quote"), "Zs": ("a Unicode space", "use a plain space"),
                   "Zl": ("a Unicode line break", "use a plain line break"),
-                  "Zp": ("a Unicode line break", "use a plain line break"),
-                  "Cf": ("an invisible character", "delete it"), "Cc": ("a control character", "delete it")}
-UNSEEN = (VOICE_BY_CLASS["Cf"], VOICE_BY_CLASS["Cc"])  # never data's own punctuation: named even inside a quote
+                  "Zp": ("a Unicode line break", "use a plain line break")}
+# the characters brief.html shows as a marker (brief.marked: one that reorders or hides the text around it, or a
+# control): never data's own punctuation, so named even inside a quote. The other format characters - a joiner in an
+# emoji, a direction mark in a right-to-left subject, a soft hyphen - are text, and named nowhere
+UNSEEN = (("an invisible character", "delete it"), ("a control character", "delete it"))
 INLINE_TAGS = frozenset(("a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "dfn", "em", "i", "kbd", "mark", "q",
                          "s", "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var", "wbr"))
 QUOTE_LOOKUPS = 64  # quoted stretches looked up in the run's files per line, at most: a hostile line stays cheap
@@ -272,8 +278,9 @@ def _rate(value):
 def derived_counts(doc, plan):
     """The counts brief.html works out from the run's files rather than
     copies: the names an organization holds in the per-domain table, the
-    items an organization holds in an owner group, and the checks that wait
-    before each plan row. A copy of the page may quote them."""
+    items under each line of an owner group (next_steps.owner_parts, the
+    split next_steps.md prints too), and the checks that wait before each
+    plan row. A copy of the page may quote them."""
     out = set()
     try:
         head = brief._text(doc.get("org_domain")) or None
@@ -281,8 +288,9 @@ def derived_counts(doc, plan):
         if grouped:
             out |= {str(len(list(m))) for _, m in itertools.groupby(entries, key=lambda e: e["org"])}
         for g in brief._list(doc.get("actions_by_owner")):
-            items = [it for it in brief._list(g.get("items") if isinstance(g, dict) else None) if isinstance(it, dict)]
-            out |= {str(n) for n in collections.Counter(brief._norm(it.get("org")) for it in items).values()}
+            items = [brief._filed(it) for it in brief._list(g.get("items") if isinstance(g, dict) else None)
+                     if isinstance(it, dict)]
+            out |= {str(len(part)) for name, part in next_steps.owner_parts(items, head) if name is not None}
         out |= {str(len(brief._texts(c.get("prerequisites")))) for c in brief._list(plan.get("changes"))
                 if isinstance(c, dict)}
     except Exception:  # a damaged file derives nothing
@@ -365,12 +373,16 @@ class Run:
 
 
 def voice(ch):
-    """(what it is, the fix) when the voice rules forbid this character, else None."""
+    """(what it is, the fix) when the voice rules forbid this character, else None. A character brief.html marks
+    is UNSEEN (a control, or one that reorders or hides the text around it); a format character it shows as
+    itself is no problem anywhere."""
     code = ord(ch)
     if code in VOICE:
         return VOICE[code]
     if code < 0x80:
-        return None if ch == "\t" or " " <= ch <= "~" else VOICE_BY_CLASS["Cc"]
+        return None if ch == "\t" or " " <= ch <= "~" else UNSEEN[1]
+    if brief.marked(ch):
+        return UNSEEN[1] if unicodedata.category(ch) == "Cc" else UNSEEN[0]
     cat = unicodedata.category(ch)
     if cat == "Nd":
         return ("a non-ASCII digit", "write 0-9")
@@ -407,7 +419,10 @@ def punctuation(line, run):
         what, fix = rule
         if rule in UNSEEN:
             fix = "write it as brief.html shows it, [U+%04X], or delete it" % ord(ch)
-        why = ("%s: %s" % (what, fix)) if what == "a non-ASCII digit" else             "%s: the voice rules forbid it, %s" % (what, fix)
+        if what == "a non-ASCII digit":
+            why = "%s: %s" % (what, fix)
+        else:
+            why = "%s: the voice rules forbid it, %s" % (what, fix)
         found.append((at, "U+%04X" % ord(ch), why))
     return found
 
