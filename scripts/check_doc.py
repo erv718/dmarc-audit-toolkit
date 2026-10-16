@@ -27,11 +27,12 @@ own files, and names every token in the copy the run does not carry:
     character it renders (&mdash;). A stretch the copy quotes ("...") that
     the run's files hold word for word - a subject line as mail wrote it -
     keeps its own punctuation
-  - the characters brief.html shows as a marker (brief.marked: one that
-    reorders or hides the words around it, such as U+202E or U+200B, and a
-    control), named wherever they are, quoted data too; the format
-    characters real mail text carries (a joiner in an emoji, a direction
-    mark in a right-to-left subject, a soft hyphen) are text, never named
+  - the characters brief.html shows as a marker (brief.marked: a format
+    character that reorders or hides the words around it, such as U+202E,
+    U+200B or U+2063, and a control), named wherever they are, quoted data
+    too; the format characters real mail text carries (a joiner in an
+    emoji, a direction mark in a right-to-left subject, a soft hyphen, the
+    tags of a flag) are text, never named
 
 It checks what the copy says, not what it covers: 'P-02 to P-14' passes
 when both ends are real plan ids, whichever rows lie between them.
@@ -401,8 +402,11 @@ def punctuation(line, run):
     spans = [(m.start(1), m.end(1)) for m in QUOTED_RX.finditer(line)]
     starts = [a for a, _ in spans]
     verdicts, lookups = {}, 0
+    flag = brief.flag_tags(line)  # the tags of a flag's emoji sequence are text, as brief.html shows them
     for m in ODD_RX.finditer(line):
         ch = m.group(0)
+        if m.start() in flag:
+            continue
         rule = voice(ch)
         key = "digit" if rule and rule[0] == "a non-ASCII digit" else ch
         if rule is None or key in reported:

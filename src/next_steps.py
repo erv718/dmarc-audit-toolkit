@@ -164,8 +164,8 @@ PREREQ_REWORDS = (
      lambda m: "the %s mail-log failure%s from our own systems %s fixed%s"
      % (m.group(1), "" if m.group(1) == "1" else "s", "is" if m.group(1) == "1" else "are",
         (" (%s more are formally excepted in audit.toml)" % m.group(2)) if m.group(2) else "")),
-    (re.compile(r"^aggregate reports: (\S+) sends (\d+) message\(s\) as (\S+) and fails"),
-     lambda m: "the sender at %s (%s messages as %s) is fixed" % (m.group(1), m.group(2), m.group(3))),
+    (re.compile(r"^aggregate reports: (\S+) sends (\d+)(?: of its (\d+))? message\(s\) as (\S+) and fails"),
+     lambda m: "the sender at %s (%s) is fixed" % (m.group(1), _as_share(m.group(2), m.group(3), m.group(4), True))),
     (re.compile(r"^no failure evidence in this run"),
      lambda m: "a mail log or aggregate reports are supplied to the audit"),
     (re.compile(r"^no aligned-DKIM evidence in this run"),
@@ -552,9 +552,105 @@ def _dominant(labels):
     return label if n * 2 > sum(c.values()) else "mixed"
 
 
-def _from_verdicts(genuine, headline=None):
+def _majority(counts):
+    """One likely label for {label: failures}: the label that holds more
+    than half of them, else 'mixed' (_dominant, counted per message)."""
+    total = sum(n for n in counts.values() if n > 0)
+    if not total:
+        return "unknown"
+    label, n = max(counts.items(), key=lambda kv: kv[1])  # at most one label can hold more than half
+    return label if n * 2 > total else "mixed"
+
+
+def _envelopes(counts, headline=None, messages=None):
+    """[{name, count}] for the envelopes one sender's failures came through
+    ({envelope: failures}), the busiest first: the most failures, then the
+    messages behind them (messages: {envelope: n}, when counted), a tie by
+    the envelope in the one order (audit.domain_key with the headline)."""
+    messages = messages or {}
+    return [{"name": k, "count": n} for k, n in sorted(
+        counts.items(), key=lambda kv: (-kv[1], -(messages.get(kv[0]) or 0), audit.domain_key(kv[0], headline), kv[0]))]
+
+
+def _messages_of(obj, name_keys):
+    """{name: logical messages} over every row of a census list or map -
+    the clean rows too, so an address counts every message it sent, as
+    MAILFLOW-001's rank counts it (audit.rank_top_senders: the messages
+    behind a sender break a tie on its failures); rows that do not say are
+    left out."""
+    if isinstance(obj, dict):
+        rows = [dict(v, _key=str(k)) for k, v in obj.items() if isinstance(v, dict)]
+    else:
+        rows = [x for x in obj if isinstance(x, dict)] if isinstance(obj, list) else []
+    out = Counter()
+    for it in rows:
+        name = next((str(it[k]) for k in name_keys if it.get(k) not in (None, "")), None)
+        n = _n(it.get("messages"))
+        if name is not None and n is not None and n > 0:
+            out[name.strip().lower()] += n
+    return out
+
+
+def _per_address(streams, messages=None, headline=None):
+    """The census's sender streams - one per address, From domain and
+    envelope - merged per address, as a reader sees a sender in From and as
+    MAILFLOW-001 counts one: an address spoofed through five envelope
+    domains is one sender with all its failures, never five notes of a
+    fifth each. The failures, the excepted counts and the label counts
+    (likely_counts) add up; the label is the one that holds more than half
+    of the failures, else 'mixed'; the messages behind the address are
+    every message it sent (messages: {address: n} over the whole census,
+    its clean streams included - what the ranks read), else its streams'
+    own. The busiest stream (the most failures, then messages, then its
+    envelope in the one order) gives the envelope, the From domain and the
+    subjects, and envelopes lists every envelope it came through, the
+    busiest first, when there are two or more (envelope_text names them).
+    Worst first, a tie in the one order (_ranked)."""
+    messages = messages or {}
+    by = OrderedDict()
+    for s in streams:
+        by.setdefault(s["name"], []).append(s)
+    out = []
+    for name, group in by.items():
+        group = sorted(group, key=lambda s: (-s["count"], -(_n(s.get("messages")) or 0),
+                                             audit.domain_key(str(s.get("envelope") or ""), headline),
+                                             str(s.get("envelope") or "")))
+        e = dict(group[0])
+        if len(group) > 1:
+            likes, envs, env_msgs = Counter(), Counter(), Counter()
+            for s in group:
+                split = s.get("likely_counts") if isinstance(s.get("likely_counts"), dict) else None
+                if split and sum(_n(v) or 0 for v in split.values()) == s["count"]:
+                    for label, n in split.items():
+                        likes[_likely(label)] += _n(n) or 0
+                else:  # a stream that does not split its failures: all of them under its own label
+                    likes[_likely(s.get("likely"))] += s["count"]
+                env = str(s.get("envelope") or "(blank)")
+                envs[env] += s["count"]
+                env_msgs[env] += _n(s.get("messages")) or 0
+            e["count"] = sum(s["count"] for s in group)
+            e["likely_counts"] = {k: n for k, n in sorted(likes.items()) if n > 0}
+            e["likely"] = _majority(e["likely_counts"])
+            if "likely_after" in e:
+                e["likely_after"] = e["likely"]
+            for key in ("excepted", "excepted_delivered"):
+                if any(_n(s.get(key)) is not None for s in group):
+                    e[key] = sum(_n(s.get(key)) or 0 for s in group)
+            if all(_n(s.get("messages")) is not None for s in group):
+                e["messages"] = sum(_n(s["messages"]) for s in group)
+            e["envelopes"] = _envelopes(envs, headline, env_msgs)
+        if messages.get(name):
+            e["messages"] = messages[name]
+        out.append(e)
+    return _ranked(out, headline)
+
+
+def _from_verdicts(genuine, headline=None, messages=None):
     """(envelopes, senders) worst first (_ranked, the headline's organization first on a tie), from the
-    genuine failures themselves when the report carries no census."""
+    genuine failures themselves when the report carries no census. A sender is one address, whatever
+    envelopes it came through (the busiest gives its envelope; envelopes names them all, the busiest first,
+    when there are two or more), with the messages behind it when the caller counted them (messages:
+    {address: every message it sent}, the figure a tie on the failures is broken by)."""
     by_env, by_sender = OrderedDict(), OrderedDict()
     for v in genuine:
         env = (v.get("envelope_domain") or "(no envelope domain)").lower()
@@ -568,12 +664,20 @@ def _from_verdicts(genuine, headline=None):
         s["labels"].append(v.get("likely"))
         s["envelopes"][env] += 1
         s["subjects"][v.get("subject") or "(no subject)"] += 1
+    messages = messages or {}
     envs = [{"name": k, "count": len(e["labels"]), "likely": _dominant(e["labels"]),
              "sender_count": len(e["senders"]), "senders": [s for s, _ in e["senders"].most_common(3)],
              "subjects": [s for s, _ in e["subjects"].most_common(2)]} for k, e in by_env.items()]
-    senders = [{"name": k, "count": len(s["labels"]), "likely": _dominant(s["labels"]),
-                "domain": s["domain"], "envelope": s["envelopes"].most_common(1)[0][0],
-                "subjects": [x for x, _ in s["subjects"].most_common(2)]} for k, s in by_sender.items()]
+    senders = []
+    for k, s in by_sender.items():
+        through = _envelopes(s["envelopes"], headline)
+        e = {"name": k, "count": len(s["labels"]), "likely": _dominant(s["labels"]), "domain": s["domain"],
+             "envelope": through[0]["name"], "subjects": [x for x, _ in s["subjects"].most_common(2)]}
+        if len(through) > 1:
+            e["envelopes"] = through
+        if messages.get(k):
+            e["messages"] = messages[k]
+        senders.append(e)
     return _ranked(envs, headline), _ranked(senders, headline)
 
 
@@ -671,14 +775,16 @@ def _carries_exceptions(obj):
     return any(isinstance(r, dict) and "excepted" in r for r in rows)
 
 
-def _after_exceptions(entries, what, headline=None):
+def _after_exceptions(entries, what, headline=None, messages=None):
     """(left, excepted) for census entries that carry the exception counts:
     each entry keeps the failures no exception covers, labelled by what is
     left (likely_after), and an envelope names the senders still failing
     through it; an entry with nothing left drops out. excepted: one
     {name, domain, envelope, count} per stream an exception covered, so the
     excepted messages are listed once, as such. Both worst first, a tie in
-    the one order (_ranked)."""
+    the one order (_ranked; messages: {address: every message it sent},
+    which breaks a tie on the excepted count as it does on the failures)."""
+    messages = messages or {}
     left, excepted = [], []
     for e in entries:
         n_exc = min(e.get("excepted") or 0, e["count"])
@@ -695,22 +801,48 @@ def _after_exceptions(entries, what, headline=None):
             e["senders"] = [e["sample_sender_after"]] if e.get("sample_sender_after") else []
         left.append(e)
     left = _ranked(left, headline)
-    excepted.sort(key=lambda e: audit.sender_rank(e["name"], e["count"], headline) + (str(e.get("envelope") or ""),))
+    excepted.sort(key=lambda e: audit.sender_rank(e["name"], e["count"], headline, messages.get(e["name"]))
+                  + (str(e.get("envelope") or ""),))
     return left, excepted
+
+
+def _excepted_per_address(excepted, messages=None, headline=None):
+    """The excepted streams ({name, domain, envelope, count}, the worst
+    first) one per address, as every list of senders counts one: an address
+    an exception covers through two envelopes is one entry with both counts
+    added up (its busiest stream's domain and envelope kept), never named
+    twice in the line that lists them. The most first, then by the messages
+    behind them, a tie in the one order (audit.sender_rank)."""
+    messages = messages or {}
+    by = OrderedDict()
+    for e in excepted:
+        if e["name"] in by:
+            by[e["name"]]["count"] += e["count"]
+        else:
+            by[e["name"]] = dict(e)
+    return sorted(by.values(), key=lambda e: audit.sender_rank(e["name"], e["count"], headline, messages.get(e["name"]))
+                  + (str(e.get("envelope") or ""),))
 
 
 def maillog_view(report, headline=None):
     """What the document needs from the mail log: summaries when the report
     carries them, else derived from the verdicts. None when there is no mail log.
     The envelope domains, the senders, the senders delivered despite failing
-    and the excepted streams each run worst first, a tie in the one order
-    every list of names follows (_ranked: the domain in audit.domain_key
-    order, the headline's organization first, then the name).
+    and the excepted streams each run worst first, then by the messages
+    behind them (every message the address sent, as MAILFLOW-001's rank
+    reads it), a tie in the one order every list of names follows (_ranked:
+    the domain in audit.domain_key order, the headline's organization
+    first, then the name). A sender is one address (by_sender): the
+    census's streams of one address through several envelopes merge
+    (_per_address), and sender_streams keeps them apart for what needs the
+    envelope each came in by.
 
     The lists that name senders are what the formal exceptions left: the
     census counts the excepted failures per stream (audit.py marks every
     verdict an exception covers), so each stream loses exactly its own, and
-    the excepted messages are listed once, in view["excepted"]. A report
+    the excepted messages are listed once, in view["excepted"] (one entry
+    per stream) and view["excepted_by_address"] (one per address, what a
+    line names: _excepted_per_address). A report
     whose census does not carry those counts (written before audit.py marked
     them) is not reduced at all: nothing in it says which stream an
     exception covered, so its excepted total (excepted_unsplit) can only be
@@ -742,40 +874,51 @@ def maillog_view(report, headline=None):
     view["by_likely"] = {k: _n(v) or 0 for k, v in (by_likely or {}).items()}
 
     census = ml.get("census")
-    by_env = by_sender = None
+    by_env = by_sender = streams = None
     counted = False  # the excepted failures are counted per stream: what is left can be named exactly
     excepted = []
+    # every message each address sent, passing ones and clean streams included: what breaks a tie on the failures
+    # in every list of senders here, as it does in MAILFLOW-001's (the census's rows, else the verdicts)
+    sent = Counter((v.get("sender") or "(no sender)").lower() for v in verdicts)
     if isinstance(census, dict):
         env_obj = next((census[k] for k in ("by_envelope", "envelope", "env", "envelopes") if k in census), None)
         snd_obj = next((census[k] for k in ("by_sender", "sender", "senders", "addr") if k in census), None)
         by_env = _entries(env_obj, ENV_KEYS) if env_obj is not None else None
         by_sender = _entries(snd_obj, SENDER_KEYS) if snd_obj is not None else None
+        sent = _messages_of(snd_obj, SENDER_KEYS) or sent
         counted = _carries_exceptions(snd_obj) and by_sender is not None
         if counted:
-            by_sender, excepted = _after_exceptions(by_sender, "sender", headline)
+            by_sender, excepted = _after_exceptions(by_sender, "sender", headline, sent)
             if by_env is not None:
                 by_env = _after_exceptions(by_env, "envelope", headline)[0]
+        if by_sender is not None:
+            # the census counts streams (address, From domain, envelope); a reader counts addresses, as
+            # MAILFLOW-001 does: the streams stay apart only for what needs the envelope each came in by
+            streams = _ranked(by_sender, headline)
+            by_sender = _per_address(by_sender, sent, headline)
     elif isinstance(census, list):
         by_env = _entries(census, ENV_KEYS)
     if by_env is not None or by_sender is not None:
         view["basis"] = "census"
     if (by_env is None or by_sender is None) and verdicts:
         # the verdicts themselves: the ones an exception covers carry its mark and are listed apart
-        v_env, v_snd = _from_verdicts([v for v in genuine if not v.get("excepted")], headline)
+        v_env, v_snd = _from_verdicts([v for v in genuine if not v.get("excepted")], headline, sent)
         if by_sender is None:
             counted = any("excepted" in v for v in genuine)
             gone = Counter(((v.get("sender") or "(no sender)").lower(), (v.get("domain") or "").lower(),
                             (v.get("envelope_domain") or "(blank)").lower()) for v in genuine if v.get("excepted"))
             excepted = [{"name": s, "domain": d, "envelope": e, "count": n}
                         for (s, d, e), n in sorted(gone.items(), key=lambda kv: audit.sender_rank(
-                            kv[0][0], kv[1], headline) + kv[0])]
+                            kv[0][0], kv[1], headline, sent.get(kv[0][0])) + kv[0])]
         by_env = by_env if by_env is not None else v_env
         by_sender = by_sender if by_sender is not None else v_snd
         view["basis"] = view["basis"] or "verdicts"
     view["by_envelope"] = _ranked(by_env or [], headline)
     view["by_sender"] = _ranked(by_sender or [], headline)
+    view["sender_streams"] = streams  # None when the senders come from the verdicts (one entry per address)
     view["census_missing"] = by_env is None and by_sender is None
     view["excepted"] = excepted
+    view["excepted_by_address"] = _excepted_per_address(excepted, sent, headline)  # what a line names
     view["exceptions_counted"] = counted
     gate = report.get("gate") if isinstance(report.get("gate"), dict) else {}
     gate_exc = gate.get("exceptions") if isinstance(gate.get("exceptions"), dict) else {}
@@ -816,9 +959,11 @@ def maillog_view(report, headline=None):
                     for reason, k in r["delivered_by"].items():
                         if reason and (_n(k) or 0) > 0:
                             by.setdefault(s, Counter())[str(reason)] += _n(k)
+    # ranked as every list of senders is: the delivered failures, then every message the sender sent
     view["ddf_senders"] = [dict({"name": s, "count": n, "domain": (s.rpartition("@")[2] if "@" in s else ""),
                                  "envelope": env_of.get(s, "")}, **({"by": dict(by[s])} if by.get(s) else {}))
-                           for s, n in sorted(ddf.items(), key=lambda kv: audit.sender_rank(kv[0], kv[1], headline))]
+                           for s, n in sorted(ddf.items(), key=lambda kv: audit.sender_rank(kv[0], kv[1], headline,
+                                                                                             sent.get(kv[0])))]
     view["delivered_excepted"] = ddf_excepted
     # the whole log's overrides, over every delivered failure as the count beside them (excepted or not); the
     # export recorded the overrides when the counter is there (empty when none was named) or a verdict carries one
@@ -866,7 +1011,8 @@ def _by_address(entries, delivered=None, headline=None):
     address with nothing left drops out. delivered: {address: messages
     delivered despite failing} (the view's ddf_senders), carried along so
     a spoof the policy was supposed to stop is never called handled. Worst
-    first, a tie in the one order (_ranked)."""
+    first, then by the messages behind them (the entries' own, added up),
+    a tie in the one order (_ranked)."""
     merged = {}
     delivered = delivered or {}
     for s in entries:
@@ -874,6 +1020,8 @@ def _by_address(entries, delivered=None, headline=None):
         e = merged.setdefault(name, {"name": name, "count": 0, "domain": s.get("domain"), "likes": Counter(),
                                      "delivered": _n(delivered.get(name)) or 0})
         e["count"] += _n(s.get("count")) or 0
+        if _n(s.get("messages")) is not None:
+            e["messages"] = (e.get("messages") or 0) + _n(s["messages"])
         e["likes"].update(_split(s))
     out = []
     for e in merged.values():
@@ -886,15 +1034,16 @@ def _by_address(entries, delivered=None, headline=None):
 
 def _groups(senders, headline=None):
     """{own, spoof, unclear} for the one-liner: every address with what it
-    has left under that group, worst first (a tie in the one order,
-    _ranked), with how many of its messages reached a mailbox despite
-    failing."""
+    has left under that group, worst first (then by the messages behind it,
+    a tie in the one order, _ranked), with how many of its messages
+    reached a mailbox despite failing."""
     groups = {OWN: [], SPOOF: [], UNCLEAR: []}
     for s in senders:
         for label, n in (s.get("likes") or {s.get("likely"): s.get("count") or 0}).items():
             if n > 0:
                 groups[_group(label)].append({"name": s["name"], "count": n, "domain": s.get("domain"),
-                                              "likely": _group(label), "delivered": s.get("delivered") or 0})
+                                              "likely": _group(label), "delivered": s.get("delivered") or 0,
+                                              "messages": s.get("messages")})
     return {k: _ranked(g, headline) for k, g in groups.items()}
 
 
@@ -941,14 +1090,24 @@ def own_domain_view(report, view, org):
         for s in senders:
             cnt.update(s["likes"])
         by_likely = {k: cnt.get(k, 0) for k in (SPOOF, OWN, UNCLEAR)}
-    # the busiest senders among the failures no exception covers, when the report counts them (top_senders_after)
+    # the busiest senders among the failures no exception covers, when the report counts them (top_senders_after),
+    # a tie on the failures broken by the messages behind each, as audit.py ranked them
     tops = c.get("top_senders_after") if isinstance(c.get("top_senders_after"), list) and reduced else c.get("top_senders")
+    sent = {s["name"]: s.get("messages") for s in senders}
+    tops = sorted(_entries(tops, SENDER_KEYS) or [],
+                  key=lambda e: audit.sender_rank(e["name"], e["count"], None, sent.get(e["name"])))
     return {"genuine_failures": _n(c.get("genuine_failures")) or 0, "logical_messages": _n(c.get("logical_messages")),
             "delivered_despite_fail": _n(c.get("delivered_despite_fail")), "excepted_reduced": reduced,
             "by_likely": {k: _n(v) or 0 for k, v in by_likely.items()} if by_likely else None,
-            "top_senders": _entries(tops, SENDER_KEYS) or [], "senders": senders,
+            "top_senders": tops, "senders": senders,
             "subdomains": subs, "window": c.get("window") if isinstance(c.get("window"), dict) else None,
             "excepted": excepted}
+
+
+def _by_address_of(view):
+    """The view's excepted senders as a line names them: one per address (excepted_by_address), else the
+    streams (a view built before it had them)."""
+    return view.get("excepted_by_address") or view.get("excepted") or []
 
 
 def _excepted_names(entries, cap=3):
@@ -1402,28 +1561,41 @@ def reword_prereq(text):
 
 
 LOOKUP_FIRST = re.compile(r"^look up _dmarc\.\S+ first:")
-# the plan's prerequisite for one failing outside-view source (plan.evidence_for), one per source
-STREAM_PREREQ_RX = re.compile(r"^aggregate reports: (\S+) sends (\d+) message\(s\) as (\S+) and fails")
+# the plan's prerequisite for one failing outside-view source (plan.evidence_for), one per source and From domain:
+# 'sends 25 of its 85 message(s) as example.org' when it sends as other domains too, 'sends 85 message(s)' when not
+STREAM_PREREQ_RX = re.compile(r"^aggregate reports: (\S+) sends (\d+)(?: of its (\d+))? message\(s\) as (\S+) and fails")
+
+
+def _as_share(n, total, dom, unit=False):
+    """'25 of its 85 as example.org' (or '25 of its 85 messages as ...' with
+    the unit): what one source sends as one From domain, and all it sends
+    beside it when that is more; '85 as example.org' when it is all."""
+    word = " messages" if unit else ""
+    if total and str(total) != str(n):
+        return "%s of its %s%s as %s" % (n, total, word, dom)
+    return "%s%s as %s" % (n, word, dom)
 
 
 def reword_prereqs(texts):
     """Every plan prerequisite reworded as its condition (reword_prereq), with
     the per-source aggregate-report ones folded into one condition that names
-    the busiest: a busy tenant's reject row carried ninety of them, and a
-    sentence with ninety clauses is not a sentence anyone reads."""
+    the busiest, by what each sends as the row's domain (a source that also
+    sends as other domains says how much it sends in all beside it): a busy
+    tenant's reject row carried ninety of them, and a sentence with ninety
+    clauses is not a sentence anyone reads."""
     out, streams = [], []
     for p in texts:
         m = STREAM_PREREQ_RX.match(p or "")
         if m:
-            streams.append((int(m.group(2)), m.group(1), m.group(3)))
+            streams.append((int(m.group(2)), m.group(1), m.group(4), m.group(3)))
         else:
             out.append(reword_prereq(p))
     if len(streams) == 1:
-        n, ip, dom = streams[0]
-        out.append("the sender at %s (%d messages as %s) is fixed" % (ip, n, dom))
+        n, ip, dom, total = streams[0]
+        out.append("the sender at %s (%s) is fixed" % (ip, _as_share(n, total, dom, True)))
     elif streams:
         streams.sort(key=lambda s: (-s[0], s[1]))
-        top = ", ".join("%s (%d as %s)" % (ip, n, dom) for n, ip, dom in streams[:STREAM_NAMES])
+        top = ", ".join("%s (%s)" % (ip, _as_share(n, total, dom)) for n, ip, dom, total in streams[:STREAM_NAMES])
         more = len(streams) - STREAM_NAMES
         out.append("the %d failing outside-view senders are fixed or formally excepted (busiest: %s%s)"
                    % (len(streams), top, ("; %d more in report.md" % more) if more > 0 else ""))
@@ -1788,10 +1960,11 @@ def _spoof_clause(policy, delivered=0):
 
 
 def _part(senders, labels):
-    """Each address with its failures under these groups, worst first, and
-    how many of its messages reached a mailbox despite failing."""
+    """Each address with its failures under these groups, worst first (then
+    by the messages behind them, as every list of senders), and how many of
+    its messages reached a mailbox despite failing."""
     out = [{"name": s["name"], "count": sum((s.get("likes") or {}).get(k, 0) for k in labels),
-            "delivered": s.get("delivered") or 0} for s in senders]
+            "delivered": s.get("delivered") or 0, "messages": s.get("messages")} for s in senders]
     return _ranked(s for s in out if s["count"] > 0)  # one organization's addresses: no headline needed
 
 
@@ -2408,6 +2581,53 @@ def where_we_stand(report, view, trend, window=None, policy=None, headline=None)
     return data
 
 
+SUBJECT_CUT = 60  # characters of a subject a line of this document quotes; the whole one is in next_steps.json
+ENVELOPES_NAMED = 2  # envelopes a sender's line names, the busiest first, before the rest are counted
+
+
+def cut_subject(text, limit=SUBJECT_CUT):
+    """A subject line as a line quotes it: whole when it is limit characters
+    or fewer, else cut at the last space within them, with '...' after -
+    so a number in it (an account or an invoice reference) is shown whole
+    or not at all, never in part. A first word longer than the limit is
+    shown whole. brief.py cuts its table's subjects the same way."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    m = re.match(r"(.{0,%d}\S)\s" % max(limit - 1, 0), text, re.S)
+    head = m.group(1) if m else re.match(r"\s*\S*", text).group(0)
+    return head.rstrip() + "..."
+
+
+def envelope_parts(e):
+    """([(name, count)], more): the envelopes one sender's failures came
+    through, as the lines name them - the ENVELOPES_NAMED busiest, each with
+    its count, and how many more; a sender with one envelope is [(name,
+    None)], and one with none []."""
+    envs = [x for x in (e.get("envelopes") if isinstance(e.get("envelopes"), list) else [])
+            if isinstance(x, dict) and x.get("name")]
+    if len(envs) > 1:
+        return ([(str(x["name"]), _n(x.get("count"))) for x in envs[:ENVELOPES_NAMED]],
+                max(len(envs) - ENVELOPES_NAMED, 0))
+    env = e.get("envelope")
+    return ([(str(env), None)] if env else []), 0
+
+
+def envelope_text(e):
+    """'envelope example.com', or for an address whose failures came through
+    several envelope domains 'envelopes mailer.vendor-one.invalid x6 and
+    relay.vendor-two.invalid x6' ('..., b x4 and 3 more' past
+    ENVELOPES_NAMED), so one sender is one line and no envelope goes
+    unsaid; '' without one."""
+    named, more = envelope_parts(e)
+    if not named:
+        return ""
+    if len(named) == 1 and named[0][1] is None:
+        return "envelope %s" % named[0][0]
+    items = [("%s x%d" % (n, c)) if c is not None else n for n, c in named] + (["%d more" % more] if more else [])
+    return "envelopes " + ", ".join(items[:-1]) + " and " + items[-1]
+
+
 def _entry_bullet(e, what):
     hook = "**%s - %d %s**" % (e["name"], e["count"], _plural(e["count"], "message"))
     words = LIKELY_WORDS.get(e.get("likely") or "unknown", "unclear")
@@ -2418,11 +2638,11 @@ def _entry_bullet(e, what):
             detail.append("%d sender %s" % (n, _plural(n, "address", "addresses")))
         if isinstance(e.get("senders"), list) and e["senders"]:
             detail.append("such as %s" % ", ".join(str(s) for s in e["senders"][:2]))
-    elif e.get("envelope"):
-        detail.append("envelope %s" % e["envelope"])
+    elif envelope_text(e):  # the envelope it came in by, or every envelope an address came through
+        detail.append(envelope_text(e))
     subs = e.get("subjects") if isinstance(e.get("subjects"), list) else []
     if subs:
-        detail.append('subjects like "%s"' % str(subs[0])[:60])
+        detail.append('subjects like "%s"' % cut_subject(subs[0]))
     return "%s %s%s" % (hook, words, (" (" + "; ".join(detail) + ")") if detail else "")
 
 
@@ -2474,7 +2694,7 @@ def what_is_failing(report, view, headline=None):
             if view.get("excepted"):
                 n = sum(e["count"] for e in view["excepted"])
                 lines.append("Every genuine failure the census names this run is formally excepted in audit.toml: "
-                             "%d %s (%s)." % (n, _plural(n, "message"), _excepted_names(view["excepted"])))
+                             "%d %s (%s)." % (n, _plural(n, "message"), _excepted_names(_by_address_of(view))))
                 data["excepted"] = list(view["excepted"])
             else:
                 lines.append("No genuine failures in the mail log this run - every message that failed also had a "
@@ -2499,8 +2719,14 @@ def what_is_failing(report, view, headline=None):
                 lines.pop()
         if view.get("excepted") and "excepted" not in data:  # listed once, as what they are: not failures to fix
             n = sum(e["count"] for e in view["excepted"])
-            lines.append("Formally excepted in audit.toml and not counted above: %d %s (%s)." % (
-                n, _plural(n, "message"), _excepted_names(view["excepted"])))
+            text = "Formally excepted in audit.toml and not counted above: %d %s (%s)." % (
+                n, _plural(n, "message"), _excepted_names(_by_address_of(view)))
+            # an item of the sender list it qualifies, as the outside view's is: a plain line right under a list
+            # reads as part of its last item in Markdown, so one that stands alone gets a blank line first
+            if lines and lines[-1].startswith("- "):
+                lines.append("- " + text)
+            else:
+                lines += ([""] if lines else []) + [text]
             data["excepted"] = list(view["excepted"])
     if rua:
         fs = [s for s in (rua.get("failing_streams") or []) if isinstance(s, dict)]
@@ -2926,8 +3152,8 @@ def build_actions(report, plan, view, owners, headline=None):
         own_all = _ranked(own_all, headline)  # the cap below keeps the headline's senders on a tie
         for s in own_all[:SENDER_ITEMS_CAP]:
             hook = "%s - %d %s" % (s["name"], s["count"], _plural(s["count"], "message"))
-            subj = ('subjects like "%s"' % str(s["subjects"][0])[:60]) if s.get("subjects") else ""
-            env = ("envelope %s" % s["envelope"]) if s.get("envelope") else ""
+            subj = ('subjects like "%s"' % cut_subject(s["subjects"][0])) if s.get("subjects") else ""
+            env = envelope_text(s)
             detail = "; ".join(x for x in (subj, env) if x)
             if s["likely"] == OWN:
                 action = ("DKIM-sign this sender (or align its SPF): the messages failed with no passing copy "
@@ -2937,8 +3163,10 @@ def build_actions(report, plan, view, owners, headline=None):
                           "heuristic could not tell spoof from our own system")
             if detail:
                 action += " (%s)" % detail
-            items.append({"kind": "sender", "keys": [s["name"], s.get("domain"), s.get("envelope")], "ref": ref,
-                          "sender": s["name"], "hook": hook, "action": action,
+            # matched to an owner by the address, its domain, then each envelope it came through, the busiest first
+            through = [str(x["name"]) for x in s.get("envelopes") or [] if isinstance(x, dict) and x.get("name")]
+            items.append({"kind": "sender", "ref": ref, "sender": s["name"], "hook": hook, "action": action,
+                          "keys": [s["name"], s.get("domain"), s.get("envelope")] + through,
                           "domains": _ordered([s.get("domain") or s["name"]], headline)})
         rest = own_all[SENDER_ITEMS_CAP:]
         if rest:
@@ -2951,11 +3179,16 @@ def build_actions(report, plan, view, owners, headline=None):
         if spoof:
             total = sum(s["count"] for s in spoof)
             k = len({s["name"] for s in spoof})
-            # "most" counts messages: a one-message part split off a mixed stream weighs one, not a stream
+            # "most" counts messages: a one-message part split off a mixed stream weighs one, not a stream; each
+            # census stream counts under the envelope it came in by, so an address spoofed through five envelopes
+            # credits each its own share, never all five to the busiest
             doms, envs = Counter(), Counter()
-            for s in spoof:
-                doms[s.get("domain") or ""] += s["count"]
-                envs[s.get("envelope") or ""] += s["count"]
+            parts = ([(s, _split(s).get(SPOOF, 0)) for s in view["sender_streams"]]
+                     if view.get("sender_streams") is not None else [(s, s["count"]) for s in spoof])
+            for s, n in parts:
+                if n > 0:
+                    doms[s.get("domain") or ""] += n
+                    envs[s.get("envelope") or ""] += n
             top_dom, top_env = doms.most_common(1)[0][0], envs.most_common(1)[0][0]
             hook = "%d %s from %d %s that %s like spoofing" % (total, _plural(total, "message"), k,
                                                                  _plural(k, "address", "addresses"),

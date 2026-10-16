@@ -1233,8 +1233,36 @@ def _listed(names, cap=6):
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
+SIGNALS_CAP = 120  # characters of a failing source's signals a prerequisite quotes; the rest are in report.json
+
+
+def quoted_signals(signals, cap=SIGNALS_CAP):
+    """A failing source's likely_signals as a prerequisite quotes them:
+    whole signals joined by '; ' while they fit in cap characters - the
+    first always, cut at a word with '...' when it alone is longer - then
+    how many were left out ('1 more signal in report.json'), never a signal
+    cut mid-word ('SPF passes for envelope domai')."""
+    texts = [str(x) for x in signals]
+    shown, used = [], 0
+    for t in texts:
+        if shown and used + 2 + len(t) > cap:
+            break
+        if not shown and len(t) > cap:
+            import next_steps  # here, not at the top: the one rule for a quote cut at a word
+            t = next_steps.cut_subject(t, cap)
+        shown.append(t)
+        used += len(t) + (2 if len(shown) > 1 else 0)
+    left = len(texts) - len(shown)
+    return "; ".join(shown + (["%d more signal%s in report.json" % (left, "" if left == 1 else "s")] if left else []))
+
+
 def evidence_for(report, domain):
-    """What the report proves about this domain's legitimate senders."""
+    """What the report proves about this domain's legitimate senders. A
+    failing aggregate-report source is counted by what it sends as this
+    domain (the per-source table, audit.from_counts), with all it sends
+    beside it when it sends as other domains too: 'sends 25 of its 85
+    message(s) as example.org', never the whole 85 for each of its domains;
+    the whole count only when the table does not name the source."""
     ev = {"legit_failing": [], "spf_only": [], "has_maillog": False, "has_rua": False,
           "outbound_seen": None, "dkim_evidence": False}
     audited = _audited(report)
@@ -1279,6 +1307,8 @@ def evidence_for(report, domain):
         ev["has_rua"] = True
         if _measured(_dict(rua.get("totals")).get("messages")):
             ev["dkim_evidence"] = True
+        import audit  # here, not at the top: audit.py imports this module
+        sent_as = audit.from_counts(rua)  # {source: {From domain: messages}}, the aggregate reports' own table
         for s in _rows(rua.get("failing_streams")):
             if not isinstance(s, dict) or str(s.get("source_ip")) in excepted_ips:
                 continue
@@ -1287,10 +1317,12 @@ def evidence_for(report, domain):
             # Anything not labelled a spoof is a sender to fix or except before p= moves (the gate rule).
             if domain in froms and s.get("likely") != "likely_spoof":
                 n = _measured(s.get("count"))
+                mine = _measured(_dict(sent_as.get(str(s.get("source_ip")))).get(domain))
+                sent = ("%d of its %d" % (mine, n) if n is not None and mine is not None and 0 < mine < n
+                        else (n if n is not None else "?"))
                 ev["legit_failing"].append("aggregate reports: %s sends %s message(s) as %s and fails (%s; %s)"
-                                           % (s.get("source_ip"), n if n is not None else "?", domain,
-                                              s.get("likely") or "unlabelled",
-                                              "; ".join(str(x) for x in _rows(s.get("likely_signals")))[:120]))
+                                           % (s.get("source_ip"), sent, domain, s.get("likely") or "unlabelled",
+                                              quoted_signals(_rows(s.get("likely_signals")))))
         for s in _rows(rua.get("spf_only_senders")):
             froms = [_name(h) for h in _rows(s.get("header_from"))] if isinstance(s, dict) else []
             if not froms or any(_home(h, audited) == domain for h in froms):  # the gate's attribution, mirrored
@@ -2091,7 +2123,11 @@ def build_plan(report, inventory=None, rua=None, ttl=DEFAULT_TTL):
     says why not otherwise). Without it, new records take the rua most
     existing records use and nothing is appended. Rows run in row_key
     order and holds in the domains' order, both led by the organization
-    the status document leads with (next_steps.headline_org)."""
+    the status document leads with (next_steps.headline_org), which the
+    plan records as its headline: a reader that lays the rows out again
+    (brief.py) sorts with it, so the order stays the plan's even when a
+    status document names another organization (next_steps.py
+    --org-name)."""
     if not isinstance(report, dict):
         raise ValueError("the report is not a JSON object (report.json from src/audit.py)")
     dns_docs = report.get("dns")
@@ -2138,7 +2174,8 @@ def build_plan(report, inventory=None, rua=None, ttl=DEFAULT_TTL):
     for c in changes:
         by_host.setdefault(c["zone_host"], []).append(c)
     return {"rua": rua_addr, "rua_is_placeholder": rua_addr == RUA_PLACEHOLDER, "report_address": report_addr,
-            "rua_derived": bool(derived), "ttl": ttl, "domains": all_domains, "changes": changes, "holds": holds,
+            "rua_derived": bool(derived), "ttl": ttl, "domains": all_domains, "headline": headline,
+            "changes": changes, "holds": holds,
             "by_zone_host": {k: [c["id"] for c in v] for k, v in by_host.items()},
             "source_report": report.get("generated_utc")}
 

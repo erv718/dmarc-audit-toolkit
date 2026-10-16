@@ -684,12 +684,17 @@ def _counters(verdicts):
     still hold every one. message_ids: the distinct Message-IDs among them,
     the grain the tenant's mail flow counts at (a logical message is one per
     recipient); None when the verdicts do not carry their Message-ID. The
-    top senders run by their failures, a tie by the sender's domain in the
-    one order (one slice holds one organization's names: no headline is
-    needed), then by address - never in mail-log row order."""
+    top senders run by their failures, then by the messages behind them
+    (every logical message the sender sent in the slice, passing ones
+    included, as the census and MAILFLOW-001 rank them), a tie by the
+    sender's domain in the one order (one slice holds one organization's
+    names: no headline is needed), then by address - never in mail-log row
+    order. The gate's blockers, report.md's and verify.md's per-domain
+    lines and the status document's ask name them in this order."""
     failing = [v for v in verdicts if v.get("genuine_failure")]
     by_likely = Counter(v.get("likely") or "unknown" for v in failing)
     senders = Counter((v.get("sender") or "?").lower() for v in failing)
+    sent = Counter((v.get("sender") or "?").lower() for v in verdicts)
     excepted = [v for v in failing if v.get("excepted")]
     left = Counter((v.get("sender") or "?").lower() for v in failing if not v.get("excepted"))
     exc_likely = Counter(v.get("likely") or "unknown" for v in excepted)
@@ -704,9 +709,9 @@ def _counters(verdicts):
            "delivered_despite_fail": sum(1 for v in verdicts if v.get("delivered_despite_fail")),
            "blocked_despite_pass": sum(1 for v in verdicts if v.get("blocked_despite_pass")),
            "by_likely": {k: by_likely.get(k, 0) for k in dedupe.LIKELY_LABELS},
-           "top_senders": [{"sender": s, "genuine_failures": n} for s, n in top_senders(senders)],
+           "top_senders": [{"sender": s, "genuine_failures": n} for s, n in top_senders(senders, messages=sent)],
            # the busiest senders among the failures no exception covers: the ones still failing
-           "top_senders_after": [{"sender": s, "genuine_failures": n} for s, n in top_senders(left)],
+           "top_senders_after": [{"sender": s, "genuine_failures": n} for s, n in top_senders(left, messages=sent)],
            "excepted": len(excepted),
            "excepted_by_likely": {k: exc_likely.get(k, 0) for k in dedupe.LIKELY_LABELS},
            "excepted_delivered": sum(1 for v in excepted if v.get("delivered_despite_fail"))}

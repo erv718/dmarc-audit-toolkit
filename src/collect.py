@@ -1015,10 +1015,16 @@ def render_todo(report, plan, caveats=()):
                 out[s] = out.get(s, 0) + n - x
         return out, gone
 
+    sent = {}  # every message each sender sent, its clean streams too: what breaks a tie, as in MAILFLOW-001's list
+    for r in rows:
+        s = str(r.get("sender") or "?")
+        sent[s] = sent.get(s, 0) + whole(r.get("messages"))
+
     def tops(senders):
-        """The busiest five, a tie by the sender's domain in the one order, then by address."""
-        return "; ".join("%s x%d" % kv for kv in sorted(senders.items(), key=lambda kv: (
-            -kv[1], audit.domain_key(str(kv[0]).rpartition("@")[2], headline), kv[0]))[:5])
+        """The busiest five as every list of senders ranks them (audit.sender_rank): the count, then the
+        messages behind it, a tie by the sender's domain in the one order, then by address."""
+        return "; ".join("%s x%d" % kv for kv in sorted(senders.items(), key=lambda kv: audit.sender_rank(
+            kv[0], kv[1], headline, sent.get(kv[0])))[:5])
 
     for f in ml.get("findings") or []:
         if f.get("id") not in ("MAILFLOW-001", "MAILFLOW-002"):

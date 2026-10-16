@@ -234,11 +234,12 @@ def md_owner_groups(md):
 
 def page_owner_groups(page):
     """brief.html's owner groups, in the same shape."""
+    import test_r12_brief as rb  # a hook's text, the pieces its names are set in included
     groups = {}
     for block in section_of(page, "owners").split('<div class="owner">')[1:]:
         h3 = re.search(r"<h3>(.*?)</h3>", block).group(1)
         owner = text_of(re.sub(r'<span class="channel">.*?</span>', "", h3)).strip()
-        hooks = lambda part: [text_of(h) for h in re.findall(r'<span class="hook">(.*?)</span>', part)]  # noqa: E731
+        hooks = rb.hooks_in
         pieces = block.split('<div class="org-block">')
         parts = [[None, None, hooks(pieces[0])]] if 'class="hook"' in pieces[0] else []
         for piece in pieces[1:]:
@@ -447,14 +448,17 @@ def test_the_plan_at_a_glance_puts_each_host_name_on_its_own_line_on_a_phone():
 
 
 def test_a_sentence_in_a_per_domain_cell_breaks_a_name_between_its_labels():
-    """The per-domain table's text names records (_dmarc.shop.example.org) whose width set the column's: each name
-    in it now breaks only after its dots, so the table fits above the breakpoint whatever the names; the words and
-    numbers are unchanged, and an IP address or a number with a dot stays whole."""
+    """The per-domain table's text names records (_dmarc.shop.example.org) whose width set the column's: a long
+    name in it breaks only between its labels, so the table fits above the breakpoint whatever the names; a short
+    one (LABEL_KEEP characters or fewer) is one piece, so the line breaks at the space before it (integration round
+    2, N2); the words and numbers are unchanged, and an IP address or a number with a dot stays whole."""
     said = "inherited from _dmarc.shop.example.org; 77.4% of 203.0.113.5's mail; see report.json"
     out = brief.prose(said)
-    assert "_dmarc.<wbr>shop.<wbr>example.<wbr>org;" in out and "report.<wbr>json" in out
+    assert ("<span>_dmarc.</span><wbr><span>shop.</span><wbr><span>example.</span><wbr><span>org</span></span>;" in out
+            and '<span class="d">report.json</span>' in out)
     assert "77.4%" in out and "203.0.113.5" in out and text_of(out) == said
-    assert brief.prose("**P-04** `_dmarc.example.com`") == "<strong>P-04</strong> <code>_dmarc.<wbr>example.<wbr>com</code>"
+    assert brief.prose("**P-04** `_dmarc.example.com`") == (
+        '<strong><span class="d">P-04</span></strong> <code><span class="d">_dmarc.example.com</span></code>')
 
 
 # ------------------------------------------------------------------ B4, B5: the stand's meta, an empty Per domain
@@ -497,14 +501,19 @@ def test_an_empty_per_domain_section_says_so_above_the_audits_notes():
 
 # ------------------------------------------------------------------ B6: real mail text shows as itself, isolated
 
-KEPT = (0x200D, 0x200C, 0x200E, 0x200F, 0x00AD, 0x061C, 0x2061)  # joiners, direction marks, a soft hyphen...
-MARKED = tuple(range(0x202A, 0x202F)) + tuple(range(0x2066, 0x206A)) + (0x200B, 0x2060, 0xFEFF, 0x07, 0x85)
+KEPT = (0x200D, 0x200C, 0x200E, 0x200F, 0x00AD, 0x061C)  # joiners, direction marks, a soft hyphen
+# the embeddings, overrides and isolates, the zero-width space, the word joiner, the BOM, the controls - and every
+# other format character mail text does not need (integration round 2, N4): the invisible operators, the Mongolian
+# vowel separator, the deprecated format controls, the interlinear annotation marks, a tag character outside a flag
+MARKED = tuple(range(0x202A, 0x202F)) + tuple(range(0x2066, 0x206A)) + (0x200B, 0x2060, 0xFEFF, 0x07, 0x85) + (
+    0x2061, 0x2062, 0x2063, 0x2064, 0x180E, 0x206A, 0x206F, 0xFFF9, 0xFFFB, 0xE0001, 0xE0041, 0xE007F)
 
 
 def test_only_the_characters_that_reorder_or_hide_text_show_as_a_marker():
     """Every format character used to show as [U+XXXX]: the joiner inside an emoji, the direction marks of a
-    right-to-left subject, a soft hyphen in a display name. Only the embeddings, overrides and isolates, the
-    zero-width space, the word joiner, the BOM - and the controls - are marked now; the rest render as themselves."""
+    right-to-left subject, a soft hyphen in a display name. Those render as themselves; every other format
+    character - and the controls - is marked (integration round 2 put back the invisible ones the first round let
+    through: U+2061 to U+2064, U+180E, the tag characters...)."""
     for code in KEPT:
         assert brief.clean("a" + chr(code) + "b") == "a" + chr(code) + "b", hex(code)
         assert not brief.marked(chr(code))
@@ -707,7 +716,8 @@ def test_tied_senders_are_named_in_one_order_in_every_file(tmp_path):
     """Six senders with five failures each; three also send passing mail. next_steps.md and the census ranked the
     busier three first (sender_rank's messages key); MAILFLOW-001's evidence - report.md, todo.md, verify.md -
     recounted the failures without the messages and named the headline's three first. Every file now names the
-    same senders in the same order."""
+    same senders in the same order - the delivered line and the override items too, whose list named the
+    headline's three first and folded info@e.example.com into '1 more sender' (integration round 2)."""
     log = r11.Log()
     log.add("staff@example.org", "Weekly report #", times=20)
     for s in TIED:
@@ -721,9 +731,19 @@ def test_tied_senders_are_named_in_one_order_in_every_file(tmp_path):
     want = ["ceo@brand.example", "billing@example.co.uk", "info@e.example.com", "hr@example.org",
             "x@news.example.org", "app@zeta.example.org"]
     assert [s["name"] for s in next_steps.maillog_view(rep, "example.org")["by_sender"]] == want
-    md = next_steps.render_md(next_steps.build(rep, None))
+    doc = next_steps.build(rep, None)
+    md = next_steps.render_md(doc)
     notes = next(l for l in md.splitlines() if l.startswith("- Notes, not headlines") and "@" in l)
     assert [n.split(" x")[0] for n in notes.split(": ", 1)[1].split(", ")] == want
+    # every message failed and reached a mailbox: the delivered line names the busiest three, the override items
+    # the busiest five (an owner's items then run by organization, the headline's first), and the one left -
+    # app@zeta.example.org, the last in the one rank - folds into the last item
+    assert "(%s)" % ", ".join("%s x5" % s for s in want[:3]) in next(
+        l for l in doc["stand"]["lines"] if l.startswith("**Delivered despite failing"))
+    overrides = {i["hook"]: i["domains"] for g in doc["actions_by_owner"] for i in g["items"] if i["kind"] == "override"}
+    fold = "1 more sender with 5 messages that reached inboxes despite failing"
+    assert sorted(overrides) == sorted(["%s - 5 messages reached inboxes despite failing" % s for s in want[:5]] + [fold])
+    assert overrides[fold] == ["zeta.example.org"]
     report_md = audit.render_md(rep)
     census = md_section(report_md, "Failing senders (census)").splitlines()
     assert [l.split()[1] for l in census if l.startswith("  - ") and "(envelope" in l] == want[:audit.CENSUS_TOP]
@@ -739,6 +759,35 @@ def test_tied_senders_are_named_in_one_order_in_every_file(tmp_path):
     # the key, plainly: failures, then the messages behind them, then the one order with the headline first
     assert audit.top_senders(Counter({"a@example.org": 5, "b@brand.example": 5}), 2, "example.org",
                              {"a@example.org": 5, "b@brand.example": 35}) == [("b@brand.example", 5), ("a@example.org", 5)]
+    # two senders of one domain tied on failures, the second busier: the lists of one domain's senders - the
+    # one-liner's groups, the delivered line, the gate's blockers in report.md and verify.md, report.md's
+    # per-domain line, the ask and the Blockers question - named abe@ first while What is failing, the census
+    # and MAILFLOW-001 named zed@ first; each names zed@ first now, the brief's copies of them too
+    log = r11.Log()
+    log.add("staff@example.com", "Weekly report #", times=20)
+    log.add("abe@example.com", "Notice #", "fail", 5)
+    log.add("zed@example.com", "Notice #", "fail", 5)
+    log.add("zed@example.com", "Statement #", "pass", 40)
+    rep = audit.build_report(domains=["example.com"], maillog=log.write(tmp_path / "ties.csv"), offline=True,
+                             auth_column="DMARC", domain_sources={"example.com": ["cli"]})
+    doc = json.loads(json.dumps(next_steps.build(rep, None, date="2026-10-13")))
+    md = next_steps.render_md(doc)
+    report_md = audit.render_md(rep)
+    todo = collect.render_todo(rep, {"changes": [], "holds": []})
+    mpath, _ = verify.write(rep, {"changes": [], "holds": []}, tmp_path / "ties")
+    page = text_of(brief.render(doc))
+    named = {name: [line for line in text.splitlines() if "abe@" in line and "zed@" in line]
+             for name, text in (("next_steps.md", md), ("report.md", report_md), ("todo.md", todo),
+                                ("verify.md", mpath.read_text(encoding="utf-8")), ("brief.html", page))}
+    assert all(named.values()) and len(named["next_steps.md"]) >= 5 and len(named["report.md"]) >= 4
+    for name, lines in named.items():
+        for line in lines:
+            assert line.index("zed@") < line.index("abe@"), (name, line)
+    assert "top senders: zed@example.com x5, abe@example.com x5" in doc["ask"]
+    assert "10 from 2 of our own senders (zed@example.com x5, abe@example.com x5)" in doc["one_liner"]
+    by = rep["maillog"]["by_domain"]["example.com"]
+    assert [t["sender"] for t in by["top_senders"]] == [t["sender"] for t in by["top_senders_after"]] == [
+        "zed@example.com", "abe@example.com"]
 
 
 # ------------------------------------------------------------------ C4: the run's caveats, in the one order
