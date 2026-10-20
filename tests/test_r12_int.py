@@ -744,14 +744,15 @@ def test_tied_senders_are_named_in_one_order_in_every_file(tmp_path):
     notes = next(l for l in md.splitlines() if l.startswith("- Notes, not headlines") and "@" in l)
     assert [n.split(" x")[0] for n in notes.split(": ", 1)[1].split(", ")] == want
     # every message failed and reached a mailbox: the delivered line names the busiest three, the override items
-    # the busiest five (an owner's items then run by organization, the headline's first), and the one left -
-    # app@zeta.example.org, the last in the one rank - folds into the last item
+    # the busiest five (an owner's items then run by organization, the headline's first) - and the one left,
+    # app@zeta.example.org, the last in the one rank, is named too: one sender is never folded into "1 more
+    # sender" (round 13, T-07)
     assert "(%s)" % ", ".join("%s x5" % s for s in want[:3]) in next(
         l for l in doc["stand"]["lines"] if l.startswith("**Delivered despite failing"))
     overrides = {i["hook"]: i["domains"] for g in doc["actions_by_owner"] for i in g["items"] if i["kind"] == "override"}
-    fold = "1 more sender with 5 messages that reached inboxes despite failing"
-    assert sorted(overrides) == sorted(["%s - 5 messages reached inboxes despite failing" % s for s in want[:5]] + [fold])
-    assert overrides[fold] == ["zeta.example.org"]
+    assert sorted(overrides) == sorted(["%s - 5 messages reached inboxes despite failing" % s for s in want])
+    assert overrides["app@zeta.example.org - 5 messages reached inboxes despite failing"] == ["zeta.example.org"]
+    assert not any(h.startswith("1 more sender") for h in overrides)
     report_md = audit.render_md(rep)
     census = md_section(report_md, "Failing senders (census)").splitlines()
     assert [l.split()[1] for l in census if l.startswith("  - ") and "(envelope" in l] == want[:audit.CENSUS_TOP]

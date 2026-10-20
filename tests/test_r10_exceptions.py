@@ -147,7 +147,9 @@ def test_c4_an_exception_comes_off_its_own_stream_and_never_relabels_another(tmp
             doc, md = doc_md(rep)
             line = doc["one_liner"]
             assert "3 from 1 of our own senders (billing@example.com x3)" in line, (minority, spoofs, line)
-            assert "%d from 1 address that look like spoofing" % spoofs in line, (minority, spoofs, line)
+            # round 13, T-07: "Hello there" carries no lure word, so the spoof stream could be our own vendor
+            assert ("%d that could be our own vendors (called spoofing on the envelope or a billing word alone: "
+                    "ops@example.com x%d)" % (spoofs, spoofs)) in line, (minority, spoofs, line)
             assert "10 formally excepted in audit.toml" in line
             assert "ops@example.com - %d" % spoofs not in md  # never a DKIM item: it is the spoof part
             assert "Formally excepted in audit.toml and not counted above: 10 messages (ops@example.com x10)." in md
@@ -162,7 +164,10 @@ def test_c44_an_address_is_named_in_every_group_with_its_own_count(tmp_path):
     line = doc["one_liner"]
     assert "6 messages from example.com failed with no passing copy" in line
     assert "5 from 2 of our own senders (billing@example.com x3, news@example.com x2)" in line
-    assert "1 from 1 address that look like spoofing" in line
+    # round 13, T-07: the stream's subject carries no lure word (its first failure is "Weekly news"), so its one
+    # spoof label could be our own vendor's, and is said so
+    assert ("1 that could be our own vendors (called spoofing on the envelope or a billing word alone: "
+            "news@example.com x1)") in line
     held = [b["text"] for b in doc["next_step"]["blockers"]]
     assert held == ["5 messages from our own senders failed with no passing copy (billing@example.com x3, "
                     "news@example.com x2); the other 1 look like spoofing, and p=none does not stop them yet"]

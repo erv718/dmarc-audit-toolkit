@@ -1462,8 +1462,12 @@ def test_the_one_liner_says_how_many_spoofing_labels_rest_on_a_weak_sign(tmp_pat
            .add("staff@brand.example", "Weekly #", times=20))
     rep = audited(tmp_path / "run", docs, log, flows={"brand.example": flow(20, 5)})
     doc = next_steps.build(rep, plan=plan_of(rep))
-    assert ("5 from 2 addresses that look like spoofing (3 of them on the envelope or a billing word alone: a check "
-            "in the plan, not proof), of which 5 reached a mailbox anyway") in doc["one_liner"]
+    # round 13, T-07: the weak-sign share is said apart, as what could be our own vendors, each part with its own
+    # deliveries; only the lure is called spoofing
+    assert ("3 that could be our own vendors (called spoofing on the envelope or a billing word alone: "
+            "statements@brand.example x3), of which 3 reached a mailbox anyway (a local override delivered them, not "
+            "the policy); 2 from 1 address that look like spoofing, of which 2 reached a mailbox anyway (a local "
+            "override delivered them, not the policy)") in doc["one_liner"]
     # lure words alone: no qualifier
     rep = audited(tmp_path / "lure", docs, Log().add("ceo@brand.example", "Urgent wire transfer #", dmarc="fail",
                                                      times=2, env="evil.invalid").add("staff@brand.example", "Weekly #",

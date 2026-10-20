@@ -273,8 +273,10 @@ def test_n7_spoofs_the_log_shows_delivered_are_not_handled_by_the_policy(tmp_pat
     rep = report_for(tmp_path, docs, log)
     line, doc = one_liner_and_doc(rep, None)
     assert "being handled by the policy" not in line and "the policy handles them" not in line
-    assert ("12 from 1 address that look like spoofing, of which 12 reached a mailbox anyway: a local override "
-            "delivered them, not the policy") in line
+    # round 13, T-07: what let them in is said in parentheses after the count (an export without the override
+    # columns: the older inference)
+    assert ("12 from 1 address that look like spoofing, of which 12 reached a mailbox anyway (a local override "
+            "delivered them, not the policy)") in line
     blockers = next_steps.blocker_items(rep, "example.com", next_steps.own_domain_view(rep, next_steps.maillog_view(rep), "example.com"))
     spoof = next(b for b in blockers if b["kind"] == "spoof")
     assert spoof["text"].endswith("once they are confirmed not ours, 12 of them reached a mailbox anyway: a local override "
@@ -361,9 +363,11 @@ def test_n9_a_delivered_failure_the_log_records_no_override_for_is_not_credited_
     assert actions["news@example.com - 4 messages reached inboxes despite failing"] == (
         "the log names no override for them: at p=none receivers deliver failing mail by design, and so did the "
         "tenant - the policy step is the fix")
+    # round 13, T-08: billing@ is our own system, so its rule changes only once it passes
     assert actions["billing@example.com - 5 messages reached inboxes despite failing"].startswith(
-        "delivered because of an Exchange transport rule (2), and the log names no override for the other 3: find that "
-        "rule and make it conditional on authentication; for the other 3, at p=none")
+        "delivered because of an Exchange transport rule (2), and the log names no override for the other 3: after "
+        "billing@example.com passes DMARC, make that rule conditional on authentication - doing it first junks these "
+        "5 too; for the other 3, at p=none")
     # the counters say the columns were there even when nothing is named, and every reader says so
     empty = dedupe.summarize(dedupe.classify(list(dedupe.load(log.write(tmp_path / "e.csv"), audit.MAILLOG_COLUMNS)),
                                              audit.MAILLOG_COLUMNS, None, "DMARC"))

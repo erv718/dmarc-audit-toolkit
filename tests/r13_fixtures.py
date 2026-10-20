@@ -170,6 +170,70 @@ def first_run_parts():
     return docs, log, flows, hosts
 
 
+IN_APEX = "v=DMARC1; p=quarantine; sp=none; pct=100; rua=mailto:dmarc-reports@example.com; fo=1"
+ON_PREM = ("Delivered", "On-premises/external")
+SAFE_SENDERS = ("Safe senders list", "Allow")
+
+
+def relayed(log, sender, subject, n, env):
+    """n messages that passed but went only to an on-premises or external hop, each with a failing copy of the same
+    message looped back (a relay echo): the mail log counts them relayed_only, never delivered."""
+    start = len(log.rows)
+    log.add(sender, subject, n, env=env, where=ON_PREM)
+    for row in log.rows[start:start + n]:
+        echo = list(row)
+        echo[9:12] = ["fail", "fail", "fail"]  # DMARC, SPF, DKIM
+        log.rows.append(echo)
+    return log
+
+
+def incident_parts():
+    """A help desk's incident ("HR mail is failing"), as the incident review's tenant holds it: example.com at
+    p=quarantine, its HR platform (hr@example.com through hrmail.example.com) failing 65 messages of its own, 27
+    of them let in by a transport rule, and 36 more passing only to an on-premises hop; the same From address
+    spoofed with a password lure (lure-mail.invalid, 12); CEO fraud quarantined (20); a payroll vendor failing
+    unaligned (14, 4 let in by users' safe sender lists); example.net at p=none with a newsletter that fails
+    (6); parked.example with nothing. (docs, log, flows, hosts)."""
+    docs = {"example.com": T.dns_doc("example.com", dmarc=IN_APEX, dmarc_source="_dmarc.example.com",
+                                     effective_policy="quarantine", dmarc_status="found"),
+            "example.net": T.own_record("example.net", "v=DMARC1; p=none; rua=mailto:dmarc-reports@example.com"),
+            "parked.example": T.dns_doc("parked.example", spf=None, spf_status="absent", spf_terminator=None,
+                                        spf_lookups=0, dkim_selectors=[], dkim_status="absent", mx=[],
+                                        mx_status="absent", findings=T.fid("DMARC-001", "SPF-001"))}
+    pay = "Your pay statement is ready (#)"
+    log = (O.Log(overrides=True)
+           .add("staff@example.com", "Team notes #", 40)
+           .add("hr@example.com", pay, 60, env="hrmail.example.com")
+           .add("hr@example.com", pay, 27, env="hrmail.example.com", dmarc="fail", spf="pass", org=TRANSPORT_RULE)
+           .add("hr@example.com", pay, 38, env="hrmail.example.com", where=O.QUARANTINED, dmarc="fail", spf="pass")
+           .add("hr@example.com", "Your password expires today #", 12, env="lure-mail.invalid", where=O.QUARANTINED,
+                dmarc="fail")
+           .add("ceo@example.com", "Urgent wire transfer today #", 20, env="evil.invalid", where=O.QUARANTINED,
+                dmarc="fail")
+           .add("payroll@example.com", "Your pay stub for period #", 4, env="mail.paysvc.invalid", dmarc="fail",
+                spf="pass", user=SAFE_SENDERS)
+           .add("payroll@example.com", "Your pay stub for period #", 10, env="mail.paysvc.invalid",
+                where=O.QUARANTINED, dmarc="fail", spf="pass")
+           .add("hello@example.net", "Welcome to the club #", 6, env="bounce.esp.invalid", dmarc="fail")
+           .add("staff@example.net", "Roster #", 20))
+    relayed(log, "hr@example.com", pay, 36, "hrmail.example.com")
+    flows = {"example.com": T.flow(2400, 300), "example.net": T.flow(100, 50), "parked.example": T.flow(0, 0)}
+    hosts = {"example.com": ("example.com", "Route53"), "example.net": ("example.net", "Route53"),
+             "parked.example": ("parked.example", "unknown")}
+    return docs, log, flows, hosts
+
+
+def incident(tmp_path, rua="mailto:dmarc-reports@example.com"):
+    """The incident run end to end: {"report", "plan", "inventory", "doc"}; no owners file."""
+    docs, log, flows, hosts = incident_parts()
+    rep = T.audited(tmp_path / "run", docs, log, flows=flows, sources={d: ["tenant"] for d in docs})
+    rep["findings"] = audit.flatten_findings(rep)
+    inventory = inventory_of(hosts, flows)
+    plan = plan_mod.build_plan(rep, inventory, rua)
+    doc = next_steps.build(rep, plan=plan, date="2026-10-20")
+    return {"report": rep, "plan": plan, "inventory": inventory, "doc": doc}
+
+
 def first_run(tmp_path, rua=None):
     """The first run end to end, as collect.py writes it with no report mailbox (rua None: the plan's new records
     carry plan.RUA_PLACEHOLDER) or with --rua-address: {"report", "plan", "inventory", "doc"}; no owners file."""

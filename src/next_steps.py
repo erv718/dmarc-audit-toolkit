@@ -91,6 +91,9 @@ CHOOSE_RUA = "choose where DMARC reports go (a mailbox you own, or a reporting s
 RERUN_RUA = "then rerun with --rua-address mailto:<that address> (or set RUA_MAILBOX in .env)"
 ADDRESS_STEP = "choose where DMARC reports go, then rerun with --rua-address"
 PLACEHOLDER = "mailto:<your aggregate reports address>"  # plan.RUA_PLACEHOLDER, as the records carry it
+# plan.WEAK_SPOOF_SIGN: a likely_spoof label on the envelope or a billing word alone, no lure word - which could be
+# our own vendor sending unaligned; the document calls those failures that, never spoofing
+WEAK_SIGN = "called spoofing on the envelope or a billing word alone"
 # CLI flags in audit prose, as the words a reader without the CLI can act on.
 # Any --flag these do not name is dropped by plain(): a flag means nothing here.
 FLAG_WORDS = tuple((re.compile(p), r) for p, r in (
@@ -507,6 +510,10 @@ def _entries(obj, name_keys):
         for key in ("excepted", "excepted_delivered", "senders_after"):
             if _n(it.get(key)) is not None:
                 entry[key] = _n(it[key])
+        if _n(it.get("delivered_despite_fail")) is not None:  # this stream's own deliveries, never its address's
+            entry["delivered"] = max(_n(it["delivered_despite_fail"]) - (entry.get("excepted_delivered") or 0), 0)
+            if isinstance(it.get("delivered_by"), dict) and not entry.get("excepted_delivered"):
+                entry["delivered_by"] = {str(k): _n(v) for k, v in it["delivered_by"].items() if k and (_n(v) or 0) > 0}
         if isinstance(it.get("likely_counts"), dict):
             counts = Counter()
             for label, n in it["likely_counts"].items():
@@ -639,9 +646,14 @@ def _per_address(streams, messages=None, headline=None):
             e["likely"] = _majority(e["likely_counts"])
             if "likely_after" in e:
                 e["likely_after"] = e["likely"]
-            for key in ("excepted", "excepted_delivered"):
+            for key in ("excepted", "excepted_delivered", "delivered"):
                 if any(_n(s.get(key)) is not None for s in group):
                     e[key] = sum(_n(s.get(key)) or 0 for s in group)
+            if any(isinstance(s.get("delivered_by"), dict) for s in group):
+                by = Counter()
+                for s in group:
+                    by.update({k: v for k, v in (s.get("delivered_by") or {}).items() if v})
+                e["delivered_by"] = dict(by)
             if all(_n(s.get("messages")) is not None for s in group):
                 e["messages"] = sum(_n(s["messages"]) for s in group)
             e["envelopes"] = _envelopes(envs, headline, env_msgs)
@@ -830,6 +842,76 @@ def _excepted_per_address(excepted, messages=None, headline=None):
                   + (str(e.get("envelope") or ""),))
 
 
+def _strong(subject):
+    """True when a subject carries a lure word phishing leans on (plan.lure): what makes a failure's
+    likely_spoof label a strong sign rather than the envelope or a billing word alone."""
+    import plan as plan_mod  # here, not at the top: plan.py imports this module
+    return plan_mod.lure(subject)
+
+
+def sender_parts(census_rows=None, verdicts=None, counted=True):
+    """Every address's failures part by part, as the evidence counts them:
+    [{name, domain, group, strong, count, delivered, by, envelopes,
+    subject}] - one part per address, label group (_group: our own,
+    spoofing, unclear) and, for spoofing, whether the stream's subject
+    carries a lure word (strong, plan.lure) or not (a weak sign: it could
+    be our own vendor). Each census stream (census_rows: maillog.census.
+    by_sender) gives its failures after the formal exceptions (counted:
+    the census carries their counts), split by its likely_counts, and its
+    own deliveries despite failing - the stream's, never its address's -
+    with what let them in (delivered_by), under its largest group (a
+    stream's deliveries are not counted label by label). Without a census,
+    the verdicts give the same, message by message. [] when neither is
+    there."""
+    parts = OrderedDict()
+
+    def add(name, domain, group, strong, n, delivered=0, by=None, env="", subject=""):
+        p = parts.setdefault((name, group, strong), {
+            "name": name, "domain": domain, "group": group, "strong": strong, "count": 0, "delivered": 0,
+            "by": Counter(), "envelopes": Counter(), "subjects": Counter()})
+        p["count"] += n
+        p["delivered"] += delivered
+        p["by"].update(by or {})
+        p["envelopes"][env or "(blank)"] += n
+        if subject:
+            p["subjects"][subject] += n
+    for r in census_rows or []:
+        if not isinstance(r, dict):
+            continue
+        name = str(r.get("sender") or "(no sender)").strip().lower()
+        n = max((_n(r.get("genuine_failures")) or 0) - ((_n(r.get("excepted")) or 0) if counted else 0), 0)
+        if n <= 0:
+            continue
+        label = r.get("likely_after") if "likely_after" in r else r.get("likely")
+        split = _split({"count": n, "likely_counts": r.get("likely_counts"), "likely": label})
+        gone = (_n(r.get("excepted_delivered")) or 0) if counted else 0
+        delivered = max((_n(r.get("delivered_despite_fail")) or 0) - gone, 0)
+        by = ({str(k): _n(v) for k, v in r["delivered_by"].items() if k and (_n(v) or 0) > 0}
+              if isinstance(r.get("delivered_by"), dict) and not gone else {})
+        main = max(split, key=lambda g: (split[g], g == _group(label))) if split else _group(label)
+        subject = str(r.get("sample_subject") or "")
+        strong = _strong(subject)
+        domain = str(r.get("domain") or name.rpartition("@")[2]).strip().lower()
+        env = str(r.get("envelope_domain") or "").strip().lower()
+        for g, k in split.items():
+            if k > 0:
+                add(name, domain, g, strong if g == SPOOF else False, k, delivered if g == main else 0,
+                    by if g == main else None, env, subject)
+    if not census_rows:
+        for v in verdicts or []:
+            if not (isinstance(v, dict) and v.get("genuine_failure")) or v.get("excepted"):
+                continue
+            name = str(v.get("sender") or "(no sender)").strip().lower()
+            g = _group(v.get("likely"))
+            subject = str(v.get("subject") or "")
+            delivered = 1 if v.get("delivered_despite_fail") else 0
+            add(name, str(v.get("domain") or name.rpartition("@")[2]).strip().lower(), g,
+                _strong(subject) if g == SPOOF else False, 1, delivered,
+                {str(v["delivered_by"]): 1} if delivered and v.get("delivered_by") else None,
+                str(v.get("envelope_domain") or "").strip().lower(), subject)
+    return [dict(p, by=dict(p["by"])) for p in parts.values()]
+
+
 def maillog_view(report, headline=None):
     """What the document needs from the mail log: summaries when the report
     carries them, else derived from the verdicts. None when there is no mail log.
@@ -987,6 +1069,11 @@ def maillog_view(report, headline=None):
     view["ddf_by_left"] = dict(left_by)
     for s in view["by_sender"]:
         s["likely"] = s.get("likely") or "unknown"
+    # every address's failures by label group and sign, each with its own deliveries (sender_parts): what the lines
+    # that split an address by label, and the delivered counts beside each label, read
+    raw = census.get("by_sender") if isinstance(census, dict) and isinstance(census.get("by_sender"), list) else None
+    view["parts"] = sender_parts(raw, None if raw is not None else verdicts,
+                                 _carries_exceptions(raw) if raw is not None else True)
     return view
 
 
@@ -1010,15 +1097,21 @@ def _split(s):
     return out
 
 
-def _by_address(entries, delivered=None, headline=None):
+def _by_address(entries, delivered=None, headline=None, parts=None):
     """Census streams merged per address, each with what it has left per
     group (likes: own, spoof, unclear, from _split): an address with
     failures under two labels is named under both, with each count. An
     address with nothing left drops out. delivered: {address: messages
     delivered despite failing} (the view's ddf_senders), carried along so
-    a spoof the policy was supposed to stop is never called handled. Worst
-    first, then by the messages behind them (the entries' own, added up),
-    a tie in the one order (_ranked)."""
+    a spoof the policy was supposed to stop is never called handled; parts
+    (the view's, sender_parts) say which group each of them came in under -
+    a stream's deliveries go with that stream, never with every label its
+    address has (dlv and dlv_by per group, and for the spoofing ones the
+    weak-sign share apart: weak, weak_dlv, weak_by, and the strong-sign
+    deliveries, strong_dlv, strong_by). Without parts the deliveries go
+    with the address's largest group. Worst first, then by the messages
+    behind them (the entries' own, added up), a tie in the one order
+    (_ranked)."""
     merged = {}
     delivered = delivered or {}
     for s in entries:
@@ -1029,10 +1122,32 @@ def _by_address(entries, delivered=None, headline=None):
         if _n(s.get("messages")) is not None:
             e["messages"] = (e.get("messages") or 0) + _n(s["messages"])
         e["likes"].update(_split(s))
+    mine = {}
+    for p in parts or []:
+        mine.setdefault(p["name"], []).append(p)
     out = []
     for e in merged.values():
         likes = Counter({k: v for k, v in e["likes"].items() if v > 0})
         e.update(likes=dict(likes), likely=likes.most_common(1)[0][0] if likes else UNCLEAR)
+        dlv, by = Counter(), {}
+        weak = weak_dlv = strong_dlv = 0
+        weak_by, strong_by = Counter(), Counter()
+        if e["name"] in mine:
+            for p in mine[e["name"]]:
+                dlv[p["group"]] += p["delivered"]
+                by.setdefault(p["group"], Counter()).update(p["by"])
+                if p["group"] == SPOOF and p["strong"]:
+                    strong_dlv += p["delivered"]
+                    strong_by.update(p["by"])
+                elif p["group"] == SPOOF:
+                    weak += p["count"]
+                    weak_dlv += p["delivered"]
+                    weak_by.update(p["by"])
+        elif e["delivered"] and likes:
+            dlv[e["likely"]] = e["delivered"]
+            strong_dlv = e["delivered"] if e["likely"] == SPOOF else 0
+        e.update(dlv=dict(dlv), dlv_by={g: dict(c) for g, c in by.items()}, weak=weak, weak_dlv=weak_dlv,
+                 weak_by=dict(weak_by), strong_dlv=strong_dlv, strong_by=dict(strong_by))
         if e["count"] > 0:
             out.append(e)
     return _ranked(out, headline)
@@ -1042,14 +1157,27 @@ def _groups(senders, headline=None):
     """{own, spoof, unclear} for the one-liner: every address with what it
     has left under that group, worst first (then by the messages behind it,
     a tie in the one order, _ranked), with how many of its messages
-    reached a mailbox despite failing."""
+    reached a mailbox despite failing under that group (dlv, from the
+    streams: an address's deliveries are never copied into every group it
+    fails under) and what let them in (by); a spoofing entry also carries
+    its weak-sign share (weak, weak_dlv, weak_by) and its strong-sign
+    deliveries (strong_dlv, strong_by)."""
     groups = {OWN: [], SPOOF: [], UNCLEAR: []}
     for s in senders:
+        dlv = s.get("dlv")
         for label, n in (s.get("likes") or {s.get("likely"): s.get("count") or 0}).items():
             if n > 0:
-                groups[_group(label)].append({"name": s["name"], "count": n, "domain": s.get("domain"),
-                                              "likely": _group(label), "delivered": s.get("delivered") or 0,
-                                              "messages": s.get("messages")})
+                g = _group(label)
+                e = {"name": s["name"], "count": n, "domain": s.get("domain"), "likely": g,
+                     "delivered": (dlv.get(g) or 0) if isinstance(dlv, dict) else (s.get("delivered") or 0),
+                     "by": dict((s.get("dlv_by") or {}).get(g) or {}), "messages": s.get("messages")}
+                if g == SPOOF:
+                    e.update(weak=min(s.get("weak") or 0, n), weak_dlv=s.get("weak_dlv") or 0,
+                             weak_by=dict(s.get("weak_by") or {}), strong_dlv=s.get("strong_dlv") or 0,
+                             strong_by=dict(s.get("strong_by") or {}))
+                    if not isinstance(dlv, dict):
+                        e["strong_dlv"] = e["delivered"]
+                groups[g].append(e)
     return {k: _ranked(g, headline) for k, g in groups.items()}
 
 
@@ -1079,7 +1207,8 @@ def own_domain_view(report, view, org):
         # the org's mail all sits in its subdomains (a damaged domains list reads as none named)
         c, subs = sub, [str(d) for d in (sub.get("domains") if isinstance(sub.get("domains"), list) else [])]
     senders = _by_address([s for s in (view["by_sender"] if view else [])
-                           if s.get("domain") == org or s.get("domain") in subs], _delivered_of(view))
+                           if s.get("domain") == org or s.get("domain") in subs], _delivered_of(view),
+                          parts=(view or {}).get("parts"))
     by_likely = c.get("by_likely") if isinstance(c.get("by_likely"), dict) else None
     reduced = _n(c.get("excepted")) is not None
     if reduced:
@@ -1107,7 +1236,7 @@ def own_domain_view(report, view, org):
             "by_likely": {k: _n(v) or 0 for k, v in by_likely.items()} if by_likely else None,
             "top_senders": tops, "senders": senders,
             "subdomains": subs, "window": c.get("window") if isinstance(c.get("window"), dict) else None,
-            "excepted": excepted}
+            "excepted": excepted, "recorded": bool((view or {}).get("overrides_recorded"))}
 
 
 def _by_address_of(view):
@@ -1145,14 +1274,15 @@ def streams(view, rua, own=None, excepted_ips=(), headline=None):
                 "own": groups[OWN], "spoof": groups[SPOOF], "unclear": groups[UNCLEAR],
                 "genuine_failures": own["genuine_failures"], "logical_messages": own["logical_messages"],
                 "by_likely": own["by_likely"], "top_senders": own["top_senders"],
-                "subdomains": own.get("subdomains") or []}
+                "subdomains": own.get("subdomains") or [], "recorded": own.get("recorded", False)}
     if view is not None and (view["by_sender"] or view["genuine_failures"] is not None):
-        groups = _groups(_by_address(view["by_sender"], _delivered_of(view), headline), headline)
+        groups = _groups(_by_address(view["by_sender"], _delivered_of(view), headline, view.get("parts")), headline)
         excepted = view.get("excepted") or []
         out = {"basis": "mail log", "scope": "all audited domains", "window": view.get("window"),
                "excepted": sum(e["count"] for e in excepted), "excepted_reduced": True,
                "excepted_senders": len({str(e["name"]).lower() for e in excepted}),
-               "own": groups[OWN], "spoof": groups[SPOOF], "unclear": groups[UNCLEAR]}
+               "own": groups[OWN], "spoof": groups[SPOOF], "unclear": groups[UNCLEAR],
+               "recorded": bool(view.get("overrides_recorded"))}
         if not view.get("exceptions_counted") and view.get("excepted_unsplit"):
             out.update(excepted=view["excepted_unsplit"], excepted_reduced=False, excepted_senders=None)
         return out
@@ -1953,13 +2083,56 @@ def _named(entries, cap=3):
     return ("; " if any(", " in p for p in parts) else ", ").join(parts)
 
 
-def _spoof_clause(policy, delivered=0):
+LET_IN = "%d let in by %s"
+P_NONE_DELIVERS = "%d delivered because p=none lets failing mail through"
+NONE_RECORDED = "%d with no override recorded (the log names nothing that let them in)"
+OVERRIDE_INFERRED = "a local override delivered them, not the policy"
+
+
+def delivered_split(delivered, by=None, recorded=False, policy=None):
+    """What let n messages that failed reach a mailbox, in plain words: each
+    override the mail log recorded for them with its count ('16 let in by
+    an Exchange transport rule'), then the rest - at p=none the policy's
+    own doing ('16 delivered because p=none lets failing mail through'),
+    else none recorded. A log without the override columns (recorded
+    False) says nothing of overrides: at p=none the policy delivers them
+    anyway, else the older inference, a local override delivered them."""
+    by = {str(k): _n(v) or 0 for k, v in (by or {}).items() if k and (_n(v) or 0) > 0}
+    parts, named = [], 0
+    if recorded:
+        merged = OrderedDict()
+        for reason, n in sorted(by.items(), key=lambda kv: (-kv[1], kv[0])):
+            words = dedupe.override_words(reason)
+            merged[words] = merged.get(words, 0) + n
+        for words, n in merged.items():
+            take = min(n, delivered - named)
+            if take > 0:
+                parts.append(LET_IN % (take, words))
+                named += take
+    rest = delivered - named
+    if rest > 0:
+        if policy == "none":
+            parts.append(P_NONE_DELIVERS % rest)
+        elif recorded:
+            parts.append(NONE_RECORDED % rest)
+        else:
+            parts.append(OVERRIDE_INFERRED)
+    return "; ".join(parts)
+
+
+def _spoof_clause(policy, delivered=0, by=None, recorded=False):
     """What happens to failures that look like spoofing, given the policy -
-    unless the mail log shows them delivered despite failing: then an
-    override let them in, and no policy handles what an override admits."""
+    unless the mail log shows them delivered despite failing: then what let
+    them in (delivered_split), and no policy handles what an override
+    admits."""
     if delivered:
-        return ("%d of them reached a mailbox anyway: a local override delivered them, which the policy cannot "
-                "undo - find that override" % delivered)
+        if not recorded and policy != "none":
+            return ("%d of them reached a mailbox anyway: a local override delivered them, which the policy cannot "
+                    "undo - find that override" % delivered)
+        named = recorded and any((_n(v) or 0) > 0 for v in (by or {}).values())
+        return "%d of them reached a mailbox anyway: %s%s" % (
+            delivered, delivered_split(delivered, by, recorded, policy),
+            " - the policy cannot undo an override: find it" if named else "")
     if policy in ("quarantine", "reject"):
         return "the policy handles them"
     if policy == "none":
@@ -1969,16 +2142,32 @@ def _spoof_clause(policy, delivered=0):
 
 def _part(senders, labels):
     """Each address with its failures under these groups, worst first (then
-    by the messages behind them, as every list of senders), and how many of
-    its messages reached a mailbox despite failing."""
-    out = [{"name": s["name"], "count": sum((s.get("likes") or {}).get(k, 0) for k in labels),
-            "delivered": s.get("delivered") or 0, "messages": s.get("messages")} for s in senders]
+    by the messages behind them, as every list of senders), how many of its
+    messages reached a mailbox despite failing under them (the streams'
+    own: _by_address's dlv) and what let them in (by)."""
+    out = []
+    for s in senders:
+        dlv = s.get("dlv") if isinstance(s.get("dlv"), dict) else None
+        by = Counter()
+        for k in labels:
+            by.update(((s.get("dlv_by") or {}).get(k)) or {})
+        out.append({"name": s["name"], "count": sum((s.get("likes") or {}).get(k, 0) for k in labels),
+                    "delivered": sum(dlv.get(k, 0) for k in labels) if dlv is not None else (s.get("delivered") or 0),
+                    "by": dict(by), "messages": s.get("messages")})
     return _ranked(s for s in out if s["count"] > 0)  # one organization's addresses: no headline needed
 
 
-def _delivered(entries):
-    """Messages delivered despite failing among these addresses' entries."""
-    return sum(_n(e.get("delivered")) or 0 for e in entries)
+def _delivered(entries, key="delivered"):
+    """Messages delivered despite failing among these addresses' entries (key: which of their counts)."""
+    return sum(_n(e.get(key)) or 0 for e in entries)
+
+
+def _by_of(entries, key="by"):
+    """{override: messages} over these entries' own (key: which of their maps)."""
+    out = Counter()
+    for e in entries:
+        out.update({k: _n(v) or 0 for k, v in (e.get(key) or {}).items()})
+    return dict(out)
 
 
 def blocker_items(report, domain, own=None):
@@ -2017,7 +2206,7 @@ def blocker_items(report, domain, own=None):
             rest = total - spoof_n
             senders = (own or {}).get("senders") or []
             spoofs = _part(senders, (SPOOF,))
-            clause = _spoof_clause(policy, min(_delivered(spoofs), spoof_n))
+            clause = _spoof_clause(policy, min(_delivered(spoofs), spoof_n), _by_of(spoofs), (own or {}).get("recorded"))
             if rest > 0:
                 who = "our own senders" if not bl.get(UNCLEAR) else "senders that are ours or unclear"
                 names = _named(_part(senders, (OWN, UNCLEAR)))
@@ -2308,14 +2497,15 @@ def _readiness(nxt):
     return ", ready when %s, and on hold while: %s." % (_join(nxt["prerequisites"]), "; ".join(holds))
 
 
-def _handled(policy, n, delivered=0):
+def _handled(policy, n, delivered=0, by=None, recorded=False):
     """What the policy does about n senders that look like spoofing; when
     the mail log shows delivered of their messages reaching a mailbox
-    despite failing, an override did that, and the policy handles nothing
-    an override admits."""
+    despite failing, what let them in (delivered_split: each override the
+    log recorded with its count, and at p=none the rest are the policy's
+    own doing), and the policy handles nothing an override admits."""
     if delivered:
-        return (", of which %d reached a mailbox anyway: a local override delivered them, not the policy"
-                % delivered)
+        return ", of which %d reached a mailbox anyway (%s)" % (delivered, delivered_split(delivered, by, recorded,
+                                                                                             policy))
     if policy in ("quarantine", "reject"):
         return " and %s being handled by the policy" % _plural(n, "is", "are")
     if policy == "none":
@@ -2350,12 +2540,20 @@ def _own_domain_sentence(org, policy, strm):
     if bl:
         own_n, spoof_n = bl.get(OWN, 0), bl.get(SPOOF, 0)
         unclear_n = bl.get(UNCLEAR, 0)
+        # the spoof labels resting on a weak sign (the envelope or a billing word alone, no lure word) are no
+        # spoofing the run can stand behind: they could be our own vendors, said apart with their own deliveries.
+        # Counted from the streams themselves (sender_parts, by plan.lure on each stream's subject, as the plan
+        # counts them), else the plan's own split
+        weak = (sum(_n(e.get("weak")) or 0 for e in strm["spoof"]) if any("weak" in e for e in strm["spoof"])
+                else _n(strm.get("spoof_weak")) or 0)
+        weak = min(weak, spoof_n)
+        recorded = bool(strm.get("recorded"))
         parts = []
         if own_n:
             who = ("%d of our own senders" % len(strm["own"])) if strm["own"] else "our own senders"
             names = _named(strm["own"], 2)
             parts.append("%d from %s%s" % (own_n, who, (" (%s)" % names) if names else ""))
-        else:
+        elif not weak:
             parts.append("none from our own senders")
         if unclear_n:
             k = len(strm["unclear"])
@@ -2365,15 +2563,23 @@ def _own_domain_sentence(org, policy, strm):
             names = _named(strm["unclear"], 2)
             parts.append("%d from %s and %s a look%s" % (unclear_n, who, "needs" if k == 1 else "need",
                                                        (" (%s)" % names) if names else ""))
-        if spoof_n:
-            k = len(strm["spoof"])
+        if weak:
+            vendors = [e for e in strm["spoof"] if e.get("weak")]
+            names = _named([dict(e, count=e["weak"]) for e in vendors], 2)
+            text = "%d that could be our own vendors (%s%s)" % (weak, WEAK_SIGN, (": " + names) if names else "")
+            d = min(_delivered(vendors, "weak_dlv"), weak)
+            if d:
+                text += ", of which %d reached a mailbox anyway (%s)" % (
+                    d, delivered_split(d, _by_of(vendors, "weak_by"), recorded, policy))
+            parts.append(text)
+        if spoof_n - weak > 0:
+            sure_n = spoof_n - weak
+            sure = [e for e in strm["spoof"] if e["count"] - (e.get("weak") or 0) > 0]
+            k = len(sure)
             who = ("%d %s" % (k, _plural(k, "address", "addresses"))) if k else "addresses"
-            weak = min(_n(strm.get("spoof_weak")) or 0, spoof_n)
-            parts.append("%d from %s that look like spoofing%s%s"
-                         % (spoof_n, who,
-                            (" (%d of them on the envelope or a billing word alone: a check in the plan, not proof)"
-                             % weak) if weak else "",
-                            _handled(policy, k or spoof_n, min(_delivered(strm["spoof"]), spoof_n))))
+            parts.append("%d from %s that look like spoofing%s"
+                         % (sure_n, who, _handled(policy, k or sure_n, min(_delivered(sure, "strong_dlv"), sure_n),
+                                                  _by_of(sure, "strong_by"), recorded)))
         if strm.get("excepted") and not unsplit:
             parts.append("%d formally excepted in audit.toml" % strm["excepted"])
         mid += ": " + "; ".join(parts)
@@ -2414,7 +2620,8 @@ def one_liner(org, policy, pct, since, strm, nxt):
                                                        _plural(len(unclear), "needs", "need"))
         if spoof:
             mid += "; %d %s like spoofing%s" % (len(spoof), _plural(len(spoof), unit + " looks", unit + "s look"),
-                                                _handled(policy, len(spoof), _delivered(spoof)))
+                                                _handled(policy, len(spoof), _delivered(spoof), _by_of(spoof),
+                                                         strm.get("recorded")))
         n = strm.get("excepted") or 0
         if n and strm.get("excepted_reduced", True):  # the senders above are what the exceptions left
             k = strm.get("excepted_senders")
@@ -2735,6 +2942,62 @@ def _note_line(entries, cap=NOTES_CAP):
 MORE_LINE = "Also at %d or more each: " % HEADLINE_MIN
 NOTES_LINE = "Notes, not headlines (under %d each): " % HEADLINE_MIN
 OUTSIDE_NOTES_LINE = "Notes, not headlines: "
+# the one exception to "under HEADLINE_MIN is a note": spoofing with a lure word in the subject that reached a mailbox
+REACHED_LINE = "Reached inboxes despite failing (under %d, never a note): " % HEADLINE_MIN
+
+
+def label_rows(view, headline=None):
+    """What is failing's sender rows: one per address, as every list of
+    senders counts one - except that an address whose failures fall under
+    two label groups (our own, spoofing, unclear: sender_parts) gives one
+    row per group, each with its own count, envelopes and subject, so 65
+    of our own and 12 spoofs never read as 77 of one kind. Each row carries
+    the deliveries of its streams (delivered) and how many of them were
+    spoofing on a strong sign (reached: likely_spoof with a lure word in the
+    subject, plan.lure). Worst first, a tie in the one order (_ranked)."""
+    parts = OrderedDict()
+    for p in view.get("parts") or []:
+        parts.setdefault(p["name"], []).append(p)
+    out = []
+    for e in view["by_sender"]:
+        mine = parts.get(e["name"]) or []
+        groups = OrderedDict()
+        for p in mine:
+            groups.setdefault(p["group"], []).append(p)
+        if len(groups) < 2 or sum(p["count"] for p in mine) != e["count"]:
+            row = dict(e)
+            if mine:
+                row["delivered"] = sum(p["delivered"] for p in mine)
+                row["reached"] = sum(p["delivered"] for p in mine if p["group"] == SPOOF and p["strong"])
+            out.append(row)
+            continue
+        for g, ps in groups.items():
+            envs, subjects = Counter(), Counter()
+            for p in ps:
+                envs.update(p["envelopes"])
+                subjects.update(p["subjects"])
+            through = _envelopes(dict(envs), headline)
+            row = {"name": e["name"], "count": sum(p["count"] for p in ps), "likely": g, "domain": e.get("domain"),
+                   "envelope": through[0]["name"] if through else e.get("envelope"),
+                   "subjects": [s for s, _ in subjects.most_common(1)],
+                   "delivered": sum(p["delivered"] for p in ps),
+                   "reached": sum(p["delivered"] for p in ps if g == SPOOF and p["strong"])}
+            if e.get("messages") is not None:
+                row["messages"] = e["messages"]
+            if len(through) > 1:
+                row["envelopes"] = through
+            out.append(row)
+    return _ranked(out, headline)
+
+
+def reached_split(entries):
+    """(reached, rest) for What is failing's sender rows (label_rows): the
+    ones under HEADLINE_MIN that are spoofing with a lure word and reached
+    a mailbox - each gets a line of its own (REACHED_LINE), never a place
+    on the notes line - and every other row, in their order. brief.py
+    splits the table the same way."""
+    reached = [e for e in entries if (_n(e.get("reached")) or 0) > 0 and (_n(e.get("count")) or 0) < HEADLINE_MIN]
+    return reached, [e for e in entries if not any(e is r for r in reached)]
 
 
 def headline_split(entries):
@@ -2778,13 +3041,17 @@ def what_is_failing(report, view, headline=None):
         else:
             for what, key, title in (("envelope", "by_envelope", "By envelope domain (who actually handed the mail over)"),
                                      ("sender", "by_sender", "By sender address (what the reader sees in From)")):
-                entries = view[key]
+                # a sender's rows split by label group when its failures fall under two (label_rows)
+                entries = label_rows(view, headline) if what == "sender" else view[key]
                 if not entries:
                     continue
-                head, more, rest = headline_split(entries)
+                reached, kept = reached_split(entries) if what == "sender" else ([], entries)
+                head, more, rest = headline_split(kept)
                 lines.append("%s:" % title)
                 for e in head:
                     lines.append("- " + _entry_bullet(e, what))
+                for e in reached:  # spoofing with a lure word that reached a mailbox: never only a note
+                    lines.append("- " + REACHED_LINE + _entry_bullet(e, what) + " - %d reached a mailbox" % e["reached"])
                 if more:
                     lines.append("- " + MORE_LINE + _note_line(more))
                 if rest:
@@ -3059,6 +3326,22 @@ OVERRIDE_FIXES = {
     "safe_senders": "ask the mailbox owners to take the sender off their safe sender lists",
 }
 OVERRIDE_FIX_OTHER = "find that override and make it conditional on authentication"
+# The same fixes for mail that is ours, or may be (our own system, unclear, or called spoofing on a weak sign only):
+# done before the sender passes DMARC they junk that mail too, so each comes after it, and says why
+SAFE_OVERRIDE_FIXES = {
+    "transport_rule": "make that rule conditional on authentication",
+    "allowed_senders": "take the sender off the allowed sender list in the anti-spam policy",
+    "allowed_domains": "take the domain off the allowed sender domain list in the anti-spam policy",
+    "spoof_allow": "remove that allow entry",
+    "safe_senders": "ask the mailbox owners to take the sender off their safe sender lists",
+}
+SAFE_OVERRIDE_OTHER = "make that override conditional on authentication"
+SAFE_ORDER = "after %s passes DMARC, %s - doing it first junks %s too"
+
+
+def safe_order(sender, fix, n):
+    """'after <sender> passes DMARC, <fix> - doing it first junks these <n> too' (this one, for one)."""
+    return SAFE_ORDER % (sender, fix, "this one" if n == 1 else "these %d" % n)
 
 
 def _no_override_fix(policy):
@@ -3068,7 +3351,25 @@ def _no_override_fix(policy):
     return "look for what the log does not record (a mailbox rule, a connector, a filter in front of the tenant)"
 
 
-def override_action(by, count, recorded=False, policy=None):
+def ours_delivered(view, sender):
+    """How many of a sender's messages delivered despite failing (sender: a
+    ddf_senders entry) are mail that is ours or may be: our own system,
+    unclear, or spoofing on a weak sign only - every one but the lures
+    (sender_parts: spoofing whose subject carries a lure word). A view
+    without parts for it reads its address's label: anything but spoofing
+    is ours, spoofing is ours unless its subject is a lure."""
+    parts = [p for p in (view or {}).get("parts") or [] if p["name"] == sender.get("name")]
+    if parts:
+        return min(sum(p["delivered"] for p in parts if not (p["group"] == SPOOF and p["strong"])), sender["count"])
+    row = next((e for e in (view or {}).get("by_sender") or [] if e.get("name") == sender.get("name")), None)
+    if row is None:
+        return 0
+    if _group(row.get("likely")) != SPOOF:
+        return sender["count"]
+    return 0 if _strong((row.get("subjects") or [""])[0]) else sender["count"]
+
+
+def override_action(by, count, recorded=False, policy=None, ours=0, sender=None):
     """The action for a sender delivered despite failing, from what let its
     messages in ({delivered_by reason: messages} over count messages):
     'delivered because of an Exchange transport rule: find that rule and
@@ -3079,7 +3380,11 @@ def override_action(by, count, recorded=False, policy=None):
     log recorded the overrides (recorded True) and names none for this
     sender, the action says so instead of sending the reader after an
     override the log would have named: at p=none the delivery is the
-    policy's own doing (policy, the sender's domain's)."""
+    policy's own doing (policy, the sender's domain's). ours: how many of
+    them are mail that is ours or may be (our own system, unclear, or
+    spoofing on a weak sign only - sender_parts): the fix then comes after
+    the sender passes DMARC, and says that doing it first junks them too
+    (SAFE_ORDER); spoofing on a strong sign keeps the do-it-now words."""
     merged = OrderedDict()  # plain words -> [messages, kind]
     for reason, n in sorted(((str(r), _n(n) or 0) for r, n in (by or {}).items()), key=lambda kv: (-kv[1], kv[0])):
         if reason and n > 0:
@@ -3092,7 +3397,11 @@ def override_action(by, count, recorded=False, policy=None):
     single = len(merged) == 1 and rest <= 0
     causes = [(w if kind else '"%s"' % w) + ("" if single else " (%d)" % n) for w, (n, kind) in merged.items()]
     because = audit._names(causes)
-    fixes = list(dict.fromkeys(OVERRIDE_FIXES.get(kind, OVERRIDE_FIX_OTHER) for n, kind in merged.values()))
+    if ours > 0 and sender:  # our own mail (or maybe ours) rides on it: the sender passes first, then the override goes
+        fixes = list(dict.fromkeys(safe_order(sender, SAFE_OVERRIDE_FIXES.get(kind, SAFE_OVERRIDE_OTHER),
+                                              min(ours, count or ours)) for n, kind in merged.values()))
+    else:
+        fixes = list(dict.fromkeys(OVERRIDE_FIXES.get(kind, OVERRIDE_FIX_OTHER) for n, kind in merged.values()))
     if rest > 0:
         because += ", and the log names no override for the other %d" % rest
         fixes.append(("for the other %d, %s" % (rest, _no_override_fix(policy))) if recorded else
@@ -3260,7 +3569,9 @@ def build_actions(report, plan, view, owners, headline=None):
             if split.get(SPOOF, 0) > 0:
                 spoof.append(dict(s, count=split[SPOOF]))
         own_all = _ranked(own_all, headline)  # the cap below keeps the headline's senders on a tie
-        for s in own_all[:SENDER_ITEMS_CAP]:
+        # one sender past the cap is named, never folded into "1 more sender"
+        cap = SENDER_ITEMS_CAP + 1 if len(own_all) == SENDER_ITEMS_CAP + 1 else SENDER_ITEMS_CAP
+        for s in own_all[:cap]:
             hook = "%s - %d %s" % (s["name"], s["count"], _plural(s["count"], "message"))
             src = _own_source(view, s)  # its own streams' subject and envelopes, never a spoof stream's
             subj = ('subjects like "%s"' % cut_subject(src["subjects"][0])) if src.get("subjects") else ""
@@ -3279,7 +3590,7 @@ def build_actions(report, plan, view, owners, headline=None):
             items.append({"kind": "sender", "ref": ref, "sender": s["name"], "hook": hook, "action": action,
                           "keys": [s["name"], s.get("domain"), s.get("envelope")] + through,
                           "domains": _ordered([s.get("domain") or s["name"]], headline)})
-        rest = own_all[SENDER_ITEMS_CAP:]
+        rest = own_all[cap:]
         if rest:
             total = sum(s["count"] for s in rest)
             items.append({"kind": "sender", "keys": [], "ref": ref,
@@ -3313,18 +3624,24 @@ def build_actions(report, plan, view, owners, headline=None):
             covered.add(("maillog", "MAILFLOW-001"))  # nothing left to work: every named failure is excepted
         ref = "MAILFLOW-002" if "MAILFLOW-002" in ids_present else "mail log"
         ddf = view["ddf_senders"]  # what the exceptions left: an excepted sender's override is accepted
-        for s in ddf[:TOP_ENTRIES]:
+        cap = TOP_ENTRIES + 1 if len(ddf) == TOP_ENTRIES + 1 else TOP_ENTRIES  # never "1 more sender"
+        for s in ddf[:cap]:
             hook = "%s - %d %s reached inboxes despite failing" % (s["name"], s["count"], _plural(s["count"], "message"))
             # the override the log recorded for them, named; else the ones to look for - unless the log recorded
-            # the overrides and names none for this sender
+            # the overrides and names none for this sender. Mail of ours rides on it: the fix comes after the sender
+            # passes (ours_delivered)
+            ours = ours_delivered(view, s)
             action = override_action(s.get("by"), s["count"], view.get("overrides_recorded", False),
-                                     current_policy(report, s.get("domain") or "")) or (
+                                     current_policy(report, s.get("domain") or ""), ours, s["name"]) or (
+                ("find the override (transport rule, allow list, safe sender) that let them in; " +
+                 safe_order(s["name"], "make it conditional on authentication", ours) +
+                 "; outside receivers do not have it") if ours else
                 "find the override (transport rule, allow list, safe sender) that let them in and make it "
                 "conditional on authentication; outside receivers do not have it")
             items.append({"kind": "override", "keys": [s["name"], s.get("domain"), s.get("envelope")], "ref": ref,
                           "sender": s["name"], "hook": hook, "action": action,
                           "domains": _ordered([s.get("domain") or s["name"]], headline)})
-        rest = ddf[TOP_ENTRIES:]
+        rest = ddf[cap:]
         if rest:
             total = sum(s["count"] for s in rest)
             items.append({"kind": "override", "keys": [], "ref": ref,

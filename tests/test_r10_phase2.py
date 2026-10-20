@@ -144,9 +144,11 @@ def test_g1_an_export_without_the_override_columns_reads_exactly_as_before(tmp_p
     assert stand_line(ns, "**Delivered despite failing") == (
         "**Delivered despite failing: 7** - these only arrive because of our own overrides; outside receivers are not "
         "as forgiving (alerts@example.com x3, billing@example.com x3, legacy@example.com x1)")
+    # round 13, T-08: billing@ is our own system: its override goes only after it passes, and the line says why
     assert actions(ns)["billing@example.com - 3 messages reached inboxes despite failing"] == (
-        "find the override (transport rule, allow list, safe sender) that let them in and make it conditional on "
-        "authentication; outside receivers do not have it")
+        "find the override (transport rule, allow list, safe sender) that let them in; after billing@example.com "
+        "passes DMARC, make it conditional on authentication - doing it first junks these 3 too; outside receivers "
+        "do not have it")
     assert "delivered_despite_fail_by" not in ns["stand"]
     # the columns present but empty: nothing is named, and the evidence reads the same
     empty = dedupe_doc(Log().add("billing@example.com", "Statement #", leg(), times=2).write(tmp_path / "empty.csv"))
@@ -245,17 +247,18 @@ def test_g1_the_readers_name_the_override_in_plain_words(tmp_path):
         "legacy@example.com x1)" % named)
     assert doc["stand"]["delivered_despite_fail_by"] == rep["maillog"]["counters"]["delivered_despite_fail_by"]
     todo = actions(doc)
+    # round 13, T-08: our own sender's rule goes only after the sender passes
     assert todo["billing@example.com - 3 messages reached inboxes despite failing"] == (
-        "delivered because of an Exchange transport rule: find that rule and make it conditional on authentication; "
-        "outside receivers do not have it")
+        "delivered because of an Exchange transport rule: after billing@example.com passes DMARC, make that rule "
+        "conditional on authentication - doing it first junks these 3 too; outside receivers do not have it")
     assert todo["alerts@example.com - 3 messages reached inboxes despite failing"] == (
-        "delivered because of a user's safe sender list (2), and the log names no override for the other 1: ask the "
-        "mailbox owners to take the sender off their safe sender lists; for the other 1, look for what the log does "
-        "not record (a mailbox rule, a connector, a filter in front of the tenant); outside receivers do not have "
-        "them")
+        "delivered because of a user's safe sender list (2), and the log names no override for the other 1: after "
+        "alerts@example.com passes DMARC, ask the mailbox owners to take the sender off their safe sender lists - doing "
+        "it first junks these 3 too; for the other 1, look for what the log does not record (a mailbox rule, a "
+        "connector, a filter in front of the tenant); outside receivers do not have them")
     assert todo["legacy@example.com - 1 message reached inboxes despite failing"] == (
-        'delivered because of "org: Connection policy (Allow)": find that override and make it conditional on '
-        "authentication; outside receivers do not have it")
+        'delivered because of "org: Connection policy (Allow)": after legacy@example.com passes DMARC, make that '
+        "override conditional on authentication - doing it first junks this one too; outside receivers do not have it")
     # several overrides behind one sender: each named with its count, each with its own fix
     assert next_steps.override_action({"org: Allowed sender domain list (Allow)": 2, "org: Spoof allow (Allow)": 1}, 3) == (
         "delivered because of the allowed sender domain list (2) and a spoof allow / Tenant Allow Block List entry "
@@ -1096,8 +1099,9 @@ def test_collect_measures_mail_flow_once_per_run_and_counts_a_cut_orgs_whole_win
     assert report["maillog"]["counters"]["delivered_despite_fail_by"] == {
         "org: Exchange transport rule (Allow)": report["maillog"]["counters"]["delivered_despite_fail"]}
     assert "app@corp.example - " in text["next_steps.md"]
-    assert "delivered because of an Exchange transport rule: find that rule and make it conditional on authentication" \
-        in text["next_steps.md"]
+    # round 13, T-08: app@ is our own system, so its rule changes only once it passes
+    assert ("delivered because of an Exchange transport rule: after app@corp.example passes DMARC, make that rule "
+            "conditional on authentication - doing it first junks these") in text["next_steps.md"]
     assert any(n.startswith("mail log: full-window totals for corp.example over the last 30 days") for n in
                files["run.json"]["notes"])
     assert files["run.json"]["degraded"] == []

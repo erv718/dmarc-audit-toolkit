@@ -914,7 +914,9 @@ def test_an_exception_comes_off_the_stream_it_covered_not_the_address_as_a_whole
     strm = next_steps.streams(view, None, own)
     assert [s["name"] for s in strm["own"]] == ["app@corp.example"] and [s["name"] for s in strm["spoof"]] == ["ops@corp.example"]
     line = next_steps.one_liner("corp.example", "none", None, None, strm, None)
-    assert "2 from 1 of our own senders (app@corp.example x2); 3 from 1 address that look like spoofing" in line
+    # round 13, T-07: a spoof label with no lure word in the subject could be our own vendor, and is said so
+    assert ("2 from 1 of our own senders (app@corp.example x2); 3 that could be our own vendors (called spoofing on "
+            "the envelope or a billing word alone: ops@corp.example x3)") in line
     assert "; 2 formally excepted in audit.toml" in line
     # the sections that name senders: the excepted stream is gone, the spoof stream of the same address stays
     assert [(s["name"], s["count"]) for s in view["by_sender"]] == [("ops@corp.example", 3), ("app@corp.example", 2)]

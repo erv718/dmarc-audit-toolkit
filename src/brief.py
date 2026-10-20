@@ -1136,7 +1136,7 @@ def failing_kept(failing):
             if skipping:
                 continue
         if skipping and (s.startswith("- **") or s.startswith("- Notes, not headlines")
-                         or s.startswith("- " + next_steps.MORE_LINE)):
+                         or s.startswith("- " + next_steps.MORE_LINE) or s.startswith("- " + next_steps.REACHED_LINE)):
             continue  # a line the table, the more line or the notes line under it says again
         out.append((current, s[2:] if s.startswith("- ") else s))
     return out
@@ -1224,10 +1224,18 @@ def failing_tables(failing):
                                ("Envelope domain", "Messages", "Label", "Senders"), more, notes,
                                next_steps.NOTES_LINE, own("by_envelope"), "list env"))
     snd = [e for e in _list(failing.get("by_sender")) if isinstance(e, dict)]
+    # one row per address and label group (next_steps.label_rows), and a spoof with a lure word that reached a
+    # mailbox gets a row of its own under HEADLINE_MIN too (next_steps.reached_split), as next_steps.md gives it a line
+    reached, snd = next_steps.reached_split(snd)
     head, more, notes = next_steps.headline_split(snd)
     rows = ['<tr><td class="name">%s</td><td class="num">%s</td><td>%s</td><td>%s</td><td class="name">%s</td></tr>'
             % (plain_name(e.get("name")), esc(_count(e.get("count"))), esc(_label(e)), _subjects(e), _envelopes(e))
             for e in head]
+    rows += ['<tr class="reached"><td class="name">%s</td><td class="num">%s</td><td>%s %s</td><td>%s</td>'
+             '<td class="name">%s</td></tr>'
+             % (plain_name(e.get("name")), esc(_count(e.get("count"))), esc(_label(e)),
+                pill("bad", "reached inboxes: %s" % _count(e.get("reached"))), _subjects(e), _envelopes(e))
+             for e in reached]
     parts.append(failing_block("By sender address", "what the reader sees in From", rows,
                                ("Sender", "Messages", "Label", "Subjects", "Envelope"), more, notes,
                                next_steps.NOTES_LINE, own("by_sender"), "list snd"))
