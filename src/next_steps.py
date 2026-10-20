@@ -89,6 +89,8 @@ FIRST_STEP = "publish a monitoring-only DMARC record for %s so reports start"
 # collect.py option that sets the report address (--rua takes report files), and the setting that does the same
 CHOOSE_RUA = "choose where DMARC reports go (a mailbox you own, or a reporting service)"
 RERUN_RUA = "then rerun with --rua-address mailto:<that address> (or set RUA_MAILBOX in .env)"
+ADDRESS_STEP = "choose where DMARC reports go, then rerun with --rua-address"
+PLACEHOLDER = "mailto:<your aggregate reports address>"  # plan.RUA_PLACEHOLDER, as the records carry it
 # CLI flags in audit prose, as the words a reader without the CLI can act on.
 # Any --flag these do not name is dropped by plain(): a flag means nothing here.
 FLAG_WORDS = tuple((re.compile(p), r) for p, r in (
@@ -2187,7 +2189,11 @@ def org_next(report, plan, org, own=None):
     policy receivers do not apply asks for the record to be corrected; DNS
     never read asks for the data, never a go-ahead. The plan's
     quarantine-now row (no mail measured) is the step whatever the policy,
-    with its checks. The gate's notes ride along; they hold nothing."""
+    with its checks. While any plan row carries the placeholder report
+    address (its status is address) the step is choosing where DMARC
+    reports go (ADDRESS_STEP, kind address), never ready now - unless the
+    organization's own record cannot be read or applied, which comes
+    first. The gate's notes ride along; they hold nothing."""
     changes = changes_for(plan, org)
     gate = report.get("gate") if isinstance(report.get("gate"), dict) else {}
     doms = gate.get("domains") if isinstance(gate.get("domains"), dict) else {}
@@ -2196,13 +2202,23 @@ def org_next(report, plan, org, own=None):
     verdict, _, notes = gate_split(report, org)
     notes = [plain(n) for n in notes]
     items = blocker_items(report, org, own)
+    why = policy_unread_why(report, org)
+    # rows that carry the placeholder report address: nothing that reports can go out before the reports have
+    # somewhere to go, so choosing the address is the step - unless the organization's own record cannot be read
+    # or applied, which stands first whatever the plan holds
+    placeholder = [c for c in plan_changes(plan) if row_status(c)[0] == "address"]
+    if placeholder and why not in ("unverified", "unrecognised"):
+        step = _step(ADDRESS_STEP, "plan", "address", verdict, notes, [b for b in items if b["kind"] != "data"], (),
+                     placeholder[0].get("id"), "no record in this run carries a report address of ours: the new and "
+                     "changed records carry the placeholder %s" % PLACEHOLDER, 1, holds=[], row=placeholder[0])
+        step["placeholder_ids"] = _ids(placeholder)
+        return step
     quiet = next((c for c in changes if c.get("kind") == "no_mail"), None)
     if quiet is not None:  # the run measured no mail sent as it: the quarantine-now row is the step, policy or not
         # what the gate found that the row does not answer holds it too (audit.ramp_blockers_left: its status is held)
         return _step(plain(step_label(quiet)), "plan", "no_mail", verdict, notes, items,
                      reword_prereqs(prereqs_of(quiet)), quiet.get("id"), quiet.get("why"), _n(quiet.get("priority")),
                      holds=[plain(b) for b in audit.ramp_blockers_left(report, org)], row=quiet)
-    why = policy_unread_why(report, org)
     if why == "unverified":
         held = [b for b in items if b["kind"] != "data" and "lookup failed" not in b["text"].lower()]
         return _step("re-run the audit with working DNS before any change to %s's DMARC record: its lookup failed, "
@@ -2248,13 +2264,13 @@ def _needs_data(nxt):
     quarantine-now row, whose checks are its own, and the first record for a
     name DNS shows none at, which needs no evidence."""
     return (bool(nxt) and nxt.get("verdict") == "insufficient_data" and bool(nxt.get("data"))
-            and nxt.get("kind") not in ("no_mail", "first", "park"))
+            and nxt.get("kind") not in ("no_mail", "first", "park", "address"))
 
 
 # what a plan step whose row cannot go out yet waits on, by the row's status (plan.row_status), before any check
 STEP_WAITS = {"host": "once its DNS host is found (this run could not tell where its zone is hosted)",
               "later": "%s, one change to that record a week",
-              "address": "once the report address is chosen (%s, %s)" % (CHOOSE_RUA, RERUN_RUA)}
+              "address": "once the report address is chosen and the run repeated with --rua-address"}
 
 
 def _readiness(nxt):
@@ -2408,7 +2424,12 @@ def one_liner(org, policy, pct, since, strm, nxt):
             mid += "; %d of their failing %s %s formally excepted in audit.toml" % (
                 n, _plural(n, "message"), _plural(n, "is", "are"))
         mid += "."
-    if nxt and nxt.get("kind") == "first":
+    if nxt and nxt.get("kind") == "address":  # never ready now: no row carrying the placeholder can go out
+        ids = nxt.get("placeholder_ids") or []
+        tail = ("The first step is to %s mailto:<that address> (a mailbox you own, or a reporting service; RUA_MAILBOX "
+                "in .env does the same): until then %d %s carry a placeholder report address%s and none is ready."
+                % (nxt["label"], len(ids), _plural(len(ids), "record"), (" (plan %s)" % id_range(ids)) if ids else ""))
+    elif nxt and nxt.get("kind") == "first":
         ref = (" (plan %s)" % nxt["ref"]) if nxt.get("ref") else ""
         tail = "The first step is to %s%s; no policy could be read." % (nxt["label"], ref)
     elif nxt and nxt.get("kind") in ("recheck", "fix_record"):  # nothing is planned until the record can be read

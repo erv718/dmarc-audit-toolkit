@@ -666,8 +666,10 @@ def test_p7_a_derived_report_address_is_said_in_plan_md():
     rep = apex_report("v=DMARC1; p=none;", (), {"corp.example": flow(5)})
     p = plan_of(rep, rua=None)
     assert p["rua_is_placeholder"] and p["rua_derived"] is False
-    assert "Set the reporting address" in plan_mod.render_md(p) and "Check the reporting address" not in \
+    # round 13, T-06: the placeholder note says to choose the address first, with collect.py's own option
+    assert "Choose where DMARC reports go first" in plan_mod.render_md(p) and "Check the reporting address" not in \
         plan_mod.render_md(p)
+    assert "rerun collect.py with `--rua-address mailto:...` or set RUA_MAILBOX" in plan_mod.render_md(p)
 
 
 # ------------------------------------------------------------------ P8: rarer senders and the reports' span

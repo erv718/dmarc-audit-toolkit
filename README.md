@@ -182,7 +182,11 @@ day one:
   with or without a `!10m` size limit: a list goes into new records as given,
   is never appended, and the run says so. Without it, `collect.py` uses the
   report mailbox (`RUA_MAILBOX`); with neither, new records take the `rua`
-  most existing records use and nothing is appended.
+  most existing records use and nothing is appended - and when no record
+  has one, they carry a placeholder, no row that carries it is ready, and
+  the first step every file names is to choose where reports go. On the
+  command line it is `--rua-address mailto:...`; `--rua` takes saved report
+  files, and `collect.py` refuses a `mailto:` there before anything runs.
 - `keep = 12`: how many dated runs stay under `audit-out/history/`.
 - `[notify] enabled`: whether the Slack summary posts when a webhook is set.
 

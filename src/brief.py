@@ -1509,15 +1509,19 @@ def plan_index(rows):
 
 def address_note(plan):
     """plan.md's warning about the report address new records carry, when it
-    is a placeholder or one the run only derived."""
+    is a placeholder (no record carrying it is ready: the step before them
+    is choosing where reports go, with collect.py's own option for it) or
+    one the run only derived."""
     rua = _text(plan.get("rua"))
     if plan.get("rua_is_placeholder"):
-        return ('<p class="note"><strong>Set the reporting address.</strong> No existing record carried a rua, so new '
-                'records use the placeholder <code>%s</code>; plan.md says how to re-run with a real one.</p>'
-                % iso_text(rua))
+        return ('<p class="note"><strong>Choose where DMARC reports go first.</strong> No existing record carried a rua, '
+                'so the new records here carry the placeholder <code>%s</code> and none of them is ready: choose a '
+                'mailbox you own or a reporting service, then rerun collect.py with <code>--rua-address '
+                'mailto:...</code> (or set RUA_MAILBOX in .env).</p>' % iso_text(rua))
     if plan.get("rua_derived"):
         return ('<p class="note"><strong>Check the reporting address.</strong> The run had no report address of its own, '
-                'so new records use <code>%s</code>, the rua most existing records already use; plan.md says more.</p>'
+                'so new records use <code>%s</code>, the rua most existing records already use; if it is not a mailbox '
+                'you read, rerun collect.py with <code>--rua-address mailto:...</code> (plan.md says more).</p>'
                 % iso_text(rua))
     return ""
 

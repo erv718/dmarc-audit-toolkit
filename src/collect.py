@@ -1198,6 +1198,11 @@ def main():
     except config_mod.ConfigError as err:
         die(str(err))
     args = ap.parse_args()
+    # --rua takes saved report files; the report address is --rua-address. Said before anything runs: read as a path,
+    # an address fails only after the whole tenant pull
+    addressed = [p for p in args.rua if str(p).strip().lower().startswith("mailto:")]
+    if addressed:
+        die("--rua takes report files or folders; did you mean --rua-address %s?" % addressed[0].strip())
     from_settings = "domains" in defaults and args.domains is defaults["domains"]  # nothing typed: the file's list
     owners, owners_path, owners_problem = load_owners(args.owners, args.no_owners)
     if owners_problem and args.owners:

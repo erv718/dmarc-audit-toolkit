@@ -4,6 +4,7 @@ builder builds them. Synthetic names only (example.com, example.net, example.org
 brand.example, .invalid, the documentation IP ranges); offline: nothing here touches the
 network. Not a test module: the test_r13_*.py files import it."""
 
+import audit
 import next_steps
 import plan as plan_mod
 import test_r11_plan as T
@@ -174,6 +175,7 @@ def first_run(tmp_path, rua=None):
     carry plan.RUA_PLACEHOLDER) or with --rua-address: {"report", "plan", "inventory", "doc"}; no owners file."""
     docs, log, flows, hosts = first_run_parts()
     rep = T.audited(tmp_path / "run", docs, log, flows=flows, sources={d: ["tenant"] for d in docs})
+    rep["findings"] = audit.flatten_findings(rep)  # the DNS findings too, as collect.py's report carries them
     inventory = inventory_of(hosts, flows)
     plan = plan_mod.build_plan(rep, inventory, rua)
     doc = next_steps.build(rep, plan=plan, date="2026-10-20")

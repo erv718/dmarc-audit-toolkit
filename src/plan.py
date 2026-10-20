@@ -2298,14 +2298,17 @@ def render_md(plan):
              % (" of " + plan["source_report"] if plan.get("source_report") else ""))
     L.append("")
     if plan["rua_is_placeholder"]:
-        L.append("**Set the reporting address.** No existing record carried a rua, so new records use the placeholder "
-                 "`%s`. Re-run with `--rua mailto:...` (your aggregate reporting tool's address, or a mailbox you own)." % RUA_PLACEHOLDER)
+        L.append("**Choose where DMARC reports go first.** No existing record carried a rua, so the new records here "
+                 "carry the placeholder `%s` and none of them is ready (status: needs the report address). Choose a "
+                 "mailbox you own or a reporting service, then rerun collect.py with `--rua-address mailto:...` or set "
+                 "RUA_MAILBOX in .env (plan.py run by hand takes `--rua mailto:...`)." % RUA_PLACEHOLDER)
         L.append("")
     elif plan.get("rua_derived"):
         L.append("**Check the reporting address.** The run had no report address of its own, so new records use `%s`, "
                  "the rua most existing records already use - which may be a reporting service's mailbox the toolkit "
-                 "never reads. If it is not a mailbox you read, re-run with `--rua mailto:...` (collect.py passes its "
-                 "report mailbox, or `--rua-address`); no record gets an address appended until then." % plan["rua"])
+                 "never reads. If it is not a mailbox you read, rerun collect.py with `--rua-address mailto:...` or set "
+                 "RUA_MAILBOX in .env (plan.py run by hand takes `--rua mailto:...`); no record gets an address "
+                 "appended until then." % plan["rua"])
         L.append("")
     L.append("## Summary")
     L.append("")

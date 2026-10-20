@@ -173,3 +173,80 @@ def test_an_older_plan_without_statuses_is_never_read_as_ready_on_a_guess():
     # a plan without an inventory looked up no DNS host: an unknown one is no status of its own
     rep = F.T.apex_report("v=DMARC1; p=none; rua=%s;" % F.RUA)
     assert all(c["status"] != "host" for c in plan_mod.build_plan(rep, None, F.RUA)["changes"])
+
+
+# ------------------------------------------------------------------ T-06: the placeholder report address
+
+
+@pytest.fixture(scope="module")
+def first(tmp_path_factory):
+    return F.first_run(tmp_path_factory.mktemp("r13_first_run"))  # no report mailbox, no --rua-address
+
+
+def test_the_rows_that_carry_the_placeholder_need_the_report_address(first):
+    plan = first["plan"]
+    assert plan["rua_is_placeholder"]
+    st = {c["id"]: (c["status"], c["status_text"]) for c in plan["changes"]}
+    assert [i for i, (s, _) in st.items() if s == "address"] == ["P-01", "P-02", "P-04"]
+    assert all(t == "needs the report address" for s, t in st.values() if s == "address")
+    assert st["P-03"] == ("check", "after 1 check")  # v=spf1 -all carries no address: it waits on its unused check
+    md = plan_mod.render_md(plan).splitlines()
+    assert md[4].startswith("**Choose where DMARC reports go first.**") and "`--rua-address mailto:...`" in md[4]
+    assert "set RUA_MAILBOX in .env" in md[4]
+    assert "Re-run with `--rua mailto:...`" not in "\n".join(md)
+
+
+def test_the_first_step_is_choosing_where_reports_go_never_ready_now(first):
+    doc = first["doc"]
+    assert doc["next_step"]["kind"] == "address" and doc["next_step"]["label"] == next_steps.ADDRESS_STEP
+    assert doc["next_step"]["placeholder_ids"] == ["P-01", "P-02", "P-04"]
+    assert doc["one_liner"].endswith(
+        "The first step is to choose where DMARC reports go, then rerun with --rua-address mailto:<that address> (a "
+        "mailbox you own, or a reporting service; RUA_MAILBOX in .env does the same): until then 3 records carry a "
+        "placeholder report address (plan P-01, P-02, P-04) and none is ready.")
+    assert "ready now" not in doc["one_liner"] and "ready when" not in doc["one_liner"]
+    md = next_steps.render_md(doc)
+    assert "choose where DMARC reports go" in md
+    assert doc["ask"].startswith(
+        "The ask this week: first, choose where DMARC reports go (a mailbox you own, or a reporting service), then "
+        "rerun with --rua-address mailto:<that address> (or set RUA_MAILBOX in .env); until then 3 records carry a "
+        "placeholder report address (plan P-01, P-02, P-04) and none is ready")
+    assert "zero-risk" not in doc["ask"] and "ready now" not in doc["ask"]
+    # todo.md has nothing to do now; the placeholder rows wait, and say on what
+    todo = collect.render_todo(first["report"], first["plan"])
+    assert todo.split("## 2. Do now", 1)[1].split("\n## ", 1)[0].strip().endswith("- none")
+    waiting = todo.split("## 2c. Waiting", 1)[1].split("\n## ", 1)[0]
+    assert waiting.count("  - status: needs the report address") == 3
+    # the brief's note says the same, with collect.py's own option
+    page = brief.render(doc, first["plan"])
+    assert ("<strong>Choose where DMARC reports go first.</strong> No existing record carried a rua, so the new records "
+            "here carry the placeholder") in page
+    assert "then rerun collect.py with <code>--rua-address mailto:...</code> (or set RUA_MAILBOX in .env)" in page
+    text = notify.summarize(first["report"], plan=first["plan"])
+    assert "3 need the report address first" in text and "zero-risk" not in text
+
+
+def test_the_documents_placeholder_is_the_plans():
+    assert next_steps.PLACEHOLDER == plan_mod.RUA_PLACEHOLDER
+
+
+def test_collect_refuses_a_report_address_given_to_rua_before_anything_runs(tmp_path, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(collect.graph_client, "creds", lambda *a, **k: calls.append("creds"))
+    monkeypatch.setattr(collect.verify_setup, "run_checks", lambda *a, **k: calls.append("setup") or [])
+    out = tmp_path / "out"
+    monkeypatch.setattr("sys.argv", ["collect.py", "--no-config", "--env-file", str(tmp_path / "none.env"),
+                                     "--out", str(out), "--rua", "mailto:a@b.example"])
+    with pytest.raises(SystemExit) as exc:
+        collect.main()
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--rua takes report files or folders; did you mean --rua-address mailto:a@b.example?" in err
+    assert calls == [] and not out.exists()  # no tenant call, and no history folder for a run that never ran
+    # the same with the address among report paths, and spelled in capitals
+    monkeypatch.setattr("sys.argv", ["collect.py", "--no-config", "--env-file", str(tmp_path / "none.env"),
+                                     "--out", str(out), "--rua", "samples/rua", "MAILTO:a@b.example"])
+    with pytest.raises(SystemExit) as exc:
+        collect.main()
+    assert exc.value.code == 2 and "did you mean --rua-address MAILTO:a@b.example?" in capsys.readouterr().err
+    assert calls == [] and not out.exists()
