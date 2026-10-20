@@ -2137,6 +2137,10 @@ def build(report, plan=None):
                     kind, kind or "change"), c.get("record") or "?", c.get("hostname") or "?",
                     c.get("priority") if c.get("priority") is not None else "?"))
                 L.append("")
+                # the row's status as plan.py set it (plan.row_status): what every other file says of this row
+                _, status_text, reason = plan_mod.status_of(c)
+                L.append("Status: %s%s." % (status_text, (" - " + reason.rstrip(".")) if reason else ""))
+                L.append("")
                 if c.get("human_summary"):
                     L.append("In plain words: %s" % c["human_summary"])
                     L.append("")

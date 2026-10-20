@@ -285,13 +285,17 @@ def test_an_owners_items_run_by_kind_then_organization_and_a_big_group_is_groupe
     heads = [l for l in body[start:] if l.startswith("  - **")]
     assert heads == ["  - **example.com** - 11 items", "  - **example.net** - 7 items", "  - **Tenant-wide** - 1 item"]
     under = body[start + 1:]
-    assert under[1].startswith("    - **5 zero-risk monitoring records for example.com** ready to publish")
+    # round 13, T-05: a bundle is zero-risk and ready to publish only when every row in it is ready now
+    assert under[1].startswith("    - **5 monitoring records for example.com** 4 ready to publish (P-01, P-02, P-03, "
+                               "P-05); 1 after the checks listed with it (P-04)")
     net = under.index("  - **example.net** - 7 items")
-    assert under[net + 1] == "    - **2 zero-risk monitoring records for example.net** ready to publish (plan P-08 to P-09)"
+    assert under[net + 1] == ("    - **2 monitoring records for example.net** after the checks listed with each (plan "
+                              "P-08 to P-09)")
     assert all(l.startswith(("  - **", "    - **")) for l in under if l)
     # a small group stays flat
     assert body[:2] == ["", "- **Brand team** (#brand)"]
-    assert body[2].startswith("  - **2 zero-risk monitoring and hygiene records** ready to publish (plan P-06 to P-07)")
+    assert body[2].startswith("  - **2 monitoring and hygiene records** 1 ready to publish (P-07); 1 after the checks "
+                              "listed with it (P-06) (plan P-06 to P-07)")
 
 
 def test_the_open_questions_run_by_kind_then_organization_and_are_grouped_by_kind(run):
@@ -362,8 +366,12 @@ def test_todo_md_names_the_domains_in_order(run):
     todo = collect.render_todo(run["report"], run["plan"])
     stands = [l for l in section(todo, "Where each domain stands") if l.startswith("- ")]
     assert [l[2:].split(":")[0] for l in stands] == ORDER
-    assert [l.split()[1] for l in section(todo, "2. Do now") if l.startswith("- P-")] == [
-        "P-%02d" % i for i in range(1, 10)]
+    # round 13, T-05: the priority-1 rows split by status (ready now, after a check, waiting), each part in the
+    # plan's own order, and together every row once
+    parts = [[l.split()[1] for l in section(todo, title) if l.startswith("- P-")]
+             for title in ("2. Do now", "2b. After a check", "2c. Waiting")]
+    assert all(ids == sorted(ids) for ids in parts)
+    assert sorted(i for ids in parts for i in ids) == ["P-%02d" % i for i in range(1, 10)]
 
 
 def test_summary_txt_names_the_domains_in_order(run):

@@ -186,15 +186,21 @@ def test_an_owners_zero_risk_records_are_bundled_per_organization(estate):
     com = "\n".join(body[body.index("  - **example.com** - 11 items"):body.index("  - **example.net** - 7 items")])
     assert "P-08" not in com and "P-09" not in com
     net = body[body.index("  - **example.net** - 7 items") + 1]
-    assert net.startswith("    - **2 zero-risk monitoring records for example.net** ready to publish (plan P-08 to P-09)")
+    # round 13, T-05: a bundle is zero-risk and ready to publish only when every row in it is ready now
+    assert net.startswith("    - **2 monitoring records for example.net** after the checks listed with each (plan P-08 "
+                          "to P-09)")
     items = {g["owner"]: g["items"] for g in estate["doc"]["actions_by_owner"]}[next_steps.UNASSIGNED]
     bundles = [(i["hook"], i["ref"], i["org"], i["orgs"]) for i in items if i["kind"] == "p1summary"]
     assert bundles == [
-        ("5 zero-risk monitoring records for example.com", "plan P-01 to P-05", "example.com", ["example.com"]),
-        ("2 zero-risk monitoring records for example.net", "plan P-08 to P-09", "example.net", ["example.net"])]
-    # one organization's records keep the bundle's old words
+        ("5 monitoring records for example.com", "plan P-01 to P-05", "example.com", ["example.com"]),
+        ("2 monitoring records for example.net", "plan P-08 to P-09", "example.net", ["example.net"])]
+    com_bundle = next(i for i in items if i["kind"] == "p1summary" and i["org"] == "example.com")
+    assert com_bundle["action"].startswith("4 ready to publish (P-01, P-02, P-03, P-05); 1 after the checks listed "
+                                           "with it (P-04)")
+    # one organization's records keep the bundle's old shape
     brand = {g["owner"]: g["items"] for g in estate["doc"]["actions_by_owner"]}["Brand team"]
-    assert brand[0]["hook"] == "2 zero-risk monitoring and hygiene records"
+    assert brand[0]["hook"] == "2 monitoring and hygiene records"
+    assert brand[0]["action"] == "1 ready to publish (P-07); 1 after the checks listed with it (P-06)"
 
 
 def test_an_item_that_concerns_several_organizations_is_filed_under_several_organizations():

@@ -237,6 +237,8 @@ table.index td:first-child { font-family: var(--font-mono); white-space: nowrap;
 .cards { display: flex; flex-direction: column; gap: 0.75rem; }
 .card { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
   padding: 0.85rem 1rem; display: flex; flex-direction: column; gap: 0.55rem; break-inside: avoid; }
+.card.quiet { background: var(--sunken); border-style: dashed; }
+.card .held { font-size: 0.875rem; color: var(--muted); }
 .card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.3rem 0.75rem; }
 .card-head .name { font-family: var(--font-mono); min-width: 0; }
 .fields { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0.45rem 1.25rem;
@@ -289,9 +291,10 @@ pre.value { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.875rem;
   table.index tr { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; gap: 0.1rem 0.75rem;
     align-items: baseline; padding-block: 0.45rem; border-bottom: 1px solid var(--line); }
   table.index td { padding: 0; border: 0; text-align: left; }
-  table.index td.name { grid-column: 1 / -1; grid-row: 2; }
-  table.index td:nth-child(2)::before { content: "priority "; color: var(--muted); }
-  table.index td:nth-child(5)::before { content: "checks "; color: var(--muted); }
+  table.index td.status { grid-column: 1 / -1; grid-row: 2; }
+  table.index td.name { grid-column: 1 / -1; grid-row: 3; }
+  table.index td:nth-child(3)::before { content: "priority "; color: var(--muted); }
+  table.index td:nth-child(6)::before { content: "checks "; color: var(--muted); }
 }
 @page { margin: 16mm 14mm; }
 @media print {
@@ -1433,15 +1436,35 @@ def _short(value):
     return " short" if len(value) <= SHORT_FIELD else ""
 
 
+# a row's status (plan.row_status) as a pill: the class from this fixed map, the words the plan's own
+STATUS_PILLS = {"now": "ok", "check": "warn", "address": "bad", "held": "bad", "host": "info", "later": "info",
+                "gated": "info"}
+
+
+def status_pill(c):
+    """The row's status pill: its status_text up to any parenthesis ('held',
+    never '(Per domain says why)' in a pill), colored by STATUS_PILLS; ''
+    for a row with no status the plan recognizes."""
+    status, text, _ = plan_mod.status_of(c)
+    if status not in STATUS_PILLS:
+        return ""
+    return pill(STATUS_PILLS[status], text.split(" (", 1)[0])
+
+
 def record_card(c, n):
     """One plan row as a record card (its id on the page is its place, n):
-    id, kind and domain; what it does in plain words; the host name, type
-    and TTL side by side (the two short ones as wide as their values), then
-    the value, the current value and the rollback; the prerequisites as a
-    compact checklist; the why, muted."""
+    its status first, as a pill (plan.row_status), then id, kind and domain;
+    what it does in plain words; the host name, type and TTL side by side
+    (the two short ones as wide as their values), then the value, the
+    current value and the rollback; the prerequisites as a compact
+    checklist; the why, muted. A row that does not go out this week (held,
+    gated, after another row) is a quiet card, with what holds it under the
+    head."""
     kind = _text(c.get("kind"))
     rid = _text(c.get("id"))
-    head_parts = [tag(rid, "tag rid") if rid else "", '<span class="k">%s</span>' % esc(plan_mod.KIND_LABEL.get(kind, kind)),
+    status, _, reason = plan_mod.status_of(c)
+    head_parts = [status_pill(c), tag(rid, "tag rid") if rid else "",
+                  '<span class="k">%s</span>' % esc(plan_mod.KIND_LABEL.get(kind, kind)),
                   '<span class="name">%s</span>' % name_html(c.get("domain")),
                   " ".join(tag(f) for f in _texts(c.get("finding_ids")))]
     rtype, ttl = _shown(c.get("record")), _shown(c.get("ttl"))
@@ -1452,6 +1475,8 @@ def record_card(c, n):
               ("Current", '<span class="mono muted">%s</span>' % esc(_shown(c.get("current"))), " wide"),
               ("Rollback", prose(_shown(c.get("rollback"))), " wide"))
     parts = ['<div class="card-head">%s</div>' % " ".join(p for p in head_parts if p)]
+    if reason and status in ("held", "gated"):  # what holds it, in the plan's words; a check is listed below
+        parts.append('<p class="held">%s</p>' % prose(("Held by: " if status == "held" else "The gate: ") + reason))
     if _text(c.get("human_summary")):
         parts.append("<p>%s</p>" % prose(c["human_summary"]))
     parts.append('<dl class="fields">%s</dl>' % "".join('<div class="field%s"><dt>%s</dt><dd>%s</dd></div>'
@@ -1461,22 +1486,25 @@ def record_card(c, n):
         parts.append('<div class="pre"><p class="k">Before applying</p>%s</div>' % checklist(prereqs, "checklist compact"))
     if _text(c.get("why")):
         parts.append('<p class="why">%s</p>' % prose(c["why"]))
-    return '<article class="card" id="%s">%s</article>' % (CARD_ID % n, "".join(parts))
+    quiet = " quiet" if status in plan_mod.WAITING_STATUSES else ""
+    return '<article class="card%s" id="%s">%s</article>' % (quiet, CARD_ID % n, "".join(parts))
 
 
 def plan_index(rows):
     """Every row at a glance, in the cards' order: its id (a link to its
-    card), priority, host name, kind and how many checks wait before it -
-    so a publisher scans the whole plan at once and jumps to one row."""
+    card), its status (plan.row_status, as the card's pill), priority, host
+    name, kind and how many checks wait before it - so a publisher scans
+    the whole plan at once, sees which rows can go out, and jumps to one."""
     body = []
     for n, c in enumerate(rows, 1):
         kind = _text(c.get("kind"))
         checks = len(_texts(c.get("prerequisites")))
-        body.append('<tr><td><a href="#%s">%s</a></td><td class="num">%s</td><td class="name">%s</td><td>%s</td>'
-                    '<td class="num">%s</td></tr>'
-                    % (CARD_ID % n, esc(_text(c.get("id")) or "row %d" % n), esc(_shown(c.get("priority")) or "?"),
-                       plain_name(c.get("hostname")), esc(plan_mod.KIND_LABEL.get(kind, kind)), checks or "none"))
-    return table(("Id", "Priority", "Host name", "Kind", "Checks"), body, numeric=(1, 4), cls="index")
+        body.append('<tr><td><a href="#%s">%s</a></td><td class="status">%s</td><td class="num">%s</td>'
+                    '<td class="name">%s</td><td>%s</td><td class="num">%s</td></tr>'
+                    % (CARD_ID % n, esc(_text(c.get("id")) or "row %d" % n), status_pill(c),
+                       esc(_shown(c.get("priority")) or "?"), plain_name(c.get("hostname")),
+                       esc(plan_mod.KIND_LABEL.get(kind, kind)), checks or "none"))
+    return table(("Id", "Status", "Priority", "Host name", "Kind", "Checks"), body, numeric=(2, 5), cls="index")
 
 
 def address_note(plan):

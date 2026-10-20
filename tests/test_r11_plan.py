@@ -1439,13 +1439,14 @@ def test_a_record_that_keeps_a_subdomain_at_quarantine_is_never_called_a_monitor
     only_monitor = [i for g in next_steps.build_actions(rep, {"changes": [monitor], "holds": []}, None, [])
                     for i in g["items"] if i["kind"] == "p1summary"][0]
     assert only_monitor["hook"] == "1 zero-risk monitoring record" and only_monitor["action"] == "ready to publish"
+    # the summary and todo.md count the rows by their status (round 13, T-05): both are ready now
     text = notify.summarize(rep, plan=plan)
-    assert "plan: 2 change(s) waiting, 2 are zero-risk monitoring/hygiene (1 keeps a subdomain at the policy it " \
-           "follows today); 0 hold(s)" in text
+    assert "plan: 2 change(s) waiting: 2 ready now, zero-risk monitoring/hygiene (1 keeps a subdomain at the policy " \
+           "it follows today); 0 hold(s)" in text
     todo = collect.render_todo(rep, plan)
-    assert ("## 2. Do now (plan priority 1: monitoring and hygiene and records that keep a subdomain at the policy it "
-            "follows today, zero delivery risk;") in todo
-    assert "## 2. Do now (plan priority 1: monitoring and hygiene, zero delivery risk;" in \
+    assert ("## 2. Do now (plan priority 1, ready now: monitoring and hygiene and records that keep a subdomain at the "
+            "policy it follows today with no mail impact and nothing to check first)") in todo
+    assert "## 2. Do now (plan priority 1, ready now: monitoring and hygiene with no mail impact" in \
         collect.render_todo(rep, {"changes": [monitor], "holds": []})
 
 

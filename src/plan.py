@@ -2088,6 +2088,101 @@ def alternatives(changes):
             c["prerequisite_items"] = prereq_items(c["prerequisites"])
 
 
+# Every row's status, computed once here and read by every file that lays the plan out (the ask, todo.md, the
+# cards and At a glance, verify.md, the status band): the first that applies, in this order. Its words are fixed
+# generator text; only an id (later) and a count (check) are data.
+ROW_STATUSES = ("address", "host", "held", "gated", "later", "check", "now")
+STATUS_WORDS = {"address": "needs the report address", "host": "find its DNS host first",
+                "held": "held (Per domain says why)", "gated": "the gate says not yet", "later": "after %s",
+                "check": "after %d %s", "now": "ready now"}
+# the statuses whose row does not go out this week whatever is checked (brief.py mutes their cards)
+WAITING_STATUSES = ("held", "gated", "later")
+ONE_A_WEEK = re.compile(r"^one change to \S+ a week: this row and the other rows? for it \(([^)]+)\)")
+
+
+def _plain_reason(text):
+    """A blocker or a prerequisite as the status reason quotes it: in the status document's plain words."""
+    import next_steps  # here, not at the top: next_steps.py imports this module
+    return next_steps.plain(text)
+
+
+def row_status(change, report=None, order=None, hosts=True):
+    """(status, status_text, status_reason) for one plan row, the first rule
+    that applies: address - its value carries the placeholder report
+    address (RUA_PLACEHOLDER); host - its DNS host is unknown (zone_host
+    empty or "unknown": the inventory's NS lookup found none; hosts False
+    says the plan's inventory carried no DNS hosts at all, or there was
+    none, so no row's host was looked up and none is said to be missing);
+    held - a quarantine-now row (no_mail) whose
+    domain's gate blockers hold it too (audit.ramp_blockers_left); gated - an
+    enforcement step (priority 3 or more) whose domain's gate is not go;
+    later - one of the record's one-change-a-week rows that comes after
+    another (its prerequisite names an id earlier in the plan; order: {id:
+    place}); check - any prerequisite still to confirm (a "verified unused"
+    line is no check); now - nothing holds it. status_reason: the first
+    blocker that holds it (held, gated), or the first check, in plain
+    words (check); else "". report None (a plan read without its report):
+    held is never said, and an enforcement step is gated - the gate cannot
+    be read, so it never reads as ready."""
+    import audit  # here, not at the top: audit.py imports this module
+    value = _text(change.get("value"))
+    pre = [str(p) for p in _rows(change.get("prerequisites")) if isinstance(p, str) and p]
+    if RUA_PLACEHOLDER in value:
+        return "address", STATUS_WORDS["address"], ""
+    if hosts and _text(change.get("zone_host")).strip().lower() in ("", "unknown"):
+        return "host", STATUS_WORDS["host"], ""
+    domain = _name(change.get("domain"))
+    if change.get("kind") == "no_mail" and isinstance(report, dict):
+        left = audit.ramp_blockers_left(report, domain)
+        if left:
+            return "held", STATUS_WORDS["held"], _plain_reason(left[0])
+    try:
+        priority = int(change.get("priority"))
+    except (TypeError, ValueError):
+        priority = None
+    if priority is not None and priority >= 3:
+        g = _dict(_dict(_dict(_dict(report).get("gate")).get("domains")).get(domain))
+        if g.get("verdict") != "go":
+            first = next((str(b) for b in _rows(g.get("blockers")) if b), "")
+            first = re.sub(r"^%s: " % re.escape(domain), "", first) if domain else first
+            return "gated", STATUS_WORDS["gated"], _plain_reason(first) if first else ""
+    place = (order or {}).get(change.get("id"))
+    for p in pre:
+        m = ONE_A_WEEK.match(p)
+        if m and place is not None:
+            earlier = [i for i in (x.strip() for x in m.group(1).split(",")) if (order or {}).get(i, place) < place]
+            if earlier:
+                return "later", STATUS_WORDS["later"] % earlier[0], ""
+    open_checks = [p for p in pre if not p.startswith("verified unused")]
+    if open_checks:
+        import next_steps  # here, not at the top: next_steps.py imports this module
+        n = len(open_checks)
+        return "check", STATUS_WORDS["check"] % (n, "check" if n == 1 else "checks"), \
+            next_steps.reword_prereq(open_checks[0])
+    return "now", STATUS_WORDS["now"], ""
+
+
+def set_statuses(changes, report=None, hosts=True):
+    """Every row's status, status_text and status_reason (row_status), in place; ids must be set. hosts: the
+    plan had an inventory to read each row's DNS host from (row_status)."""
+    order = {c.get("id"): k for k, c in enumerate(changes) if c.get("id")}
+    for c in changes:
+        c["status"], c["status_text"], c["status_reason"] = row_status(c, report, order, hosts)
+
+
+def status_of(change):
+    """(status, status_text, status_reason) as the row carries them: the
+    plan's own, computed once (set_statuses); a row from an older plan.json
+    that carries none gets row_status without the report (never held, an
+    enforcement step gated), so no reader calls such a row ready on a
+    guess - its unknown DNS host a status only when the row carries a
+    zone_host at all."""
+    change = _dict(change)
+    if change.get("status") in ROW_STATUSES and isinstance(change.get("status_text"), str):
+        return change["status"], change["status_text"], _text(change.get("status_reason"))
+    return row_status(change, hosts="zone_host" in change)
+
+
 def record_rank(change):
     """Where a row's record sits among one domain's rows: its _dmarc record
     first, then the record at its own name (SPF), then its _domainkey
@@ -2170,6 +2265,9 @@ def build_plan(report, inventory=None, rua=None, ttl=DEFAULT_TTL):
     for i, c in enumerate(changes, 1):
         c["id"] = "P-%02d" % i
     alternatives(changes)
+    # once, here: every reader takes the row's status as it stands. A row's unknown DNS host is a status only when
+    # the inventory carried the hosts its NS lookups found (discover.py): one with none looked nothing up
+    set_statuses(changes, report, any("zone_host" in row for row in inv_rows.values()))
     by_host = collections.OrderedDict()
     for c in changes:
         by_host.setdefault(c["zone_host"], []).append(c)

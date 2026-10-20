@@ -437,14 +437,17 @@ def test_the_plan_at_a_glance_puts_each_host_name_on_its_own_line_on_a_phone():
     Edge at 360px: _dmarc.dev.support.example.com on one line, no inner scroll)."""
     narrow = css_block("@media screen and (max-width: 48rem)")
     assert "table.index tr { display: grid;" in narrow
-    assert "table.index td.name { grid-column: 1 / -1; grid-row: 2; }" in narrow
-    assert 'table.index td:nth-child(2)::before { content: "priority "; ' in narrow
-    assert 'table.index td:nth-child(5)::before { content: "checks "; ' in narrow
+    # round 13, T-05: the row's status on a full-width line of its own, the host name on the line below it
+    assert "table.index td.status { grid-column: 1 / -1; grid-row: 2; }" in narrow
+    assert "table.index td.name { grid-column: 1 / -1; grid-row: 3; }" in narrow
+    assert 'table.index td:nth-child(3)::before { content: "priority "; ' in narrow
+    assert 'table.index td:nth-child(6)::before { content: "checks "; ' in narrow
     plan = {"changes": [{"id": "P-01", "priority": 1, "zone_host": "Route53", "zone": "example.com",
                          "domain": "dev.support.example.com", "hostname": "_dmarc.dev.support.example.com",
                          "kind": "new", "prerequisites": ["a lookup shows no record"]}]}
     index = re.search(r'<table class="index">.*?</table>', brief.render({}, plan)).group(0)
-    assert re.findall(r"<td( class=\"\w+\")?>", index) == ["", ' class="num"', ' class="name"', "", ' class="num"']
+    assert re.findall(r"<td( class=\"\w+\")?>", index) == ["", ' class="status"', ' class="num"', ' class="name"', "",
+                                                           ' class="num"']
 
 
 def test_a_sentence_in_a_per_domain_cell_breaks_a_name_between_its_labels():

@@ -971,19 +971,44 @@ def render_todo(report, plan, caveats=()):
     L += ["- %s: %s" % (h["domain"], h["reason"]) for h in holds] or ["- none"]
     L.append("")
 
-    # monitoring and hygiene rows touch no mail anyone sends; a no-mail-measured row waits on its checks
-    keeps = any(c.get("priority") == 1 and c.get("kind") == "new" and
-                not re.search(r"(?:^|;)\s*p\s*=\s*none\b", str(c.get("value") or ""), re.I) for c in changes)
-    L.append("## 2. Do now (plan priority 1: monitoring and hygiene%s, zero delivery risk; quarantine where no mail "
-             "is measured, after its checks)" % (
-                 " and records that keep a subdomain at the policy it follows today" if keeps else ""))
-    L.append("")
+    # the plan's priority-1 rows by the status plan.py gave each (plan.row_status): only the ones ready now touch
+    # no mail anyone sends and wait on nothing; the rest wait on their checks, or cannot go out this week
     rows = [c for c in changes if c.get("priority") == 1]
+    status = {id(c): plan_mod.status_of(c) for c in rows}
+    ready = [c for c in rows if status[id(c)][0] == "now"]
+    checked = [c for c in rows if status[id(c)][0] == "check"]
+    waiting = [c for c in rows if status[id(c)][0] not in ("now", "check")]
+    keeps = any(c.get("kind") == "new" and not re.search(r"(?:^|;)\s*p\s*=\s*none\b", str(c.get("value") or ""), re.I)
+                for c in ready)
+
+    def row_line(c):
+        return ("- %s %s: %s at `%s` = `%s` (current: `%s`) - %s"
+                % (c["id"], c["domain"], c["record"], c["hostname"], c["value"], c["current"], c["why"]))
+
+    def status_line(c):
+        _, text, reason = status[id(c)]
+        return "  - status: %s%s" % (text, (" - " + reason) if reason else "")
+
+    L.append("## 2. Do now (plan priority 1, ready now: monitoring and hygiene%s with no mail impact and nothing "
+             "to check first)" % (" and records that keep a subdomain at the policy it follows today" if keeps else ""))
+    L.append("")
+    L += [row_line(c) for c in ready] or ["- none"]
+    L.append("")
+    L.append("## 2b. After a check (plan priority 1: publish each once the checks listed with it are confirmed; a "
+             "quarantine-now row changes delivery for a domain the run measured sending nothing)")
+    L.append("")
     items = []
-    for c in rows:
-        items.append("- %s %s: %s at `%s` = `%s` (current: `%s`) - %s"
-                     % (c["id"], c["domain"], c["record"], c["hostname"], c["value"], c["current"], c["why"]))
+    for c in checked:
+        items += [row_line(c), status_line(c)]
         # a park row waits on its unused check, a task row on its inventory: said here, not only in plan.md
+        items += ["  - before applying: %s" % pre for pre in c.get("prerequisites") or []]
+    L += items or ["- none"]
+    L.append("")
+    L.append("## 2c. Waiting (plan priority 1 rows that cannot go out this week, and what each waits on)")
+    L.append("")
+    items = []
+    for c in waiting:
+        items += [row_line(c), status_line(c)]
         items += ["  - before applying: %s" % pre for pre in c.get("prerequisites") or []]
     L += items or ["- none"]
     L.append("")

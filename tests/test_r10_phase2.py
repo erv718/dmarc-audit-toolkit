@@ -1069,9 +1069,11 @@ def test_collect_measures_mail_flow_once_per_run_and_counts_a_cut_orgs_whole_win
     assert {c["hostname"]: c["prerequisites"][1:] for c in parks} == {
         "parked.example": [],
         "_dmarc.parked.example": [plan_mod.external_destination("parked.example", "mailto:reports@example.com")]}
-    for c in parks:  # todo.md's "Do now" says what each park row waits on, as plan.md does
+    for c in parks:  # todo.md says what each park row waits on, as plan.md does: its status, then its checks
         row = "- %s parked.example: TXT at `%s` = `%s`" % (c["id"], c["hostname"], c["value"])
-        assert text["todo.md"].split(row, 1)[1].split("\n")[1] == "  - before applying: " + open_checks
+        after = text["todo.md"].split(row, 1)[1].split("\n")
+        assert after[1].startswith("  - status: %s - " % c["status_text"])  # round 13, T-05
+        assert after[2] == "  - before applying: " + open_checks
     assert "of which 2 are park rows that need the domain's unused check first" in text["next_steps.md"]
     assert "| `parked.example` | no DMARC record | " in text["next_steps.md"]
     assert "| nothing sent or received in 30 days (tenant) |" in text["next_steps.md"]

@@ -484,10 +484,13 @@ def test_k1_an_audited_name_whose_own_lookup_failed_is_not_checked_either():
             "it failed (plan.json says: not checked (its lookup failed in this run)); if one does, do not publish: "
             "mkt.corp.example already has a record of its own") in blk
     assert "https://dns.google/resolve?name=_dmarc.mkt.corp.example&type=TXT" in blk
-    # the status document asks for the lookup with the approval, and its per-domain row says so too
+    # the status document asks for the lookup with the approval, and its per-domain row says so too; a row with a
+    # check first is never asked as a zero-risk record (round 13, T-05: its status is after 1 check)
     doc = next_steps.build(rep, p)
-    assert ("approval to publish the 1 zero-risk record (plan %s) in the next DNS change window, of which 1 needs a "
+    assert m["status"] == "check" and m["status_text"] == "after 1 check"
+    assert ("approval to publish 1 record (plan %s) once the checks listed with it are confirmed, of which 1 needs a "
             "lookup of the name's own _dmarc record first (publish only if it has none)" % m["id"]) in doc["ask"]
+    assert "zero-risk" not in doc["ask"]
     assert [g["next_step"] for g in doc["per_domain"] if g["domains"] == ["mkt.corp.example"]] == [
         "publish a p=none monitoring record (once a lookup shows it has no record of its own)"]
     # a quiet one, a parked one: the same lookup comes first
@@ -590,18 +593,24 @@ def test_k1_k2_next_steps_names_the_append_and_the_lookups_still_owed(monkeypatc
     assert ("| `shop.example` | p=none | needs more data | add the toolkit's report address to rua or move to "
             "p=quarantine at pct=25, one a week (plan %s, %s) |" % (a["id"], s["id"])) in doc
     assert "add rua reporting" not in doc
-    # the zero-risk records, one item per organization (round 12: an organization's line holds its own records):
-    # the two whose own record nobody saw wait on a lookup, and corp.example's item says so
-    corp = [c["id"] for c in plan["changes"] if c["priority"] == 1 and c["domain"].endswith("corp.example")]
-    assert ("- **%d zero-risk monitoring records for corp.example** ready to publish, of which 2 (%s, %s) need a lookup "
-            "first: the name may have a record of its own already (plan %s to %s)"
-            % (len(corp), q["id"], f["id"], corp[0], corp[-1]) in doc)
-    assert ("- **1 zero-risk monitoring record for brand.example** ready to publish (plan %s)" % b["id"] in doc
-            and "- **1 zero-risk monitoring record for shop.example** ready to publish (plan %s)" % a["id"] in doc)
+    # the monitoring records, one item per organization (round 12: an organization's line holds its own records):
+    # the two whose own record nobody saw wait on a lookup, and corp.example's item says so; only the rows ready
+    # now are ready to publish (round 13, T-05: the row statuses)
+    corp = [c for c in plan["changes"] if c["priority"] == 1 and c["domain"].endswith("corp.example")]
+    ready = [c["id"] for c in corp if c["status"] == "now"]
+    assert [c["id"] for c in corp if c["status"] == "check"] == [q["id"], f["id"]] and len(ready) == 2
+    assert ("- **%d monitoring records for corp.example** 2 ready to publish (%s, %s); 2 after the checks listed "
+            "with each (%s, %s), of which 2 (%s, %s) need a lookup first: the name may have a record of its own "
+            "already (plan %s to %s)" % (len(corp), ready[0], ready[1], q["id"], f["id"], q["id"], f["id"],
+                                         corp[0]["id"], corp[-1]["id"]) in doc)
+    assert ("- **1 monitoring record for brand.example** after the checks listed with it (plan %s)" % b["id"] in doc
+            and "- **1 monitoring record for shop.example** after the checks listed with it (plan %s)" % a["id"] in doc)
     assert len(corp) + 2 == len(p1)
-    assert ("approval to publish the %d zero-risk records (plan %s to %s) in the next DNS change window, of which 2 "
-            "need a lookup of the name's own _dmarc record first (publish only if it has none)"
-            % (len(p1), p1[0], p1[-1])) in doc
+    checked = [c for c in p1 if c not in ready]
+    assert ("approval to publish the 2 zero-risk records (plan %s, %s) in the next DNS change window; approval to "
+            "publish 4 more records (plan %s) once the checks listed with each are confirmed, of which 2 need a lookup "
+            "of the name's own _dmarc record first (publish only if it has none)"
+            % (ready[0], ready[1], next_steps.id_range(checked))) in doc
 
 
 def own(domain, record, **over):

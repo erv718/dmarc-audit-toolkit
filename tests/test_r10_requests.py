@@ -442,26 +442,37 @@ def test_r2_the_plan_md_row_the_table_and_todo_say_it_in_plain_words(tmp_path):
     assert ("| `brand.example` | no DMARC record | not yet - held by: (DMARC-001) (for the weekly ramp this skips) | "
             "no mail measured: quarantine now (plan %s) | nothing sent or received in 30 days (tenant) |"
             % brand["id"]) in next_steps.render_md(doc)
-    # the ask counts the quarantine-now rows apart from the zero-risk records
-    assert ("approval to publish the %d zero-risk records (plan %s) in the next DNS change window, of which 2 are "
-            "park rows that need the domain's unused check first; approval to move 3 domains that send no mail "
-            "straight to quarantine (plan %s) once the checks listed with each are confirmed"
-            % (len(zero_risk), next_steps.id_range(zero_risk), next_steps.id_range(quiet))) in doc["ask"]
+    # the ask counts the quarantine-now rows apart from the zero-risk records, and only the rows ready now are
+    # zero-risk: the park rows that need their unused check are asked once it is confirmed (round 13, T-05)
+    ready = [c["id"] for c in p["changes"] if c["id"] in zero_risk and c["status"] == "now"]
+    checked = [i for i in zero_risk if i not in ready]
+    assert len(ready) == 6 and len(checked) == 2
+    assert ("approval to publish the %d zero-risk records (plan %s) in the next DNS change window; approval to "
+            "publish 2 more records (plan %s) once the checks listed with each are confirmed, of which 2 are park rows "
+            "that need the domain's unused check first; approval to move 3 domains that send no mail straight to "
+            "quarantine (plan %s) once the checks listed with each are confirmed"
+            % (len(ready), next_steps.id_range(ready), next_steps.id_range(checked),
+               next_steps.id_range(quiet))) in doc["ask"]
     todo = collect.render_todo(rep, p)
-    assert ("## 2. Do now (plan priority 1: monitoring and hygiene, zero delivery risk; quarantine where no mail is "
-            "measured, after its checks)") in todo
-    do_now = todo.split("## 2. Do now", 1)[1].split("## 3.", 1)[0]
+    assert ("## 2. Do now (plan priority 1, ready now: monitoring and hygiene with no mail impact and nothing to check "
+            "first)") in todo
+    do_now = todo.split("## 2. Do now", 1)[1].split("## 2b.", 1)[0]
+    after = todo.split("## 2b. After a check", 1)[1].split("## 2c.", 1)[0]
     assert ("- %s brand.example: TXT at `_dmarc.brand.example` = `v=DMARC1; p=quarantine; sp=none; rua=%s;` (current: `none`) "
-            "- quarantine now: " % (brand["id"], RUA)) in do_now
-    assert do_now.count("  - before applying: no sender that mails monthly or less often (statements, renewals) "
-                        "uses this domain") == 3
+            "- quarantine now: " % (brand["id"], RUA)) in after
+    assert "brand.example" not in do_now and "quarantine now" not in do_now
+    assert after.count("  - before applying: no sender that mails monthly or less often (statements, renewals) "
+                       "uses this domain") == 3
     stands = todo.split("## Where each domain stands", 1)[1].split("## 1.", 1)[0]
     assert ("- brand.example: p=unknown, next step: no mail measured, quarantine now (%s, section 2); the gate's no_go "
             "is for the weekly ramp this skips" % brand["id"]) in stands
     assert ("- spoofed.example: p=none, next step: no mail measured, quarantine now (%s, section 2); the gate's no_go "
             "is for the weekly ramp this skips" % one(rows_by(p)["spoofed.example"], "no_mail")["id"]) in stands
     text = notify.summarize(rep, plan=p)
-    assert "are zero-risk monitoring/hygiene, 3 move domains that send no mail straight to quarantine;" in text
+    # the summary counts the rows by their status too (round 13, T-05): zero-risk only for the ones ready now
+    assert ("- plan: 14 change(s) waiting: 6 ready now, zero-risk monitoring/hygiene, 6 after their checks (3 move "
+            "domains that send no mail straight to quarantine), 2 not this week (held, gated or after another change "
+            "to the same record); 1 hold(s)") in text
     assert ("- `spoofed.example`: p=none, next: no mail measured, quarantine now (plan %s); the gate's *no_go* is for "
             "the weekly ramp this skips - 30 genuine failures of its own"
             % one(rows_by(p)["spoofed.example"], "no_mail")["id"]) in text

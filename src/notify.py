@@ -46,6 +46,7 @@ from pathlib import Path
 import audit  # the delta's own rules, the recorded cuts, what a quarantine-now row clears, a split census
 import dedupe  # the overrides that let a delivered failure in, in plain words
 import next_steps  # the organization the status document leads with, which the per-domain lines lead with too
+import plan as plan_mod  # each plan row's status, as plan.py set it once
 import run_hunting
 
 WEBHOOK_KEYS = ("SLACK_WEBHOOK_URL", "TEAMS_WEBHOOK_URL")
@@ -691,25 +692,46 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
             lines.append("- trend over the last %d runs (%s): %s" % (len(pts), word, "; ".join(parts + why)))
 
     if isinstance(plan, dict):
-        ch = [c for c in _rows(plan.get("changes")) if isinstance(c, dict)]
-        # a no_mail row quarantines a domain the run measured sending nothing: priority 1, but not monitoring; a
-        # monitoring record for a name whose own record nobody looked up waits on that lookup
-        quiet = sum(1 for c in ch if c.get("kind") == "no_mail")
-        p1 = [c for c in ch if c.get("priority") == 1 and c.get("kind") != "no_mail"]
-        looks = sum(1 for c in p1 if any(str(p).startswith("look up _dmarc.") for p in _rows(c.get("prerequisites"))))
-        # a record that keeps a subdomain at the p=quarantine it follows today is zero-risk, but not monitoring
-        keeps = sum(1 for c in p1 if c.get("kind") == "new" and re.search(r"(?:^|;)\s*p\s*=\s*(?!none\b)\w",
-                                                                          str(c.get("value") or ""), re.I))
-        said = (["%d of them after a lookup of the name's own record" % looks] if looks else []) + \
-            (["%d %s a subdomain at the policy it follows today" % (keeps, "keeps" if keeps == 1 else "keep")]
-             if keeps else [])
-        lines.append("- plan: %d change(s) waiting, %d are zero-risk monitoring/hygiene%s%s; %d hold(s)"
-                     % (len(ch), len(p1),
-                        (" (%s)" % "; ".join(said)) if said else "",
-                        (", %d %s no mail straight to quarantine"
-                         % (quiet, "moves a domain that sends" if quiet == 1 else "move domains that send"))
-                        if quiet else "", len(_rows(plan.get("holds")))))
+        lines.append(plan_line(plan))
     return "\n".join(lines)
+
+
+def plan_line(plan):
+    """The summary's plan line, by the status plan.py gave each row
+    (plan.row_status): how many are ready now (zero-risk only then: no mail
+    impact and nothing to check), how many wait on their checks (a
+    quarantine-now row, which changes delivery for a domain the run measured
+    sending nothing, and a record that waits on a lookup of the name's own
+    record, said apart), how many need the report address or their DNS
+    host first, and how many are not for this week; then the holds."""
+    ch = [c for c in _rows(plan.get("changes")) if isinstance(c, dict)]
+    status = {id(c): plan_mod.status_of(c)[0] for c in ch}
+    ready = [c for c in ch if status[id(c)] == "now"]
+    checked = [c for c in ch if status[id(c)] == "check"]
+    quiet = sum(1 for c in checked if c.get("kind") == "no_mail")
+    looks = sum(1 for c in checked if any(str(p).startswith("look up _dmarc.") for p in _rows(c.get("prerequisites"))))
+    # a record that keeps a subdomain at the p=quarantine it follows today is zero-risk, but not monitoring
+    keeps = sum(1 for c in ready if c.get("kind") == "new" and re.search(r"(?:^|;)\s*p\s*=\s*(?!none\b)\w",
+                                                                         str(c.get("value") or ""), re.I))
+    parts = []
+    if ready:
+        parts.append("%d ready now, zero-risk monitoring/hygiene%s" % (
+            len(ready), (" (%d %s a subdomain at the policy it follows today)" % (keeps, "keeps" if keeps == 1 else "keep"))
+            if keeps else ""))
+    if checked:
+        said = (["%d %s no mail straight to quarantine" % (quiet, "moves a domain that sends" if quiet == 1
+                                                          else "move domains that send")] if quiet else []) + \
+            (["%d after a lookup of the name's own record" % looks] if looks else [])
+        parts.append("%d after their checks%s" % (len(checked), (" (%s)" % "; ".join(said)) if said else ""))
+    for key, words in (("address", "need the report address first"), ("host", "need their DNS host found first")):
+        n = sum(1 for c in ch if status[id(c)] == key)
+        if n:
+            parts.append("%d %s" % (n, words))
+    waiting = sum(1 for c in ch if status[id(c)] in plan_mod.WAITING_STATUSES)
+    if waiting:
+        parts.append("%d not this week (held, gated or after another change to the same record)" % waiting)
+    return "- plan: %d change(s) waiting%s; %d hold(s)" % (len(ch), (": " + ", ".join(parts)) if parts else "",
+                                                           len(_rows(plan.get("holds"))))
 
 
 def _d(value):

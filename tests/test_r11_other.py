@@ -172,8 +172,9 @@ def test_n28_a_parked_domain_leads_with_its_park_row_never_a_monitoring_record(t
     assert doc["next_step"]["kind"] == "park" and doc["next_step"]["ref"] == "P-01"
     assert "monitoring-only" not in line and "monitoring-only" not in doc["ask"]
     assert line.endswith("The next safe step is to park it with p=reject, ready when %s." % park)
-    assert doc["ask"] == ("The ask this week: approval to publish the 2 zero-risk records (plan P-01 to P-02) in the next "
-                          "DNS change window, of which 2 are park rows that need the domain's unused check first.")
+    # a park row waiting on its unused check is never a zero-risk record ready now (round 13, T-05)
+    assert doc["ask"] == ("The ask this week: approval to publish 2 records (plan P-01 to P-02) once the checks listed "
+                          "with each are confirmed, of which 2 are park rows that need the domain's unused check first.")
 
 
 # ------------------------------------------------------------------ N5, N6: a plan step and the gate's verdict

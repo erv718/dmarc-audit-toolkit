@@ -490,8 +490,9 @@ def test_plan_rows_are_grouped_by_priority_host_and_zone_in_domain_order_whateve
         "a.example.com", "t.example.com", "example.net"]
     # a record card: id, kind, the name, the host name in mono, type, value block, current, TTL, rollback, why; the
     # short fields side by side, the value, the current value and the rollback full width
-    card = re.search(r'<article class="card" id="rec-8"><div class="card-head"><span class="tag rid">P-04</span>.*?'
-                     r'</article>', sec).group(0)
+    # round 13, T-05: the card opens with the row's status pill, and a row that waits this week is a quiet card
+    card = re.search(r'<article class="card(?: quiet)?" id="rec-8"><div class="card-head"><span class="pill \w+">'
+                     r'[^<]*</span> <span class="tag rid">P-04</span>.*?</article>', sec).group(0)
     for part in ('<span class="k">publish</span>',
                  '<b>shop.</b><span class="apex">example.</span><span class="apex">com</span>',
                  '<div class="field"><dt>Host name</dt><dd><span class="mono"><span class="dn keep"><span>_dmarc.</span>'
@@ -848,14 +849,16 @@ def test_the_dns_section_opens_with_every_row_at_a_glance_each_linked_to_its_den
     page = brief.render({"org_domain": "example.com"}, {"changes": rows, "holds": holds})
     sec = section_of(page, "dns")
     index = re.search(r'<table class="index">.*?</table>', sec).group(0)
-    found = re.findall(r'<tr><td><a href="#(rec-\d+)">(P-\d+)</a></td><td class="num">(\d+)</td><td class="name">'
+    # round 13, T-05: a Status column after the id, the card's own pill
+    found = re.findall(r'<tr><td><a href="#(rec-\d+)">(P-\d+)</a></td><td class="status"><span class="pill \w+">'
+                       r'[^<]+</span></td><td class="num">(\d+)</td><td class="name">'
                        r'(.*?)</td><td>([^<]*)</td><td class="num">(\w+)</td></tr>', index)
     assert [(a, i, p, text_of(h), k, n) for a, i, p, h, k, n in found] == [
         ("rec-%d" % n, c["id"], str(c["priority"]), c["hostname"], plan_mod.KIND_LABEL[c["kind"]],
          str(len(c["prerequisites"])) if c["prerequisites"] else "none") for n, c in enumerate(rows, 1)]
     # each link lands on its card, the cards in the index's order
-    assert re.findall(r'<article class="card" id="(rec-\d+)"><div class="card-head"><span class="tag rid">(P-\d+)',
-                      sec) == [(a, i) for a, i, *_ in found]
+    assert re.findall(r'<article class="card(?: quiet)?" id="(rec-\d+)"><div class="card-head"><span class="pill \w+">'
+                      r'[^<]*</span> <span class="tag rid">(P-\d+)', sec) == [(a, i) for a, i, *_ in found]
     # the index, then what to decide first (its "above" is the index), then the cards
     assert sec.index('<table class="index">') < sec.index("<h3>Decide first</h3>") < sec.index('class="card"')
     # denser cards: the short fields side by side, each as wide as its value, the value, the current value and the

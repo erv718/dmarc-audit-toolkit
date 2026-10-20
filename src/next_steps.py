@@ -85,6 +85,10 @@ LIKELY_WORDS = {"likely_spoof": "looks like spoofing",
 OWN, SPOOF, UNCLEAR = "likely_misconfigured_sender", "likely_spoof", "unknown"
 GATE_WORDS = {"go": "ready", "no_go": "not yet", "insufficient_data": "needs more data"}
 FIRST_STEP = "publish a monitoring-only DMARC record for %s so reports start"
+# the step before any record that reports can go out, while the plan's rows carry plan.RUA_PLACEHOLDER: the
+# collect.py option that sets the report address (--rua takes report files), and the setting that does the same
+CHOOSE_RUA = "choose where DMARC reports go (a mailbox you own, or a reporting service)"
+RERUN_RUA = "then rerun with --rua-address mailto:<that address> (or set RUA_MAILBOX in .env)"
 # CLI flags in audit prose, as the words a reader without the CLI can act on.
 # Any --flag these do not name is dropped by plain(): a flag means nothing here.
 FLAG_WORDS = tuple((re.compile(p), r) for p, r in (
@@ -2153,18 +2157,21 @@ def _row_covers(item, prereqs):
 
 
 def _step(label, source, kind, verdict, notes, items, prerequisites=(), ref=None, why=None, priority=None,
-          holds=None):
+          holds=None, row=None):
     """One next step, whatever its source, in the shape every reader takes:
     prerequisites (conditions to confirm), blockers (the gate's, typed),
     holds (what holds the step beyond its own prerequisites: for a gate step
     its blockers, for a plan step the gate's blockers its row does not carry)
-    and data (the evidence an insufficient_data verdict asks for)."""
+    and data (the evidence an insufficient_data verdict asks for). row: the
+    plan row a plan step is, whose status (plan.row_status) rides along as
+    status and status_text."""
     data = [b["text"] for b in items if b["kind"] == "data"]
     if holds is None:
         holds = [b["text"] for b in items if b["kind"] != "data"]
+    status, status_text = (row_status(row)[:2] if isinstance(row, dict) else (None, None))
     return {"label": label, "ref": ref, "prerequisites": list(prerequisites), "why": why, "source": source,
             "kind": kind, "priority": priority, "verdict": verdict, "notes": notes, "blockers": items,
-            "holds": holds, "data": data}
+            "holds": holds, "data": data, "status": status, "status_text": status_text}
 
 
 def org_next(report, plan, org, own=None):
@@ -2191,9 +2198,10 @@ def org_next(report, plan, org, own=None):
     items = blocker_items(report, org, own)
     quiet = next((c for c in changes if c.get("kind") == "no_mail"), None)
     if quiet is not None:  # the run measured no mail sent as it: the quarantine-now row is the step, policy or not
+        # what the gate found that the row does not answer holds it too (audit.ramp_blockers_left: its status is held)
         return _step(plain(step_label(quiet)), "plan", "no_mail", verdict, notes, items,
                      reword_prereqs(prereqs_of(quiet)), quiet.get("id"), quiet.get("why"), _n(quiet.get("priority")),
-                     holds=[])
+                     holds=[plain(b) for b in audit.ramp_blockers_left(report, org)], row=quiet)
     why = policy_unread_why(report, org)
     if why == "unverified":
         held = [b for b in items if b["kind"] != "data" and "lookup failed" not in b["text"].lower()]
@@ -2213,22 +2221,22 @@ def org_next(report, plan, org, own=None):
                     and str(c.get("hostname") or "").lower() == "_dmarc." + org), None)
         if rec is not None and rec.get("kind") == "park":  # the plan parks the name: never a monitoring record beside it
             return _step(plain(step_label(rec)), "plan", "park", verdict, notes, items, reword_prereqs(prereqs_of(rec)),
-                         rec.get("id"), rec.get("why"), _n(rec.get("priority")), holds=[])
+                         rec.get("id"), rec.get("why"), _n(rec.get("priority")), holds=[], row=rec)
         return _step(FIRST_STEP % org, "plan" if rec else "gate", "first", verdict, notes,
                      [b for b in items if b["kind"] != "data"], (), rec.get("id") if rec else None,
-                     "no policy could be read", _n(rec.get("priority")) if rec else None, holds=[])
+                     "no policy could be read", _n(rec.get("priority")) if rec else None, holds=[], row=rec)
     if changes:
         c = changes[0]
         prereqs = reword_prereqs(prereqs_of(c)) + _hold_conditions(plan, org, c)
         if _n(c.get("priority")) == 1 and c.get("kind") in ("new", "modify"):
-            # a zero-risk record (monitoring, hygiene): it touches no mail anyone sends, so no verdict holds it
-            # and it needs no evidence - its own checks, if any, are its prerequisites
+            # a monitoring or hygiene record: it touches no mail anyone sends, so no verdict holds it and it needs
+            # no evidence - its own checks, if any, are its prerequisites, and its status says when it can go out
             return _step(plain(step_label(c)), "plan", c.get("kind"), verdict, notes,
                          [b for b in items if b["kind"] != "data"], prereqs, c.get("id"), c.get("why"),
-                         c.get("priority"), holds=[])
+                         c.get("priority"), holds=[], row=c)
         holds = [b["text"] for b in items if b["kind"] != "data" and not _row_covers(b, prereqs)]
         return _step(plain(step_label(c)), "plan", c.get("kind"), verdict, notes, items, prereqs, c.get("id"),
-                     c.get("why"), c.get("priority"), holds=holds)
+                     c.get("why"), c.get("priority"), holds=holds, row=c)
     if gate_step:
         return _step(plain(gate_step), "gate", None, verdict, notes, items, [b["text"] for b in items])
     return None
@@ -2243,13 +2251,22 @@ def _needs_data(nxt):
             and nxt.get("kind") not in ("no_mail", "first", "park"))
 
 
+# what a plan step whose row cannot go out yet waits on, by the row's status (plan.row_status), before any check
+STEP_WAITS = {"host": "once its DNS host is found (this run could not tell where its zone is hosted)",
+              "later": "%s, one change to that record a week",
+              "address": "once the report address is chosen (%s, %s)" % (CHOOSE_RUA, RERUN_RUA)}
+
+
 def _readiness(nxt):
     """', ready when ...' for a plan step (its prerequisites are conditions),
     ', on hold while: ...' for a gate step (its blockers are observations),
     ', on hold - it needs more data: ...' when the gate says
     insufficient_data; a plan step the gate also holds says both. A step is
     ready now only when nothing holds it and its verdict is not
-    insufficient_data."""
+    insufficient_data, and a plan step only when its row could go out: one
+    whose DNS host is unknown, that waits a week for another change to its
+    record or that carries the placeholder report address says what it
+    waits on first (STEP_WAITS)."""
     if _needs_data(nxt):
         text = ", on hold - it needs more data: %s" % "; ".join(nxt["data"])
         if nxt["source"] == "plan" and nxt["prerequisites"]:
@@ -2258,6 +2275,14 @@ def _readiness(nxt):
     holds = nxt.get("holds") or []
     if nxt["source"] == "gate":
         return (", on hold while: %s." % "; ".join(nxt["prerequisites"])) if nxt["prerequisites"] else ", and it is ready now."
+    wait = STEP_WAITS.get(nxt.get("status"))
+    if wait:  # the row cannot go out yet whatever is confirmed: never ready now
+        text = ", " + (wait % nxt.get("status_text") if "%s" in wait else wait)
+        if nxt["prerequisites"]:
+            text += ", and then ready when %s" % _join(nxt["prerequisites"])
+        if holds:
+            text += ", and on hold while: %s" % "; ".join(holds)
+        return text + "."
     if not nxt["prerequisites"] and not holds:
         return ", and it is ready now."
     if not holds:
@@ -3186,7 +3211,7 @@ def build_actions(report, plan, view, owners, headline=None):
             items.append({"kind": "p1record", "keys": keys, "ref": c.get("id"), "domain": dom,
                           "hostname": c.get("hostname"), "hook": dom, "action": step_label(c),
                           "is_dmarc": str(c.get("hostname") or "").startswith("_dmarc."), "lookup": looks_first(c),
-                          "keeps": keeps_policy(c)})
+                          "keeps": keeps_policy(c), "status": row_status(c)[0]})
         else:
             summary = plain(step_label(c))
             why = plain(str(c.get("human_summary") or c.get("why") or "").strip())  # plan.py's plain words first
@@ -3416,23 +3441,58 @@ def _p1_parts(p1, headline=None):
     return [(o, by[o]) for o in sorted(by, key=lambda o: (not o, audit.domain_key(o, headline)))]
 
 
+# what the owners' line says of its monitoring and hygiene records by their status (plan.row_status), for one
+# record and for several: only the ready ones are "ready to publish"
+P1_STATUS_WORDS = OrderedDict([
+    ("now", ("ready to publish", "ready to publish")),
+    ("check", ("after the checks listed with it", "after the checks listed with each")),
+    ("address", ("needs the report address first", "need the report address first")),
+    ("host", ("needs its DNS host found first", "need their DNS host found first")),
+    ("later", ("waits a week for another change to the same record",
+               "wait a week for another change to the same record")),
+    ("held", ("held", "held")), ("gated", ("waits on the gate", "wait on the gate"))])
+
+
+def _p1_status_words(status, rows, alone=False):
+    """One status's part of the owners' line: what the records wait on, and
+    (when the line holds records of more than one status, alone False) how
+    many and which ones."""
+    one, many = P1_STATUS_WORDS.get(status, (status, status))
+    if alone:
+        return one if len(rows) == 1 else many
+    return "%d %s (%s)" % (len(rows), one if len(rows) == 1 else many, ", ".join(i["ref"] or i["domain"] for i in rows))
+
+
 def _p1_summary(p1, org="", headline=None):
-    """The one item for an owner's zero-risk rows (of one organization, org,
-    when the owner's rows span several: its hook names it): how many, what
-    kind, which wait on a lookup, which keep a policy, and their plan ids."""
+    """The one item for an owner's monitoring and hygiene rows (of one
+    organization, org, when the owner's rows span several: its hook names
+    it): how many, what kind, which wait on a lookup, which keep a policy,
+    and their plan ids. They are zero-risk and ready to publish only when
+    every one is ready now (plan.row_status); otherwise the line says how
+    many are ready and what each of the others waits on."""
     ids = [i["ref"] for i in p1 if i["ref"]]
     # a record that keeps a name at the policy it follows today is zero-risk too, but not monitoring
     keeps = sum(1 for i in p1 if i.get("keeps"))
     what = ("DMARC" if keeps else "monitoring") if all(i["is_dmarc"] for i in p1) else \
         ("DMARC and hygiene" if keeps else "monitoring and hygiene")
+    by = OrderedDict()
+    for i in p1:
+        by.setdefault(i.get("status") or "check", []).append(i)
+    ready = list(by) == ["now"]
+    if len(by) == 1:  # one status for all of them: the line's own ids say which
+        status, rows = next(iter(by.items()))
+        action = _p1_status_words(status, rows, alone=True)
+    else:
+        order = [s for s in P1_STATUS_WORDS if s in by] + [s for s in by if s not in P1_STATUS_WORDS]
+        action = "; ".join(_p1_status_words(s, by[s]) for s in order)
     # a record for a name whose own _dmarc record nobody saw waits on a lookup: a second record breaks it
     looks = [i["ref"] or i["domain"] for i in p1 if i.get("lookup")]
-    return {"hook": "%d zero-risk %s %s%s" % (len(p1), what, _plural(len(p1), "record"),
-                                              (" for %s" % org) if org else ""),
-            "action": "ready to publish" + (", of which %d (%s) %s a lookup first: the name may have a "
-                                            "record of its own already" % (
-                                                len(looks), ", ".join(looks),
-                                                "needs" if len(looks) == 1 else "need") if looks else "")
+    return {"hook": "%d %s%s %s%s" % (len(p1), "zero-risk " if ready else "", what, _plural(len(p1), "record"),
+                                       (" for %s" % org) if org else ""),
+            "action": action + (", of which %d (%s) %s a lookup first: the name may have a "
+                                "record of its own already" % (
+                                    len(looks), ", ".join(looks),
+                                    "needs" if len(looks) == 1 else "need") if looks else "")
             + ("; %d %s a subdomain at the p=quarantine it follows today, not a p=none monitoring "
                "record" % (keeps, "keeps" if keeps == 1 else "keep") if keeps else ""),
             "ref": ("plan " + id_range(ids)) if ids else None,
@@ -3492,22 +3552,60 @@ def render_actions(groups, failing=None, headline=None):
     return L
 
 
+def row_status(change):
+    """(status, status_text, status_reason) of one plan row, as plan.py set
+    it once (plan.status_of: a row of an older plan that carries none is
+    never read as ready)."""
+    import plan as plan_mod  # here, not at the top: plan.py imports this module
+    return plan_mod.status_of(change)
+
+
+def plan_waiting():
+    """The row statuses whose row does not go out this week, whatever is checked (plan.WAITING_STATUSES)."""
+    import plan as plan_mod  # here, not at the top: plan.py imports this module
+    return plan_mod.WAITING_STATUSES
+
+
+def _ids(rows):
+    return [c.get("id") for c in rows if c.get("id")]
+
+
 def build_ask(plan, org, nxt, policy):
+    """The ask this week, from the plan rows' statuses (plan.row_status):
+    only the rows that are ready now are zero-risk records to publish; the
+    rows that wait on their checks are asked for once those are confirmed
+    (the quarantine-now rows apart, which change delivery); a row whose DNS
+    host is unknown waits on finding it; a quarantine-now row the gate's
+    blockers hold, and the second change to one record in a week, are not
+    asked for this week. Then the next step on the organization and the
+    plan's first hold."""
     p1 = [c for c in plan_changes(plan) if _n(c.get("priority")) == 1]
-    # a no_mail row quarantines a domain the run measured sending nothing: priority 1, but not zero-risk
-    quiet = [c for c in p1 if c.get("kind") == "no_mail"]
-    p1 = [c for c in p1 if c.get("kind") != "no_mail"]
+    status = {id(c): row_status(c)[0] for c in p1}
+    # a no_mail row quarantines a domain the run measured sending nothing: priority 1, but never zero-risk
+    now = [c for c in p1 if status[id(c)] == "now" and c.get("kind") != "no_mail"]
+    checked = [c for c in p1 if status[id(c)] == "check" and c.get("kind") != "no_mail"]
+    quiet = [c for c in p1 if status[id(c)] in ("check", "now") and c.get("kind") == "no_mail"]
+    unhosted = [c for c in p1 if status[id(c)] == "host"]
+    waiting = [c for c in p1 if status[id(c)] in plan_waiting()]
+    placeholder = [c for c in plan_changes(plan) if row_status(c)[0] == "address"]
     holds = holds_for(plan, org) or holds_for(plan)
     parts = []
-    if p1:
-        ids = [c.get("id") for c in p1 if c.get("id")]
-        text = ("approval to publish the %d zero-risk %s (plan %s) in the next DNS change window"
-                % (len(p1), _plural(len(p1), "record"), id_range(ids)))
+    if placeholder:  # nothing that reports goes out before the reports have somewhere to go
+        parts.append("first, %s, %s; until then %d %s carry a placeholder report address (plan %s) and none is "
+                     "ready" % (CHOOSE_RUA, RERUN_RUA, len(placeholder), _plural(len(placeholder), "record"),
+                                id_range(_ids(placeholder))))
+    if now:
+        parts.append("approval to publish the %d zero-risk %s (plan %s) in the next DNS change window"
+                     % (len(now), _plural(len(now), "record"), id_range(_ids(now))))
+    if checked:
+        text = ("approval to publish %d %s%s (plan %s) once the checks listed with %s are confirmed"
+                % (len(checked), "more " if now else "", _plural(len(checked), "record"), id_range(_ids(checked)),
+                   "it" if len(checked) == 1 else "each"))
         # a park row the plan verified unused needs no check; the others say which checks are open. A record for a
         # name whose own _dmarc record nobody saw waits on a lookup of it
-        park = sum(1 for c in p1 if c.get("kind") == "park"
+        park = sum(1 for c in checked if c.get("kind") == "park"
                    and not any(str(p).startswith("verified unused") for p in prereqs_of(c)))
-        looks = sum(1 for c in p1 if looks_first(c))
+        looks = sum(1 for c in checked if looks_first(c))
         said = []
         if park:
             said.append("%d %s the domain's unused check first" % (
@@ -3519,13 +3617,23 @@ def build_ask(plan, org, nxt, policy):
             text += ", of which " + " and ".join(said)
         parts.append(text)
     if quiet:
-        ids = [c.get("id") for c in quiet if c.get("id")]
         parts.append("approval to move %d %s no mail straight to quarantine (plan %s) once the checks listed with "
                      "%s are confirmed" % (len(quiet), "domain that sends" if len(quiet) == 1 else "domains that send",
-                                           id_range(ids), "it" if len(quiet) == 1 else "each"))
+                                           id_range(_ids(quiet)), "it" if len(quiet) == 1 else "each"))
+    if unhosted:
+        parts.append("the DNS host of %d %s found first (plan %s): this run could not tell where %s zone is hosted"
+                     % (len(unhosted), _plural(len(unhosted), "record"), id_range(_ids(unhosted)),
+                        "its" if len(unhosted) == 1 else "their"))
+    if waiting:  # said, never asked for: the gate's blockers hold the row, or another change to its record comes first
+        by_words = OrderedDict()
+        for c in waiting:
+            by_words.setdefault(row_status(c)[1], []).append(c)
+        parts.append("not this week: %s" % "; ".join("plan %s, %s" % (id_range(_ids(rows)) or "?", words)
+                                                     for words, rows in by_words.items()))
     at_end = not nxt or nxt["label"].lower().startswith("none")
     first = nxt is not None and nxt.get("kind") in ("first", "recheck", "fix_record")
-    asked = {c.get("id") for c in p1 + quiet if c.get("id")}  # the rows the clauses above already ask for
+    # the rows the clauses above already ask for, and the ones that are not for this week
+    asked = {c.get("id") for c in now + checked + quiet + unhosted + waiting + placeholder if c.get("id")}
     which = "the step after that" if parts else "the next step"
     if first:
         pass  # no policy could be read: the ask is the record, or the re-run, below

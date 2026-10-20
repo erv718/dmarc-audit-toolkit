@@ -49,7 +49,9 @@ def test_summary_deltas_against_previous_run():
     assert "*newly seen senders*: 198.51.100.7" in text
     assert "genuine failures vs last run: -9" in text
     assert "pass rate vs last run: +7.0 points" in text
-    assert "plan: 2 change(s) waiting, 1 are zero-risk monitoring/hygiene; 1 hold(s)" in text
+    # round 13, T-05: the rows by status - a priority-3 row nothing says is go is gated, never ready
+    assert ("plan: 2 change(s) waiting: 1 ready now, zero-risk monitoring/hygiene, 1 not this week (held, gated or "
+            "after another change to the same record); 1 hold(s)") in text
 
 
 def test_post_sends_json_text(monkeypatch):
