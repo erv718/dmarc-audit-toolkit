@@ -178,7 +178,8 @@ def test_sample_document_has_the_template_shape(sample, tmp_path):
     assert "- **Mail refused or quarantined by receivers under our policy: %d rejected / %d quarantined**" % (
         disp.get("reject", 0), disp.get("quarantine", 0)) in md
     assert "- **Trend: first run, no trend yet**" in md
-    assert "| `example.com` | p=reject | not yet |" in md
+    # at p=reject no policy step is left: the cell says so, the gate's word after it (round 13, T-10)
+    assert "| `example.com` | p=reject | no step left (not yet) |" in md
     assert doc["ask"].startswith("Nothing to approve this week: example.com is at p=reject")
     assert md.rstrip().endswith("it is not a failure.") and "Glossary. DMARC is " in md
     assert "no sentence here was written by an AI" in md
@@ -226,7 +227,9 @@ def test_with_a_plan_the_next_step_and_ids_come_from_the_plan(planned, tmp_path)
     assert "The next safe step is to raise pct to 50, ready when " in doc["one_liner"]
     assert doc["next_step"]["ref"] == ratchet["id"] and doc["next_step"]["source"] == "plan"
     assert doc["next_step"]["prerequisites"]  # the plan's holds, reworded as conditions
-    assert "| `example.com` | p=quarantine, pct=25 | not yet | raise pct to 50 (plan %s) |" % ratchet["id"] in md
+    # the Gate cell names what holds the step (round 13, T-10): the gate's first blocker, cut short
+    assert ("| `example.com` | p=quarantine, pct=25 | not yet - held by: 1 sender pass on SPF alone (190 msgs): set "
+            "up aligned DKIM... | raise pct to 50 (plan %s) |" % ratchet["id"]) in md
     assert ("| `news.example.com` | p=none (inherited from example.com) | needs more data | "
             "publish a p=none monitoring record (plan %s) |" % monitor["id"]) in md
     assert ratchet["human_summary"] in md  # the plan's plain-language sentence rides along

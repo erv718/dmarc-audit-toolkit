@@ -673,13 +673,17 @@ def test_n30_the_ramp_suffix_only_when_the_quarantine_now_row_clears_the_blocker
     plan = {"changes": [{"id": "P-01", "domain": "brand.example", "kind": "no_mail", "priority": 1, "record": "TXT",
                          "hostname": "_dmarc.brand.example", "value": "v=DMARC1; p=quarantine; sp=none; rua=%s;" % RUA,
                          "current": "none", "why": "no mail measured", "prerequisites": []}], "holds": []}
-    assert "| not yet (for the weekly ramp this skips) |" in table_rows(next_steps.build(rep, plan))[0]
+    # the cell names what holds the gate (round 13, T-10): its first blocker, the one the row answers
+    assert ("| not yet - held by: NO DMARC RECORD - no policy, no reporting, invisible to you (for the weekly ramp "
+            "this skips) |") in table_rows(next_steps.build(rep, plan))[0]
     assert "the gate's no_go is for the weekly ramp this skips" in collect.render_todo(rep, plan)
     assert "the gate's *no_go* is for the weekly ramp this skips" in notify.summarize(rep, plan=plan)
     unknown = "198.51.100.10 fails DMARC on 40/40 msgs (unknown); fix, or formally except it, before p= moves"
     rep["gate"]["domains"]["brand.example"]["blockers"].append(unknown)
     assert audit.ramp_blockers_left(rep, "brand.example") == [unknown]
-    assert "| not yet (it holds the quarantine-now row too) |" in table_rows(next_steps.build(rep, plan))[0]
+    # the blocker that holds the row too is the one the cell names (round 13, T-10)
+    assert ("| not yet - held by: 198.51.100.10 fails DMARC on 40/40 msgs (unclear); fix, or... (it holds the "
+            "quarantine-now row too) |") in table_rows(next_steps.build(rep, plan))[0]
     assert "the gate's no_go holds that row too: " + unknown in collect.render_todo(rep, plan)
     assert "the gate's *no_go* holds that row too: " + unknown in notify.summarize(rep, plan=plan)
 

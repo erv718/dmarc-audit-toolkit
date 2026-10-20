@@ -693,14 +693,20 @@ def policy_cell(text):
 
 
 def gate_cell(gate, gate_text):
-    """The gate pill, with what the document adds to its word ('(for the
-    weekly ramp this skips)', ', with a plan hold') muted beneath it."""
+    """The gate pill, with what the document adds to its word ('held by: ...',
+    '(for the weekly ramp this skips)', ', with a plan hold') muted beneath
+    it. A name with no policy step left reads 'no step left' in the pill the
+    verdict colors, the verdict word muted after it."""
     gate = gate if isinstance(gate, str) and gate else "not checked"
     cls, word = GATE_PILLS.get(gate, NOT_CHECKED)
     said = _text(gate_text)
     lead = next_steps.GATE_WORDS.get(gate, gate)
+    if said.startswith(next_steps.NO_STEP_LEFT):
+        word, lead = next_steps.NO_STEP_LEFT, next_steps.NO_STEP_LEFT
     rest = said[len(lead):] if said.startswith(lead) else said
     rest = rest.strip().lstrip(",").strip()
+    if rest.startswith("- "):  # 'not yet - held by: ...': the pill says the verdict, the rest says what holds it
+        rest = rest[2:].strip()
     return pill(cls, word) + ('<span class="rest">%s</span>' % prose(rest) if rest else "")
 
 

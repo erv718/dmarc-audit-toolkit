@@ -313,9 +313,12 @@ def test_the_open_questions_run_by_kind_then_organization_and_are_grouped_by_kin
     assert owned[-1]["question"] == "Who owns this: Partner bypass (RULES-002)?"
     # next_steps.md: one bold line per kind, in plain words, with its count, and the questions under it
     body = [l for l in section(run["md"], "Open questions") if l and l != "---"]
+    # one blocker on example.com's step: example.net's failing and spoofed streams hold example.net's gate only
+    # (round 13, T-10), so they are no longer asked about before example.com moves
     assert [l for l in body if l.startswith("**")] == [
-        "**Blockers (3)**", "**Prerequisites (9)**", "**Plan holds (2)**", "**Not verified yet (4)**",
+        "**Blockers (1)**", "**Prerequisites (9)**", "**Plan holds (2)**", "**Not verified yet (4)**",
         "**Needs an owner (19)**"]
+    assert not any("198.51.100.7" in l or "203.0.113.9" in l for l in body[:body.index("**Prerequisites (9)**")])
     holds = body.index("**Plan holds (2)**")
     assert body[holds + 1].startswith("- example.com: %s" % HOLD) and body[holds + 2].startswith("- brand.example: ")
 

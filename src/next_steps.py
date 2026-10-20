@@ -2836,14 +2836,45 @@ def _unread_step(report, domain):
     return "publish a monitoring-only DMARC record so reports start (no record found)"
 
 
+HELD_BY_CUT = 60  # characters of the blocker a Gate cell quotes after "held by:"; the rest is in report.md
+AT_END_STEP = "none - already at the end"  # the gate's step for a name with no policy step left (audit.next_step)
+NO_STEP_LEFT = "no step left"
+
+
+def gate_words(report, domain, verdict, step="", first=()):
+    """The per-domain table's Gate cell: the verdict in words (GATE_WORDS),
+    and for not yet what holds it - its own first blocker, in plain words
+    and cut at HELD_BY_CUT characters ('not yet - held by: 198.51.100.20
+    fails DMARC on 60/60 msgs ...'), a blocker the gate shares with every
+    name (gate.shared_blockers: nothing says whose it is) only when it has
+    no other; first, when given, is what to name before anything else (the
+    blockers that hold a quarantine-now row too). A name whose step is the
+    end of the road (AT_END_STEP) says 'no step left', with the verdict
+    word after it in parentheses: at p=reject nothing is left to move,
+    whatever the gate still finds."""
+    if not verdict:
+        return "not checked"
+    word = GATE_WORDS.get(verdict, verdict)
+    if str(step or "").startswith(AT_END_STEP):
+        return "%s (%s)" % (NO_STEP_LEFT, word)
+    if verdict != "no_go":
+        return word
+    blockers = gate_split(report, domain)[1]
+    shared = audit._dict(report.get("gate")).get("shared_blockers")
+    shared = {str(b) for b in shared} if isinstance(shared, list) else set()
+    own = [str(b) for b in first or () if b] or [b for b in blockers if b not in shared] or blockers
+    return ("%s - held by: %s" % (word, cut_subject(plain(own[0]), HELD_BY_CUT))) if own else word
+
+
 def per_domain(report, plan, headline=None):
     """One row per audited name, in the one order every list follows
     (audit.domain_key: the headline's organization first, then each
     organization by name, its organizational domain before the names below
     it). Subdomains share a row only when they sit next to each other in
-    that order and share their organization, policy, gate, next step and
-    mail flow, so a merged row never pulls a name out of its place. Each
-    row carries its organization (org) for readers that group by it."""
+    that order and share their organization, policy, gate (and what holds
+    it: gate_words), next step and mail flow, so a merged row never pulls a
+    name out of its place. Each row carries its organization (org) for
+    readers that group by it."""
     gate_domains = (report.get("gate") or {}).get("domains") or {}
     gate_domains = gate_domains if isinstance(gate_domains, dict) else {}
     planned = audit._dict(plan).get("domains")
@@ -2866,15 +2897,17 @@ def per_domain(report, plan, headline=None):
         g = gate_domains.get(d) if isinstance(gate_domains.get(d), dict) else {}
         verdict = g.get("verdict") if isinstance(g.get("verdict"), str) else None
         gate = verdict or "not checked"
-        gate_text = GATE_WORDS.get(verdict, verdict) if verdict else "not checked"
         ml = bd.get(d) if isinstance(bd.get(d), dict) else None
         # a domain the run measured sending nothing leads with its quarantine-now row; the gate judged the
-        # weekly ramp that row skips, and its verdict says so - unless its blockers hold that row too
+        # weekly ramp that row skips, and its verdict says so - unless its blockers hold that row too, which the
+        # cell then names first
         changes = sorted(changes_for(plan, d), key=lambda c: c.get("kind") != "no_mail")
         holds = holds_for(plan, d)
-        if changes and changes[0].get("kind") == "no_mail" and verdict:
-            gate_text += (" (for the weekly ramp this skips)" if not audit.ramp_blockers_left(report, d)
-                          else " (it holds the quarantine-now row too)")
+        quiet_row = bool(changes) and changes[0].get("kind") == "no_mail" and bool(verdict)
+        left = audit.ramp_blockers_left(report, d) if quiet_row else []
+        gate_text = gate_words(report, d, verdict, str(g.get("next_step") or ""), left)
+        if quiet_row:
+            gate_text += (" (for the weekly ramp this skips)" if not left else " (it holds the quarantine-now row too)")
         elif verdict == "go" and holds:  # the gate found nothing; the plan still holds a step for the domain
             gate_text += ", with a plan hold"
         ids = [c.get("id") for c in changes if c.get("id")]
@@ -2922,9 +2955,9 @@ def per_domain(report, plan, headline=None):
     groups, last = [], None
     for r in rows:
         # an organizational domain keeps a row of its own; subdomains share one only with the row right above
-        # them, and only when they also share what their mail flow says
-        key = None if r["domain"] == r["apex"] else (r["apex"], r["policy_today"], r["gate"], r["next_step"],
-                                                      r["mailflow_text"])
+        # them, and only when they also share what their mail flow says and what holds their gate
+        key = None if r["domain"] == r["apex"] else (r["apex"], r["policy_today"], r["gate"], r["gate_text"],
+                                                      r["next_step"], r["mailflow_text"])
         if key is None or key != last:
             groups.append({"domains": [], "org": r["apex"], "policy_today": r["policy_today"], "gate": r["gate"],
                            "gate_text": r["gate_text"], "next_step": r["next_step"], "plan_ids": [], "maillog": {},

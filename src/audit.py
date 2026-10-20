@@ -54,8 +54,13 @@ With several domains the mail log is attributed per sender domain (the
 verdict's domain field): each gate sees only its own rows, an audited apex
 carries a separate subdomains_total for unaudited subdomains under it, and
 rows under no audited domain count once under "(other)", attached to no gate
-(maillog.by_domain). A domain with no rows of its own in the mail log and
-none in the aggregate reports is insufficient_data, whatever the run holds
+(maillog.by_domain). The aggregate reports' failing and spoof-delivered
+streams are attributed the same way, by the From domains they carry
+(header_from): each holds the closest audited domain of each, never another
+domain's gate; only a stream with no From domain under an audited name
+holds every gate (gate.shared_blockers). A domain with no rows of its own
+in the mail log and none in the aggregate reports is insufficient_data,
+whatever the run holds
 about other domains. The overall verdict is the worst of all domains, and
 gate.current_policy, gate.policy_source and gate.next_step describe that
 worst-ranked domain (on a tie the headline domain, then the order given).
@@ -1250,18 +1255,43 @@ def _exception_notes(excepted):
     return out
 
 
+def stream_homes(stream, audited):
+    """The audited names one aggregate-report stream is about: the closest
+    audited domain of each From domain it carries (header_from), the way the
+    SPF-only streams and the mail-log rows are attributed (_home_domain: an
+    audited subdomain's stream reaches its own gate, an unaudited
+    subdomain's its closest audited parent). [] when the stream carries no
+    From domain, or none of them has an audited home: nothing then says
+    whose it is, and it holds every gate."""
+    homes = []
+    hfs = stream.get("header_from") if isinstance(stream, dict) else None
+    for hf in hfs if isinstance(hfs, list) else []:
+        home = _home_domain(_norm_name(hf), list(audited or ()))[0] if audited else None
+        if home and home not in homes:
+            homes.append(home)
+    return homes
+
+
 def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None, audited=()):
-    """Blockers that apply to every domain in the run, plus what the formal
-    exceptions (audit.toml [[exceptions]], already split to the active ones)
-    lifted: notes naming each excepted sender, the excepted rua source IPs,
-    and how many deduplicated mail-log failures were excepted. maillog_doc
-    counts here only on the no-domain path: with named domains the mail log
-    is attributed per sender domain (_maillog_blockers, _excepted_by_domain),
+    """The blockers the run's evidence raises outside any one domain's
+    mail-log rows, each with the audited names it holds, plus what the
+    formal exceptions (audit.toml [[exceptions]], already split to the
+    active ones) lifted: notes naming each excepted sender, the excepted rua
+    source IPs, and how many deduplicated mail-log failures were excepted.
+    Returns (held, info): held is [(text, homes)] in the order raised, where
+    homes lists the audited names the blocker holds (a failing or
+    spoof-delivered aggregate-report stream holds the home of each From
+    domain it carries, stream_homes) and [] means every name (a stream
+    nothing attributes, a tenant allow, the mail log on the no-domain path):
+    no gate inherits another domain's failing streams. maillog_doc counts
+    here only on the no-domain path: with named domains the mail log is
+    attributed per sender domain (_maillog_blockers, _excepted_by_domain),
     so no gate inherits another's rows. An excepted failure holds nothing,
     delivered despite failing or not. audited: the gate's names; a domain
     exception covers a failing stream only when every domain the stream
     authenticated with, other than these, is under it (config.matches_stream)."""
-    blockers, notes, excepted_streams = [], [], []
+    held, notes, excepted_streams = [], [], []
+    blockers = []  # the ones every name shares
     active = list(exceptions or [])
     if rua_doc:
         for f in rua_doc["failing_streams"]:
@@ -1280,20 +1310,21 @@ def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None, au
                         f"{e['match']} (until {e['until']}: {e['reason']}; remove when {e['removal_criterion']})"
                         for e in hits))
                 continue
+            homes = stream_homes(f, audited)
             if f["likely"] == "likely_spoof":
                 if f["dispositions"].get("none", 0):
-                    blockers.append(
+                    held.append((
                         f"spoof stream {f['source_ip']} ({f['count']} msgs) saw disposition none - "
-                        "receivers delivered it; the current policy is not catching it")
+                        "receivers delivered it; the current policy is not catching it", homes))
                 # a spoof already rejected is what enforcement looks like; not a blocker
             else:
                 left = config_mod.stream_uncovered(active, f, audited)
                 hint = (f" (a domain exception covers part of it; {', '.join(left)} "
                         f"{'is' if len(left) == 1 else 'are'} not under any: except that domain too, or the "
                         "source IP)" if left else "")
-                blockers.append(
+                held.append((
                     f"{f['source_ip']} fails DMARC on {f['fail']}/{f['count']} msgs "
-                    f"({f['likely']}); fix, or formally except it, before p= moves{hint}")
+                    f"({f['likely']}); fix, or formally except it, before p= moves{hint}", homes))
     excepted_failures = 0
     if maillog_doc:
         c = maillog_doc["counters"]
@@ -1315,8 +1346,9 @@ def _shared_blockers(rua_doc, maillog_doc, tenant_docs=None, exceptions=None, au
         for f in (doc or {}).get("findings", []):
             if f["severity"] == "blocking" or (f["severity"] == "major" and f["id"] in TENANT_GATE_BLOCKS):
                 blockers.append(f"{name}: {f['title']} - unauthenticated mail is delivered past the policy")
-    return blockers, {"notes": notes, "excepted_streams": excepted_streams,
-                      "excepted_maillog_failures": excepted_failures}
+    held += [(b, []) for b in blockers]
+    return held, {"notes": notes, "excepted_streams": excepted_streams,
+                  "excepted_maillog_failures": excepted_failures}
 
 
 def _excepted_by_domain(maillog_doc, active, names):
@@ -1354,6 +1386,8 @@ def _dns_blockers(r, domain):
 
 
 OVERRIDE_MASKING = "a local override is masking failures external receivers enforce"
+# how the gate's insufficient_data hold opens for a domain the evidence has no rows for (_domain_gate)
+NO_ROWS_HOLD = "the evidence supplied has no rows for "
 
 
 def _delivered_phrase(c, delivered, policy=None):
@@ -1520,7 +1554,7 @@ def _domain_gate(domain, info, shared, dns_blockers, rua_doc, evidence, maillog=
         # the run has evidence, but none of it is about this domain: no mail-log
         # rows of its own, no aggregate-report rows with it as the From domain
         verdict = "insufficient_data"
-        missing = (f"the evidence supplied has no rows for {name} (none in the mail log, none in the aggregate "
+        missing = (f"{NO_ROWS_HOLD}{name} (none in the mail log, none in the aggregate "
                    "reports)")
         if at_end:
             hold = f"{missing}, so enforcement cannot be confirmed safe for it"
@@ -1582,10 +1616,14 @@ def ramp_blockers_left(report, domain):
     policy with a rua address, and a domain that sends nothing has no
     legitimate failure, so the missing-record findings, a spoof stream
     receivers deliver and spoof-only mail-log failures (delivered or not: at
-    p=none that is the policy's own doing) are what the row answers. A
-    failing sender that may be ours, a lookup that failed, a tenant allow or
-    a failure a formal exception does not cover stands against that row as
-    it stands against the ramp. [] when every blocker is answered."""
+    p=none that is the policy's own doing) are what the row answers - and so
+    is the gate's own hold that the evidence has no rows for the domain (its
+    insufficient_data verdict on the ramp): the row rests on the mail flow
+    the tenant measured, and names what only aggregate reports would show
+    as a check of its own. A failing sender that may be ours, a lookup that
+    failed, a tenant allow or a failure a formal exception does not cover
+    stands against that row as it stands against the ramp. [] when every
+    blocker is answered."""
     doc = _dict(report)
     g = _dict(_dict(_dict(doc.get("gate")).get("domains")).get(domain))
     blockers = [str(b) for b in g.get("blockers") if b] if isinstance(g.get("blockers"), list) else []
@@ -1602,6 +1640,8 @@ def ramp_blockers_left(report, domain):
         if bare in cleared or bare in RAMP_CLEARED:
             continue
         if bare.startswith("spoof stream ") and "saw disposition none" in bare:
+            continue
+        if bare.startswith(NO_ROWS_HOLD):
             continue
         if spoof_only and re.match(r"^\d+ (logical )?message\(s\) from this domain failed", bare):
             continue
@@ -1669,7 +1709,8 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
     if remarked:
         mark_excepted(maillog_doc, active)
         _follow_marks(maillog_doc, names)
-    shared, exc = _shared_blockers(rua_doc, None if names else maillog_doc, tenant_docs, active, names)
+    held, exc = _shared_blockers(rua_doc, None if names else maillog_doc, tenant_docs, active, names)
+    shared = [t for t, homes in held if not homes]  # what holds every name: nothing says whose it is
     notes = list(exc["notes"])
     excepted = {}
     if names:
@@ -1700,7 +1741,10 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
     for d in names:
         info = domain_policy(d, dns_reports, rua_doc)
         dns_b = _dns_blockers(dns_reports[d], d) if dns_reports and d in dns_reports else []
-        per_domain[d] = _domain_gate(d, info, shared, dns_b, rua_doc, evidence,
+        # its own failing streams (the ones sending as it or a name below it that has no gate of its own) and the
+        # ones nothing attributes, in the order the evidence raised them: never another domain's
+        mine = [t for t, homes in held if not homes or d in homes]
+        per_domain[d] = _domain_gate(d, info, mine, dns_b, rua_doc, evidence,
                                      by_domain.get(d) if by_domain else None, scope,
                                      ml_spf.get(d, []), notes, excepted.get(d), rua_spf.get(d, []),
                                      exc["excepted_streams"])
@@ -1740,7 +1784,7 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
         merged.pop(evidence["statement"], None)
         reasons = list(merged) + [evidence["statement"]]
     else:
-        top = _domain_gate(None, domain_policy(None, dns_reports, rua_doc), shared, [], rua_doc, evidence,
+        top = _domain_gate(None, domain_policy(None, dns_reports, rua_doc), [t for t, _ in held], [], rua_doc, evidence,
                            None, None, (maillog_doc or {}).get("spf_only_senders") or [], notes, None,
                            (rua_doc or {}).get("spf_only_senders") or [], exc["excepted_streams"])
         verdict, overall = top["verdict"], "no domain named - one verdict over the files given"
@@ -1755,6 +1799,9 @@ def gate_verdict(dns_reports, rua_doc, maillog_doc, domains=(), headers_doc=None
                            "excepted_streams": exc["excepted_streams"],
                            "excepted_maillog_failures": exc["excepted_maillog_failures"]},
             "rule": GATE_RULE,
+            # the blockers that hold every name because nothing attributes them to one (a stream with no audited
+            # From domain, a tenant allow): a domain's own come first when its row names one
+            "shared_blockers": list(shared),
             "overall": overall, "domain_count": len(per_domain),
             "headline": ({"domain": head_name, "source_label": why, "verdict": head["verdict"],
                           "current_policy": head["current_policy"], "policy_source": head["policy_source"],

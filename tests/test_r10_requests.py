@@ -437,10 +437,11 @@ def test_r2_the_plan_md_row_the_table_and_todo_say_it_in_plain_words(tmp_path):
     doc = next_steps.build(rep, p)
     row = next(g for g in doc["per_domain"] if g["domains"] == ["brand.example"])
     assert row["next_step"] == "no mail measured: quarantine now"
-    # the gate's verdict is the weekly ramp's, which the row skips: no cell reads as both at once
-    assert ("| `brand.example` | no DMARC record | not yet (for the weekly ramp this skips) | no mail measured: "
-            "quarantine now (plan %s) | nothing sent or received in 30 days (tenant) |" % brand["id"]) in \
-        next_steps.render_md(doc)
+    # the gate's verdict is the weekly ramp's, which the row skips: no cell reads as both at once; the cell names
+    # what holds the gate (round 13, T-10: the fixture's finding titles are their ids)
+    assert ("| `brand.example` | no DMARC record | not yet - held by: (DMARC-001) (for the weekly ramp this skips) | "
+            "no mail measured: quarantine now (plan %s) | nothing sent or received in 30 days (tenant) |"
+            % brand["id"]) in next_steps.render_md(doc)
     # the ask counts the quarantine-now rows apart from the zero-risk records
     assert ("approval to publish the %d zero-risk records (plan %s) in the next DNS change window, of which 2 are "
             "park rows that need the domain's unused check first; approval to move 3 domains that send no mail "
@@ -802,10 +803,13 @@ def test_r3_the_sp_step_at_quarantine_names_every_sending_subdomain_without_a_re
         next_steps.render_md(doc)
     assert ("and the other change to _dmarc.corp.example (plan %s) waits for another week, since both rewrite "
             "today's record, and on hold while: " % sp["id"]) in doc["one_liner"]
-    # the gate's blockers the row does not carry hold the step too (N6): the delivered spoofs and the override
+    # the gate's blockers the row does not carry hold the step too (N6): the override. The spoofs receivers
+    # delivered as spoofed.example hold spoofed.example's gate, never corp.example's (round 13, T-10)
     assert doc["one_liner"].endswith("18 messages from this domain failed authentication but reached a mailbox - a "
                                      "local override is masking failures external receivers enforce.")
-    assert doc["next_step"]["holds"][0].startswith("spoofing source 203.0.113.66 (800 msgs) saw disposition none")
+    assert doc["next_step"]["holds"][0].startswith("18 messages from this domain failed authentication")
+    assert not any("203.0.113.66" in h for h in doc["next_step"]["holds"])
+    assert any("203.0.113.66" in b for b in rep["gate"]["domains"]["spoofed.example"]["blockers"])
 
 
 def test_r3_once_the_records_exist_the_step_is_ready(tmp_path):

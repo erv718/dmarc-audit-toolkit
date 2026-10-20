@@ -443,7 +443,12 @@ How the plan is gated (the methodology, encoded in `src/plan.py` and
   next step and the hold says who. Spoofs that receivers already reject do not
   hold anything: enforcement is what stops them. Each domain is judged on its
   own rows: a domain with no rows anywhere is `insufficient_data`, never a
-  silent go, and never inherits another domain's failures.
+  silent go, and never inherits another domain's failures. That holds for
+  the aggregate reports too: a failing or spoof-delivered stream holds the
+  domain it sends as (the closest audited name of its From domain), never
+  the others; only a stream whose From domain is under no audited name
+  holds every gate. The per-domain table says what holds each one ("not
+  yet - held by: ..."), and "no step left" where the policy is at its end.
 - **DKIM before reject, always.** The move to `p=reject` needs aligned-DKIM
   evidence from the aggregate reports or from a mail log carrying SPF and DKIM
   verdicts (`queries/raw_maillog.kql` writes them). Senders passing on SPF
