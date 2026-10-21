@@ -55,8 +55,9 @@ def test_the_ask_no_longer_names_another_domains_stream_for_example_com(run):
     ask = run["doc"]["ask"]
     assert "203.0.113.9" not in ask
     assert "198.51.100.20" not in ask or "example.com" in ask
-    assert ("the step after that on example.com (move to p=reject) is held back by this: spoofing source "
-            "203.0.113.66 (120 msgs)") in ask
+    # round 13, T-11: the ask counts the step with the rows not for this week; what holds it is the step's own
+    assert "3 not this week" in ask
+    assert run["doc"]["next_step"]["holds"][0].startswith("spoofing source 203.0.113.66 (120 msgs)")
 
 
 def test_the_overall_reasons_name_whose_stream_it_is(run):

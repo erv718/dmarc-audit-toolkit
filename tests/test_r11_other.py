@@ -213,7 +213,10 @@ def test_n5_the_plans_hold_on_the_move_to_reject_holds_that_step(tmp_path):
     assert ("| `sub.corp.example` | p=quarantine (inherited from _dmarc.corp.example) | ready | %s |" % one) in rows[1]
     assert "only if it needs a policy of its own" not in rows[1] and "move from p=quarantine to p=reject" not in rows[1]
     assert "- sub.corp.example: p=quarantine, gate go, next step: %s" % one in collect.render_todo(rep, reject_plan(holds=[HOLD]))
-    assert "- `sub.corp.example`: p=quarantine, gate *go*, next: %s" % one in notify.summarize(rep, plan=reject_plan(holds=[HOLD]))
+    # round 13, T-04: the Slack message keeps that line under its details only for a name with failures, a change
+    # or a cut; the line itself says the same as todo.md
+    lines = {e["domain"]: e["line"] for e in notify.domain_lines(rep, reject_plan(holds=[HOLD]))}
+    assert lines["sub.corp.example"] == "- `sub.corp.example`: p=quarantine, gate *go*, next: %s - 0 genuine failures of its own" % one
     # without the hold the gate's own words stand, in every reader
     gate_step = rep["gate"]["domains"]["sub.corp.example"]["next_step"]
     assert gate_step.endswith("a record of its own at _dmarc.sub.corp.example only if it needs a policy of its own")
@@ -682,7 +685,8 @@ def test_n30_the_ramp_suffix_only_when_the_quarantine_now_row_clears_the_blocker
     assert ("| not yet - held by: NO DMARC RECORD - no policy, no reporting, invisible to you (for the weekly ramp "
             "this skips) |") in table_rows(next_steps.build(rep, plan))[0]
     assert "the gate's no_go is for the weekly ramp this skips" in collect.render_todo(rep, plan)
-    assert "the gate's *no_go* is for the weekly ramp this skips" in notify.summarize(rep, plan=plan)
+    # round 13, T-04: the per-domain line (the Slack message keeps it under its details when it has failures)
+    assert "the gate's *no_go* is for the weekly ramp this skips" in notify.domain_lines(rep, plan)[0]["line"]
     unknown = "198.51.100.10 fails DMARC on 40/40 msgs (unknown); fix, or formally except it, before p= moves"
     rep["gate"]["domains"]["brand.example"]["blockers"].append(unknown)
     assert audit.ramp_blockers_left(rep, "brand.example") == [unknown]
@@ -690,7 +694,7 @@ def test_n30_the_ramp_suffix_only_when_the_quarantine_now_row_clears_the_blocker
     assert ("| not yet - held by: 198.51.100.10 fails DMARC on 40/40 msgs (unclear); fix, or... (it holds the "
             "quarantine-now row too) |") in table_rows(next_steps.build(rep, plan))[0]
     assert "the gate's no_go holds that row too: " + unknown in collect.render_todo(rep, plan)
-    assert "the gate's *no_go* holds that row too: " + unknown in notify.summarize(rep, plan=plan)
+    assert "the gate's *no_go* holds that row too: " + unknown in notify.domain_lines(rep, plan)[0]["line"]
 
 
 def test_n31_todo_leads_with_the_rows_that_replace_the_gates_step():
@@ -816,7 +820,7 @@ def test_n53_n56_notify_and_the_metrics_table_survive_damaged_inputs(tmp_path):
         damage(rep)
         assert notify.summarize(rep, previous={"rua": "none", "gate": {}}, plan={"changes": ["text"], "holds": []},
                                 history=[{"rua_pass_rate": 10 ** 400, "genuine_failures": float("nan")},
-                                         {"genuine_failures": 5, "maillog_hours": 10 ** 400}]).startswith("*DMARC audit*")
+                                         {"genuine_failures": 5, "maillog_hours": 10 ** 400}]).startswith("*DMARC")
     assert "text" in notify.summarize(good, plan="text") or True  # a plan that is not an object is no plan
     md = collect.render_metrics([{"run": "r1", "findings": {"major": float("nan")}, "plan_changes": float("inf"),
                                   "rua_pass_rate": 10 ** 400, "genuine_failures": 10 ** 400, "domains": "text"}])

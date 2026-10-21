@@ -460,7 +460,7 @@ def test_a_long_zone_sits_beside_its_label_and_stays_with_it_on_paper():
     css = brief.CSS
     assert ".section p.zone { max-width: none; }" in css
     printed = css.split("@media print {\n", 1)[1]
-    assert ".tile, .card, .ask, tr, .checklist li, .zone { break-inside: avoid; }" in printed
+    assert ".tile, .card, .ask, tr, .checklist li, .zone, .now { break-inside: avoid; }" in printed  # round 13: .now
     zone = "an-extraordinarily-long-organizational-domain-name-for-layout.example"
     page = brief.render({}, {"changes": [{"id": "P-01", "priority": 1, "zone_host": "unknown", "zone": zone,
                                           "domain": zone, "hostname": "_dmarc." + zone, "kind": "new"}]})

@@ -22,15 +22,17 @@ built from, and what a person or an agent may change before sending it.
 | Section | What it says | Built from |
 |---|---|---|
 | Title | `DMARC rollout - status and next steps, <date>` | the report's generation date (`--date` overrides it) |
-| Audience line | who it is for, the sources with their sizes, and the statement that no sentence was written by an AI | `inputs`, the plan, the metrics history, the owners file |
-| The one-liner (bold) | policy today (and since when, if the history shows the change), how many of our own streams still fail, how many could be our own vendors (a spoof label on the envelope or a billing word alone, no lure word) and how many look like spoofing, each with the deliveries its own streams had and what let them in, the next safe step and what it is ready when | `gate`, `dns`, `maillog.census`, the plan's next enforcement step and its prerequisites |
+| Headline (bold) | the 45-second answer in at most 30 words: whether the domains block spoofed mail (how many of how many), the worst finding, and what the reader is asked for | next_steps.json `top.headline`, built by fixed rules from the parts below |
+| This week (the 45-second read) | Protected? (every audited name's policy counted: refuses or junks spoofed mail, enforces a share, only reports, no record, invalid record, lookup failed, not read); Most critical, by domain - one line per organization, worst first (urgent: spoofed mail with a lure word reached inboxes; our own mail blocked now; our own or possibly our own failing at 10 or more; spoofing nothing stops; a mail log not read; unprotected; clean), at most five and the rest counted, each with its single worst finding and the one thing to do first; Your call - the plan's rows by status (ready now, after which check, DNS host to find, not this week, plan holds); Since last run - worse, better, fixed, new, records, or why a comparison is withheld; Not in this data - at most two data gaps and, always, bounces and lost mail (message trace) | next_steps.json `top`: `gate.domains`, `dns`, `maillog.by_domain` and the census, `rua.failing_streams`, the plan rows' statuses, `delta`, the cuts and dates |
+| The next step for <org> | the one-liner, unchanged and not bold: policy today (and since when, if the history shows the change), how many of our own streams still fail, how many could be our own vendors (a spoof label on the envelope or a billing word alone, no lure word) and how many look like spoofing, each with the deliveries its own streams had and what let them in, the next safe step and what it is ready when | `gate`, `dns`, `maillog.census`, the plan's next enforcement step and its prerequisites |
 | Where we stand | genuine failures with the raw count alongside (for an organization the row budget or the API cap cut, the full-window totals counted in advanced hunting beside that organization's own floor; the gate, the census and the labels rest on the rows kept, the plan reads the totals for its quarantine-now and sp= decisions); when passing copies went only to an on-premises or external hop, how many (check message trace; the toolkit never sees a message that did not arrive); delivered despite failing, with the overrides that let it in when the mail log recorded them; spoofing blocked by receivers; trend versus the previous run (withheld, with the reason, when the row budget cut a mail log or the mail-log spans or the outside views are not comparable) | `maillog.counters`, `maillog.window_totals`, `rua.by_disposition`, `delta` (else `--previous`, else `metrics.json`) |
 | What is failing | the top failing envelope domains and sender addresses, each with its heuristic label (an address failing under two labels is one row per label; a spoof with a lure word that reached a mailbox has a line of its own, never only a note); senders outside the audited domains; the outside view from aggregate reports | `maillog.census`, `maillog.by_domain`, `rua.failing_streams` |
 | Per domain | one row per audited domain: policy today (when none was read, why: "no DMARC record", "lookup failed", "not read"; a p= receivers do not apply is an "invalid record"), gate (with what holds it: "not yet - held by: ..." names the domain's own first blocker, its own failing streams included and never another domain's; "no step left" where the policy is at its end), next step (the plan's first row for the domain, the same step todo.md and summary.txt name; "no mail measured: quarantine now" for a domain the run measured sending nothing, its gate verdict marked as the one for the weekly ramp that row skips), and its mail flow as the tenant measured it ("sends: N out, M in", "nothing sent or received", or "not measured"), then one line on what that view cannot see (a third party sending as the domain straight to outside recipients shows only in the aggregate reports) | `gate.domains`, `dns`, the plan, `mailflow` |
 | What happens next, by owner | one action per failing sender, override (named, with what to change, when the mail log recorded it - after the sender passes DMARC when the mail it lets in is ours or may be, since doing it first junks that mail too), SPF-only sender, unknown source and DNS change, grouped by the owner the owners file names; the last group is `Unassigned - needs an owner` | `findings`, the plan's changes, `maillog.census`, `owners.csv` |
-| The ask | the approval or DNS window for this week's step, and what holds the step after it, by each plan row's status: only the rows ready now are zero-risk records to publish, the rows after a check are asked once their checks are confirmed (a domain the run measured sending nothing apart, with its checks; the records for a name whose own `_dmarc` record nobody saw counted as needing a lookup first), a row whose DNS host is unknown waits on finding it, and a held row or a second change to one record is "not this week" | the plan rows' statuses, its quarantine-now rows and the next enforcement step |
+| The ask | the approval or DNS window for this week's step, and what holds the step after it, by each plan row's status, in at most 60 words (past that its clauses shorten and count, and next_steps.json `ask_parts` keeps every list): only the rows ready now are zero-risk records to publish, the rows after a check are asked by what they wait on (one report-authorization record, the domain's unused check, a lookup of the name's own record, their own checks; a domain the run measured sending nothing apart), a row whose DNS host is unknown waits on finding it, and a held row or a second change to one record is "not this week"; audit.toml's `[brief]` change window and approver end it when set | the plan rows' statuses, its quarantine-now rows and the next enforcement step |
 | Open questions | unmet prerequisites, gaps enforcement does not close, heuristics not yet verified, unassigned items | `gate.reasons`, `findings` with `verified: false`, the plan's holds |
-| Glossary | DMARC, SPF, DKIM, rua, p=, sp=, pct=, genuine failure, relay echo | fixed text |
+| Sources and how to check | the audience line without its first sentence (the sources with their sizes, and that no sentence was written by an AI; a custom `--audience` stays whole), then the pointer to verify.md | `inputs`, the plan, the metrics history, the owners file |
+| Glossary | DMARC, SPF, DKIM, rua, p=, sp=, pct=, gate, parked domain, envelope domain, record with no mail impact, outside view, report-authorization record, plan id, finding id, genuine failure, relay echo | fixed text |
 
 Two rules the generator applies so the document reads like a person wrote
 it: an entry under 10 genuine failures is a note, never a headline (they
@@ -43,17 +45,25 @@ count is not evidence of health.
 Every run also writes `brief.html` next to the document: the same content
 laid out as one page for a meeting or a leadership read. `src/brief.py`
 builds it from `next_steps.json` and `plan.json` with no AI, the way
-`next_steps.py` builds the document: the one-liner as the lede, Where we
+`next_steps.py` builds the document: the status band first, on the first
+screen under a slim masthead (the date, how many organizations and domains,
+how far the evidence reaches, and a warning when it is older than a week):
+the headline, Protected?, the most critical finding per organization as a
+badge and a line, your call with each plan id linked to its record card,
+what changed and what this data cannot show. Then Where we
 stand as four figures (genuine failures with the raw count beside them,
 delivered despite failing, rejected and quarantined by receivers, the trend),
 each captioned with what it counts (every domain in the mail log, or the
 aggregate reports' window), over the section's lines, the next step with its
-conditions as a checklist, the per-domain table grouped by organization,
+conditions as a checklist and the one-liner folded under it ("The status in
+one paragraph"), the per-domain table grouped by organization,
 What is failing as tables, the actions by owner (a plan row's checks as a
-checklist under it), the ask, the plan's records (every row at a glance,
+checklist under it), the ask as three lists (publish now, after a check, not
+this week: each plan id with its host name) over its sentence, the plan's records (every row at a glance,
 each linked to its card, then the holds, then the cards by priority, DNS
 host and zone, in the plan's own order), the open questions grouped by
-kind, and the glossary. Every list of domains is in one order: the headline
+kind, the glossary, and the sources and how to check them in the footer.
+Every list of domains is in one order: the headline
 organization first, then each organization by name, its own domain before
 the names below it. A section the run left empty says what the document
 says there ("None from this run.", "Nothing to do this week: ..."); "Not in
@@ -160,11 +170,21 @@ python src/audit.py example.com --offline --rua samples/rua --maillog samples/sa
 python src/next_steps.py audit-out/report.json --owners samples/owners.csv.example
 ```
 
-What it writes (the one-liner, the first section and the first owner group;
-the audience line above them names the sources and their sizes):
+What it writes (the headline and This week, the first section, the next step
+and the first owner group; the Sources section at the end names the sources
+and their sizes, and the evidence's age is counted from the day it runs):
 
 ```markdown
-**example.com is at p=reject. 21 messages from example.com failed with no passing copy in the mail log's 9-day span (2026-05-01 to 2026-05-09): 3 from 1 of our own senders (statements@example.com x3); 11 that could be our own vendors (called spoofing on the envelope or a billing word alone: finance.lead0@example.com x4, finance.lead2@example.com x4); 7 from 2 addresses that look like spoofing and are being handled by the policy. No policy step is left; what is left is keeping our own senders passing.**
+**Protected: example.com blocks spoofed mail. Worst: our own mail is being refused on example.com. Your call: nothing to approve (no plan this run).**
+
+## This week (the 45-second read)
+
+- **Protected?** Protected (per the aggregate reports: DNS not read): example.com refuses spoofed mail (p=reject).
+- **Most critical, by domain** (worst first):
+  1. **Refuses spoofs - example.com**: 3 of our own messages fail DMARC and receivers refuse them. Do first: DKIM-sign statements@example.com (owner: Statements platform team).
+- **Your call:** Nothing to approve: this run built no plan (offline: no DNS read).
+- **Since last run:** First run: this is the baseline.
+- **Not in this data:** Offline run: DNS not read, so policies come from the aggregate reports or are unknown; the newest evidence is from 2026-09-02, 49 days before this run; (+1 more under Where we stand); bounces and lost mail (NDRs): use message trace.
 
 ## Where we stand (2026-09-01 to 2026-09-02, deduplicated)
 
@@ -172,6 +192,10 @@ the audience line above them names the sources and their sizes):
 - **Delivered despite failing: 3** - these only arrive because of our own overrides; outside receivers are not as forgiving (statements@example.com x3)
 - **Mail refused or quarantined by receivers under our policy: 300 rejected / 6 quarantined** - this includes any of our own senders that are not yet aligned, not only spoofing (1361 messages seen by 3 reports, 77.4% passing). The spoofing share: 300 messages from 1 source that looks like spoofing (300 rejected).
 - **Trend: first run, no trend yet**
+
+## The next step for example.com
+
+example.com is at p=reject. 21 messages from example.com failed with no passing copy in the mail log's 9-day span (2026-05-01 to 2026-05-09): 3 from 1 of our own senders (statements@example.com x3); 11 that could be our own vendors (called spoofing on the envelope or a billing word alone: finance.lead0@example.com x4, finance.lead2@example.com x4); 7 from 2 addresses that look like spoofing and are being handled by the policy. No policy step is left; what is left is keeping our own senders passing.
 
 ## What happens next, by owner
 

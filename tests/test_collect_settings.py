@@ -76,7 +76,9 @@ def test_notify_switch_off_prints_instead_of_posting(tmp_path):
             env_extra={"SLACK_WEBHOOK_URL": "https://hooks.example/never-called"})
     assert p.returncode in (0, 1), p.stderr
     assert "summary not posted: [notify] enabled = false" in p.stderr
-    assert "*DMARC audit*" in p.stdout
+    # round 13, T-04: the run says where the summary is and why it was not posted, never the text unlabeled
+    assert "summary.txt written (not posted: [notify] enabled = false in audit.toml)" in p.stdout
+    assert "*DMARC" not in p.stdout
 
 
 def test_latest_holds_only_this_runs_files(tmp_path):

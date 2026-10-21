@@ -189,6 +189,9 @@ day one:
   files, and `collect.py` refuses a `mailto:` there before anything runs.
 - `keep = 12`: how many dated runs stay under `audit-out/history/`.
 - `[notify] enabled`: whether the Slack summary posts when a webhook is set.
+- `[brief] change_window` and `approver`: optional free text the ask and the
+  status band's "Your call" end with, quoted as written (" - window: ...;
+  approver: ..."). Left out, nothing is said.
 
 Secrets never go in this file; they stay in `.env`.
 
@@ -228,8 +231,14 @@ newest first, so a busy domain never comes back as a truncated day), counts
 the whole window in advanced hunting for an organization whose rows the row
 budget cut, pulls new aggregate reports from the report mailbox, audits DNS,
 runs the deduplication, writes the report, the status document, the to-do
-list and the plan, appends the history and metrics, and prints or posts the
-summary.
+list and the plan, appends the history and metrics, and posts the summary
+when a webhook is set (`--dry-run` prints it under "Slack summary (dry run,
+not posted):"; otherwise the run says `summary.txt written (not posted: ...)`
+and why, never the text unlabeled). After every note it ends with a few plain
+lines: `done: <M> domains in <N> organizations audited - exit <code>: <what
+it means>`, the status band's headline and its most critical organizations,
+what changed since the last run, what the data cannot show, the run folder,
+and `Open first: .../latest/brief.html` with the other files beside it.
 
 Exit codes: 0 clean, 1 at least one major or blocking finding, 2 a usage or
 setup error. A brand-new rollout will exit 1 for weeks; that is the findings
@@ -241,8 +250,16 @@ that alert on exit codes.
 
 Read them in this order, all under `audit-out/latest/`:
 
-1. **`next_steps.md`**: the document you send. Where the rollout stands in
-   one sentence, deduplicated failure counts with the raw number alongside,
+1. **`next_steps.md`**: the document you send. It opens with the status
+   band, "This week (the 45-second read)": one headline, whether we are
+   protected (each domain's policy counted), the most critical finding per
+   organization - worst first, at most five, each with the one thing to do
+   first - your call on the plan's records, what changed since the last run,
+   and what this data cannot show (always: bounces and lost mail, which only
+   message trace sees). The same block leads `brief.html`, the run's last
+   lines and the Slack summary (`next_steps.json` `top`). Then where the
+   rollout stands, with the status in one paragraph under The next step,
+   deduplicated failure counts with the raw number alongside,
    what is failing by envelope domain and by sender, a per-domain table
    (policy today, gate, next step, and the mail flow the tenant measured -
    "sends: N out, M in", "nothing sent or received", or "not measured"), what
@@ -305,12 +322,17 @@ Read them in this order, all under `audit-out/latest/`:
    for any report.
 
 **Status brief.** `brief.html` is `next_steps.md` laid out for a meeting: the
-one-liner, the figures as tiles, the next step with its checklist, the
-per-domain table grouped by organization, what is failing, actions by owner,
-the ask, the plan's records - every row at a glance, each linked to its
+status band on the first screen (the headline, Protected?, the most critical
+finding per organization with its badge, your call with each plan id linked to
+its card, what changed and what this data cannot show), then the figures as
+tiles, the next step with its checklist and the status in one paragraph folded
+under it, the per-domain table grouped by organization, what is failing,
+actions by owner, the ask as three lists (publish now, after a check, not this
+week) over its sentence, the plan's records - every row at a glance, each linked to its
 card, then the cards in the order a DNS change ticket wants them (priority,
 DNS host, zone, domain: the plan's own order, ids ascending) - the open
-questions grouped by kind and the glossary. `src/brief.py` writes it from
+questions grouped by kind and the glossary, and the sources and how to check
+them at the end. `src/brief.py` writes it from
 `next_steps.json` and `plan.json` with no AI, so it says what the document
 says; `collect.py` writes it on every run, and
 `python src/brief.py audit-out/latest` rebuilds it. It is
@@ -531,9 +553,17 @@ weeks of local history even though the API still only shows 30 days, and
 `metrics.md` turns that into the trend line.
 
 **Slack, off by default.** Set `SLACK_WEBHOOK_URL` in `.env` and each run posts
-one message: policy, gate and next step per domain (the plan's first row for
-it, as `next_steps.md` and `todo.md` name it; a policy the run could not read
-says why - no DMARC record, lookup failed, not read), deduplicated failure counts next to
+one message. Its first line is the date and the status band's headline
+(`*DMARC <date>* - Partly: 2 of 9 domains block spoofed mail. ...`), then one
+line per most critical organization (its badge and what is wrong, in plain
+words), what changed since the last run, what the data cannot show and where
+the full brief is. Under "Details:" come the per-domain lines - policy, gate
+and next step (the plan's first row for it, as `next_steps.md` and `todo.md`
+name it; a policy the run could not read says why - no DMARC record, lookup
+failed, not read) - for the domains the band does not lead with that have
+failures of their own or a change since the last run, and for every domain
+of a cut organization; the others are counted on one line. Then
+deduplicated failure counts next to
 the raw ones (with the overrides that let failing mail in, when the mail log
 recorded them), the worst failing senders from the census, spoofing blocked by
 receivers, newly identified senders (new to the whole history, not just absent

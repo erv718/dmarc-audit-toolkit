@@ -244,3 +244,83 @@ def first_run(tmp_path, rua=None):
     plan = plan_mod.build_plan(rep, inventory, rua)
     doc = next_steps.build(rep, plan=plan, date="2026-10-20")
     return {"report": rep, "plan": plan, "inventory": inventory, "doc": doc}
+
+
+# ------------------------------------------------------------------ a stress estate: ten organizations
+
+STRESS_LONGORG = "an-extraordinarily-long-organizational-domain-name-for-layout.example"
+STRESS_LONGSUB = "transactional-notifications-for-customer-accounts-and-billing.eu-west-1.mail.example.com"
+STRESS_SENDING = ["alerts", "billing", "careers", "community", "docs", "events", "investor-relations", "marketing",
+                  "news", "pay", "status", "support", "surveys", "webinars", "rewards"]
+STRESS_QUIET = ["archive", "beta", "dev.support", "intranet-legacy", "labs", "old-shop", "partners", "staging", "test",
+                "wiki"]
+
+
+def stress(tmp_path):
+    """The layout review's stress estate through the real pipeline (its make_stress.py builder): ten organizations
+    on three DNS hosts and unknown ones, example.com with fifteen sending and ten quiet subdomains and a delegated
+    zone, a 63-character organization, more than forty plan rows, an owners file: {"report", "plan", "inventory",
+    "doc"}."""
+    inp = tmp_path / "inputs"
+    inp.mkdir(parents=True, exist_ok=True)
+    apex = ESTATE_APEX
+    docs = {"example.com": T.own_record("example.com", apex)}
+    flows = {"example.com": T.flow(800, 1500)}
+    hosts = {"example.com": ("example.com", "Route53")}
+    for s in STRESS_SENDING:
+        d = "%s.example.com" % s
+        docs[d], flows[d], hosts[d] = T.inherits(d, apex, "_dmarc.example.com"), T.flow(20 + len(s), 5), (
+            "example.com", "Route53")
+    for s in STRESS_QUIET:
+        d = "%s.example.com" % s
+        docs[d], flows[d], hosts[d] = T.inherits(d, apex, "_dmarc.example.com"), T.flow(0, 0), ("example.com", "Route53")
+    docs[STRESS_LONGSUB] = T.inherits(STRESS_LONGSUB, apex, "_dmarc.example.com")
+    flows[STRESS_LONGSUB], hosts[STRESS_LONGSUB] = T.flow(400, 2), ("eu-west-1.mail.example.com", "Cloudflare")
+    docs["shop.example.com"] = T.own_record("shop.example.com", "v=DMARC1; p=none; rua=%s;" % RUA)
+    flows["shop.example.com"], hosts["shop.example.com"] = T.flow(0, 0), ("shop.example.com", "Route53")
+    docs["example.net"] = T.own_record("example.net", "v=DMARC1; p=none; rua=%s;" % RUA)
+    flows["example.net"], hosts["example.net"] = T.flow(120, 300), ("example.net", "CSC")
+    docs["brand.example"] = T.own_record("brand.example", "v=DMARC1; p=reject; rua=%s;" % RUA)
+    flows["brand.example"], hosts["brand.example"] = T.flow(50, 90), ("brand.example", "CSC")
+    docs["alpha.example"] = T.own_record("alpha.example", "v=DMARC1; p=none; rua=%s;" % RUA)
+    flows["alpha.example"], hosts["alpha.example"] = T.flow(30, 10), ("alpha.example", "CSC")
+    docs["example.org"] = T.dns_doc("example.org", findings=T.fid("DMARC-001"))
+    flows["example.org"], hosts["example.org"] = T.flow(0, 0), ("example.org", "Cloudflare")
+    for p in ("parked.example", "parked-two.example", "holding.example", "legacy.example", STRESS_LONGORG):
+        docs[p] = T.dns_doc(p, spf=None, spf_status="absent", spf_terminator=None, spf_lookups=0, dkim_selectors=[],
+                            dkim_status="absent", mx=[], mx_status="absent", findings=T.fid("DMARC-001", "SPF-001"))
+        flows[p], hosts[p] = T.flow(0, 0), (p, "unknown" if p != "legacy.example" else "Cloudflare")
+    log = (T.Log()
+           .add("staff@example.com", "Weekly team update #", times=60)
+           .add("noreply@example.com", "Your receipt #", dmarc="fail", times=31)
+           .add("automated-notifications-noreply@" + STRESS_LONGSUB, "Your monthly statement is now available #",
+                dmarc="fail", times=22)
+           .add("billing@example.com", "Invoice # is ready", dmarc="fail", times=14, env="mailer.billing-vendor.invalid")
+           .add("ceo@example.com", "Urgent wire transfer #", dmarc="fail", times=12, env="evil.invalid")
+           .add("alerts@pay.example.com", "Payment alert #", dmarc="fail", times=11)
+           .add("hello@example.net", "Welcome aboard #", dmarc="fail", times=10)
+           .add("team@brand.example", "Brand update #", times=20)
+           .add("hr@brand.example", "Your password expires today #", dmarc="fail", times=4, env="lure.invalid"))
+    for i, s in enumerate(STRESS_SENDING):
+        log.add("info@%s.example.com" % s, "Update from %s #" % s, dmarc="fail", times=2 + i % 7)
+    log.add("news@example.org", "Hello #", dmarc="fail", times=3)
+    log.add("ops@alpha.example", "Ops digest #", dmarc="fail", times=6)
+    rows = [("192.0.2.10", 500, "example.com", "example.com", "pass", "example.com", "pass"),
+            ("198.51.100.20", 60, "example.com", "esp.invalid", "pass", "esp.invalid", "pass")]
+    for k in range(12):
+        rows.append(("203.0.113.%d" % (40 + k), 9 + 7 * k, "example.com", None, None, "spoof%d.invalid" % k, "fail"))
+    reports = [T.rua_report(inp / "example-com.xml", "example.com", "quarantine", rows,
+                            begin=T.BEGIN - 20 * T.DAY, end=T.BEGIN),
+               T.rua_report(inp / "example-net.xml", "example.net", "none", [
+                   ("198.51.100.7", 200, "example.net", "example.net", "pass", "example.net", "pass"),
+                   ("203.0.113.9", 40, "example.net", None, None, "spoof.invalid", "fail")],
+                   begin=T.BEGIN - 20 * T.DAY, end=T.BEGIN),
+               T.rua_report(inp / "brand.xml", "brand.example", "reject", [
+                   ("192.0.2.77", 150, "brand.example", "brand.example", "pass", "brand.example", "pass")],
+                   begin=T.BEGIN - 20 * T.DAY, end=T.BEGIN)]
+    rep = T.audited(tmp_path / "run", docs, log, reports, flows=flows, sources={d: ["tenant"] for d in docs})
+    rep["dns_extra"] = T.no_record("m.example.com", "t.example.com", "e.example.com")
+    inventory = inventory_of(hosts, flows)
+    plan = plan_mod.build_plan(rep, inventory, RUA)
+    doc = next_steps.build(rep, plan=plan, date=ESTATE_DATE, org_name="example.com")
+    return {"report": rep, "plan": plan, "inventory": inventory, "doc": doc}

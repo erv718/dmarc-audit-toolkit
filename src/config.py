@@ -194,6 +194,29 @@ def notify_settings(cfg):
     return {"enabled": enabled, "target": target}
 
 
+BRIEF_KEYS = ("change_window", "approver")
+
+
+def brief_settings(cfg):
+    """{change_window, approver} from the [brief] table: free text the ask and
+    the status band's call end with, quoted as written (' - window: <text>;
+    approver: <text>'); None for a key that is not set. Both optional."""
+    table = cfg.get("brief") or {}
+    if not isinstance(table, dict):
+        raise ConfigError("[brief] must be a table")
+    unknown = sorted(k for k in table if k not in BRIEF_KEYS)
+    if unknown:
+        raise ConfigError("[brief] has keys collect.py does not know: %s (known: %s)"
+                          % (", ".join(unknown), ", ".join(BRIEF_KEYS)))
+    out = {}
+    for key in BRIEF_KEYS:
+        val = table.get(key)
+        if val is not None and not isinstance(val, str):
+            raise ConfigError("[brief] %s must be a string" % key)
+        out[key] = " ".join(val.split()) or None if isinstance(val, str) else None
+    return out
+
+
 def exception_kind(match):
     """address | ip | prefix | domain, or None when the text is none of them."""
     if "@" in match:

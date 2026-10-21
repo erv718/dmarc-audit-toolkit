@@ -4,7 +4,9 @@ plan.py computes each row's status once (status, status_text, status_reason: add
 gated, later, check, now - the first that applies), and every file that lays the plan out reads it:
 the ask and the owners' line say "zero-risk" and "ready" only for a row that is ready now, todo.md's
 Do now lists only those, the cards and At a glance carry the status as a pill, and verify.md opens
-each row's section with it. Synthetic data, offline."""
+each row's section with it. T-11: the ask is built from short lists (next_steps.json ask_parts), at most 60
+words, each id named once, the change window and approver at its end when audit.toml sets them; brief.html lays
+the lists out (publish now, after a check, not this week). Synthetic data, offline."""
 
 import re
 
@@ -12,6 +14,7 @@ import pytest
 
 import brief
 import collect
+import config
 import next_steps
 import notify
 import plan as plan_mod
@@ -53,11 +56,14 @@ def test_every_estate_row_gets_one_status_and_none_is_ready(run):
 def test_the_ask_never_calls_a_row_zero_risk_or_ready_unless_it_is_ready_now(run):
     ask = run["doc"]["ask"]
     assert "zero-risk" not in ask and "ready" not in ask
-    assert ("approval to publish 6 records (plan P-03, P-04, P-05, P-06, P-07, P-09) once the checks listed with each "
-            "are confirmed") in ask
-    assert ("approval to move 3 domains that send no mail straight to quarantine (plan P-01, P-02, P-08) once the checks "
-            "listed with each are confirmed") in ask
-    assert "the DNS host of 2 records found first (plan P-10 to P-11)" in ask
+    # round 13, T-11: under 60 words, by what each group of rows waits on; every id in the ask's lists
+    assert ("approval to publish 6 records (P-03, P-04, P-05 and 3 more) once corp.example publishes one "
+            "report-authorization record") in ask
+    assert "3 domains that send no mail moved to quarantine once their checks are confirmed" in ask
+    assert "2 records once their DNS host is found" in ask
+    parts = run["doc"]["ask_parts"]
+    assert parts["groups"][0]["ids"] == ["P-03", "P-04", "P-05", "P-06", "P-07", "P-09"]
+    assert parts["quiet"] == ["P-01", "P-02", "P-08"] and parts["host"] == ["P-10", "P-11"]
     for g in run["doc"]["actions_by_owner"]:
         for i in g["items"]:
             if i["kind"] == "p1summary":
@@ -105,8 +111,10 @@ def test_a_quarantine_now_row_the_gate_holds_is_held_everywhere(tmp_path):
         assert (row[rid]["status"], row[rid]["status_text"]) == ("held", "held (Per domain says why)")
         assert row[rid]["status_reason"].startswith("192.0.2.99 fails DMARC on 30/30 msgs")
     # the ask never asks for them; it says they are not for this week
-    assert "approval to move" not in doc["ask"]
-    assert "not this week: plan P-01, P-02, P-08, held (Per domain says why)" in doc["ask"]
+    assert "approval to move" not in doc["ask"] and "moved to quarantine" not in doc["ask"]
+    # round 13, T-11: counted with the rows not for this week, by their status words in the ask's lists
+    assert {"words": "held (Per domain says why)", "ids": ["P-01", "P-02", "P-08"]} in doc["ask_parts"]["later"]
+    assert "6 not this week" in doc["ask"]
     # todo.md waits on them, with the reason; the cards are quiet and say what holds them
     todo = collect.render_todo(rep, plan)
     waiting = todo.split("## 2c. Waiting", 1)[1].split("\n## ", 1)[0]
@@ -250,3 +258,70 @@ def test_collect_refuses_a_report_address_given_to_rua_before_anything_runs(tmp_
         collect.main()
     assert exc.value.code == 2 and "did you mean --rua-address MAILTO:a@b.example?" in capsys.readouterr().err
     assert calls == [] and not out.exists()
+
+
+# ------------------------------------------------------------------ T-11: the ask as short lists
+
+def test_t11_the_estates_ask_is_short_and_names_each_id_once(run):
+    ask = run["doc"]["ask"]
+    assert len(ask.split()) <= next_steps.ASK_WORDS == 60
+    ids = re.findall(r"\bP-\d{2}\b", ask)
+    assert ids and len(ids) == len(set(ids))
+    assert ask == ("The ask this week: approval to publish 6 records (P-03, P-04, P-05 and 3 more) once corp.example "
+                   "publishes one report-authorization record; 3 domains that send no mail moved to quarantine once "
+                   "their checks are confirmed; 2 records once their DNS host is found; 3 not this week; and a decision "
+                   "on 1 plan hold.")
+    # the lists it is built from hold every row once, by when it can go out
+    parts = run["doc"]["ask_parts"]
+    assert parts["lines"] == {"now": [], "check": ["P-01", "P-02", "P-03", "P-04", "P-05", "P-06", "P-07", "P-08",
+                                                   "P-09", "P-10", "P-11"], "later": ["P-12", "P-13", "P-14"]}
+    assert parts["later"] == [{"words": "the gate says not yet", "ids": ["P-12", "P-13", "P-14"]}]
+    assert parts["holds"] == [{"domain": "example.com", "text": next_steps._hold_summary(run["plan"]["holds"][0]["reason"])}]
+    assert (parts["window"], parts["approver"]) == (None, None)
+    # a small plan keeps the full words: what each row waits on, the step after it and the hold's own words
+    doc = next_steps.build(run["report"], plan=dict(run["plan"], changes=[F.row(run["plan"], "P-09")]),
+                           org_name="example.net")
+    assert doc["ask"].startswith("The ask this week: approval to publish 1 record (plan P-09) once corp.example "
+                                 "publishes one report-authorization record")
+    assert "a decision on example.com: publish the monitoring records for e.example.com" in doc["ask"]
+
+
+def test_t11_the_change_window_and_approver_end_the_ask_and_the_call(run):
+    window = {"change_window": "Thursday 18:00-20:00 UTC"}
+    doc = next_steps.build(run["report"], plan=run["plan"], date=F.ESTATE_DATE, org_name="example.com",
+                           settings=window)
+    assert doc["ask"].endswith(" - window: Thursday 18:00-20:00 UTC.")
+    assert doc["top"]["call"]["text"].endswith(" - window: Thursday 18:00-20:00 UTC.")
+    assert doc["ask_parts"]["window"] == "Thursday 18:00-20:00 UTC" and len(doc["ask"].split()) <= 66
+    both = next_steps.build(run["report"], plan=run["plan"], org_name="example.com",
+                            settings=dict(window, approver="IT change board"))
+    assert both["ask"].endswith(" - window: Thursday 18:00-20:00 UTC; approver: IT change board.")
+    assert both["top"]["call"]["text"].endswith(" - window: Thursday 18:00-20:00 UTC; approver: IT change board.")
+    # without them, no window words anywhere
+    plain = run["doc"]
+    assert "window:" not in plain["ask"] and "window:" not in plain["top"]["call"]["text"]
+    assert "approver" not in plain["ask"]
+    # audit.toml's [brief] table, read as written, each key optional
+    assert config.brief_settings({"brief": {"change_window": "  Thursday   18:00 "}}) == {
+        "change_window": "Thursday 18:00", "approver": None}
+    assert config.brief_settings({}) == {"change_window": None, "approver": None}
+    for bad in ({"brief": "x"}, {"brief": {"window": "Thursday"}}, {"brief": {"approver": 7}}):
+        with pytest.raises(config.ConfigError):
+            config.brief_settings(bad)
+
+
+def test_t11_the_brief_lays_the_ask_out_as_three_lists(run):
+    page = brief.render(run["doc"], run["plan"])
+    ask = page[page.index('<section id="ask"'):]
+    ask = ask[:ask.index("</section>")]
+    labels = re.findall(r"<dt>([^<]+)</dt>", ask)
+    assert labels == ["Publish now", "After a check", "Not this week"]
+    publish, after, later = re.findall(r"<dd>(.*?)</dd>", ask)
+    assert publish == '<span class="muted">none</span>'
+    # each id a tag linked to its card, with its host name beside it
+    places = brief.card_places(run["plan"], "example.com")
+    assert re.findall(r'<a class="tag" href="#rec-(\d+)"[^>]*>(P-\d+)</a>', later) == [
+        (str(places[i]), i) for i in ("P-12", "P-13", "P-14")]
+    assert '<a class="tag" href="#rec-%d" title="_dmarc.example.org">P-01</a>' % places["P-01"] in after
+    assert "_dmarc.parked.example" in after and after.count('class="idhost"') == 11
+    assert "<p>%s</p>" % brief.prose(run["doc"]["ask"]) in ask  # the sentence under the lists

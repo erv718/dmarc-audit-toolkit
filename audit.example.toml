@@ -43,6 +43,12 @@ enabled = true
 # "teams" is designed in but not yet verified against a live webhook; keep "slack".
 target = "slack"
 
+# [brief]
+# Optional, free text: the ask and the status band's "Your call" end with them, quoted as
+# written (" - window: <change_window>; approver: <approver>"). Leave them out and nothing is said.
+# change_window = "Thursday 18:00-20:00 UTC"
+# approver = "IT change board"
+
 # Formal exceptions (docs/methodology.md step 5). A FAILING sender listed here
 # stops holding the gate until the date passes. match, reason, until and
 # removal_criterion are required (owner is optional); an entry missing one is

@@ -375,9 +375,15 @@ def test_todo_md_names_the_domains_in_order(run):
 
 
 def test_summary_txt_names_the_domains_in_order(run):
-    text = notify.summarize(run["report"], None, run["plan"])
+    # round 13, T-04: the message keeps a domain's line only when the status band's strip does not say it and it has
+    # failures, a change or a cut organization; every line, kept or not, runs in the one order
+    lines = "\n".join(e["line"] for e in notify.domain_lines(run["report"], run["plan"]))
     # a policy the run did not read is said in words, never p=unknown (round 13, T-12): every line, whatever it says
-    assert re.findall(r"^- `([^`]+)`: (?:p=|no DMARC record|lookup failed|not read|invalid record)", text, re.M) == ORDER
+    assert re.findall(r"^- `([^`]+)`: (?:p=|no DMARC record|lookup failed|not read|invalid record)", lines, re.M) == ORDER
+    text = notify.summarize(run["report"], None, run["plan"])
+    kept = re.findall(r"^- `([^`]+)`: ", text, re.M)
+    assert kept == [d for d in ORDER if d in kept] and all(line in lines for line in text.splitlines()
+                                                            if line.startswith("- `"))
 
 
 def test_verify_md_runs_domain_by_domain_in_order(run, tmp_path):

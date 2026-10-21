@@ -859,7 +859,8 @@ def test_g3_the_readers_put_the_full_window_beside_the_floor(tmp_path):
         "despite failing")
     assert lines["hr.corp.example"].endswith("; over the full 30 days, counted in Advanced Hunting: 10 genuine failures, "
                                              "0 delivered despite failing")
-    assert "Advanced Hunting" not in lines["shop.example"] and "rows kept" not in lines["shop.example"]
+    # round 13, T-04: shop.example, not cut, leads its own line of the status band's strip and has no line below it
+    assert "shop.example" not in lines and "1. `corp.example` " in notify.summarize(rep)
     # a report without the totals reads as before
     bare = cut_report(tmp_path, None)
     assert "Full-window totals" not in audit.render_md(bare)
@@ -1078,7 +1079,9 @@ def test_collect_measures_mail_flow_once_per_run_and_counts_a_cut_orgs_whole_win
         after = text["todo.md"].split(row, 1)[1].split("\n")
         assert after[1].startswith("  - status: %s - " % c["status_text"])  # round 13, T-05
         assert after[2] == "  - before applying: " + open_checks
-    assert "of which 2 are park rows that need the domain's unused check first" in text["next_steps.md"]
+    # round 13, T-11: the ask stays under 60 words, so the park rows' group says what they wait on in short
+    assert "approval to publish 2 records (plan %s) once the domain's unused check is done" % next_steps.id_range(
+        [c["id"] for c in parks]) in text["next_steps.md"]
     assert "| `parked.example` | no DMARC record | " in text["next_steps.md"]
     assert "| nothing sent or received in 30 days (tenant) |" in text["next_steps.md"]
     assert "- shop.example: sends: 120 out, 0 in (30 days, tenant); last seen " in text["report.md"]

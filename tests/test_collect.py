@@ -56,7 +56,8 @@ def test_offline_run_twice_builds_history_latest_and_metrics(tmp_path):
     assert len(entries) == 2 and entries[1]["genuine_failures"] == entries[0]["genuine_failures"]
     assert (out / "metrics.md").read_text(encoding="utf-8").count("| 2026") >= 0
     summary = (out / "latest" / "summary.txt").read_text(encoding="utf-8")
-    assert "*DMARC audit*" in summary and "genuine failures vs last run: +0" in summary
+    # round 13, T-04: line 1 is the date and the status band's headline
+    assert summary.startswith("*DMARC 20") and "genuine failures vs last run: +0" in summary
 
 
 def test_nothing_to_audit_is_a_usage_error(tmp_path):

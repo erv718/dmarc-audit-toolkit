@@ -32,10 +32,12 @@ FR_DOMAINS = ("harborfoods.example", "harbor-old.example", "harborfoods-shop.exa
 
 
 def outputs(run):
-    """Every file a run writes from these inputs, as text: {name: text}."""
+    """Every file a run writes from these inputs, as text: {name: text}. summary lines: every per-domain line the
+    Slack message builds (round 13, T-04: it keeps some of them under its details, in these words)."""
     rep, plan, doc = run["report"], run["plan"], run["doc"]
     return {"next_steps.md": next_steps.render_md(doc), "next_steps.json": json.dumps(doc, indent=1),
             "todo.md": collect.render_todo(rep, plan), "summary.txt": notify.summarize(rep, plan=plan),
+            "summary lines": "\n".join(e["line"] for e in notify.domain_lines(rep, plan)),
             "report.md": audit.render_md(rep), "plan.md": plan_mod.render_md(plan), "verify.md": verify.render(rep, plan),
             "brief.html": brief.render(json.loads(json.dumps(doc)), plan),
             "metrics.md": collect.render_metrics([collect.metrics_entry("2026-10-09T060000Z", rep, plan)])}
@@ -71,7 +73,7 @@ def test_the_first_run_gives_one_next_step_in_every_file(tmp_path):
     for rua in (None, F.FR_RUA):
         run = F.first_run(tmp_path / ("rua" if rua else "placeholder"), rua)
         files = outputs(run)
-        md, todo, summary = files["next_steps.md"], files["todo.md"], files["summary.txt"]
+        md, todo, summary = files["next_steps.md"], files["todo.md"], files["summary lines"]
         for d in FR_DOMAINS:
             rows = [c for c in run["plan"]["changes"] if c["domain"] == d][:2]
             lines = (line_of(md, "| `%s` |" % d), line_of(todo, "- %s: " % d), line_of(summary, "- `%s`: " % d))
@@ -89,7 +91,7 @@ def test_the_first_run_gives_one_next_step_in_every_file(tmp_path):
     assert ("- harborfoods.example: p=none, gate no_go, next step: add rua reporting to the DMARC record (P-01, "
             "section 2c: needs the report address)") in files["todo.md"]
     assert ("- `harborfoods.example`: p=none, gate *no_go*, next: add rua reporting to the DMARC record (plan P-01, "
-            "needs the report address) - 60 genuine failures of its own") in files["summary.txt"]
+            "needs the report address) - 60 genuine failures of its own") in files["summary lines"]
     assert "| add rua reporting to the DMARC record (plan P-01) |" in line_of(files["next_steps.md"],
                                                                             "| `harborfoods.example` |")
 
@@ -101,7 +103,7 @@ def test_no_output_says_p_unknown(first, estate):
         for name, text in files.items():
             assert "p=unknown" not in text and "p=None" not in text, name
         for d, words in said.items():
-            assert line_of(files["summary.txt"], "- `%s`: " % d).startswith("- `%s`: %s, " % (d, words))
+            assert line_of(files["summary lines"], "- `%s`: " % d).startswith("- `%s`: %s, " % (d, words))
             assert line_of(files["todo.md"], "- %s: " % d).startswith("- %s: %s, " % (d, words))
     # a lookup that failed and a policy nobody read say so, in the per-domain table too
     rep = json.loads(json.dumps(first["report"]))
@@ -110,7 +112,8 @@ def test_no_output_says_p_unknown(first, estate):
     assert next_steps.policy_text(rep, "harbor-old.example") == ("lookup failed", None)
     del rep["dns"]["harbor-old.example"]
     assert next_steps.policy_words(rep, "harbor-old.example") == "not read"
-    assert "- `harbor-old.example`: not read, gate *" in notify.summarize(rep, plan=first["plan"])
+    assert "- `harbor-old.example`: not read, gate *" in "\n".join(e["line"] for e in notify.domain_lines(rep, first["plan"]))
+    assert "2. `harbor-old.example` not read - policy not read" in notify.summarize(rep, plan=first["plan"])
     # a p= receivers do not apply is an invalid record, its value beside it
     g = rep["gate"]["domains"]["harbor-old.example"]
     g.update(current_policy="quarantin", next_step="unknown - unrecognised policy p=quarantin")
@@ -119,7 +122,9 @@ def test_no_output_says_p_unknown(first, estate):
 
 
 def test_a_domain_with_no_dmarc_record_has_failures_that_are_not_measurable(first):
-    summary = notify.summarize(first["report"], plan=first["plan"])
+    # round 13, T-04: every per-domain line the message builds (it keeps some of them under its details)
+    summary = "\n".join(e["line"] for e in notify.domain_lines(first["report"], first["plan"]))
+    assert not re.search(r"(?<![0-9])0 genuine failures", notify.summarize(first["report"], plan=first["plan"]))
     shop = line_of(summary, "- `harborfoods-shop.example`: ")
     assert shop.endswith(" - failures not measurable without a DMARC record (34 messages)")
     assert line_of(summary, "- `harbor-old.example`: ").endswith(" - no mail-log rows of its own")
@@ -176,7 +181,7 @@ def test_reading_a_policy_the_run_could_not_read_is_never_on_hold(tmp_path):
     page = brief.render(json.loads(json.dumps(doc)))
     step = page.split('id="next-step"', 1)[1].split("</section>", 1)[0]
     assert "on hold while" not in step.lower()
-    summary = notify.summarize(rep)
+    summary = "\n".join(e["line"] for e in notify.domain_lines(rep))  # round 13, T-04: the line as built
     assert ("- `example.com`: not read, gate *no_go*, next: read the policy first: run online, or supply aggregate "
             "reports that cover it - 5 genuine failures of its own") in summary
     assert "- example.com: not read, gate no_go, next step: read the policy first" in collect.render_todo(

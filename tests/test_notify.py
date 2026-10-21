@@ -28,7 +28,13 @@ def test_summary_covers_gate_findings_maillog_and_outside_view():
     rep = report(findings=("DMARC-003",))
     rep["rua"]["filters"] = {"known": {"given": True, "ip_check": True, "networks": ["192.0.2.0/24"]}}
     text = notify.summarize(rep)
-    assert "`example.com`: p=quarantine, gate *no_go*, next: p=reject" in text
+    # round 13, T-04: the status band leads, plain; a domain the strip leads with is said there, not again below
+    lines = text.splitlines()
+    assert lines[0] == ("*DMARC 2026-01-08* - Protected: example.com blocks spoofed mail. Nothing urgent. Your call: "
+                        "nothing to approve (no plan this run).")
+    assert lines[1] == "1. `example.com` junks spoofs - our own senders not checked (the mail log is not counted per domain)"
+    assert lines[lines.index("Details:") - 1] == "Full brief: brief.html in audit-out/latest (inside the company only)"
+    assert "`example.com`: p=quarantine" not in text
     assert "findings: 1 (major 1)" in text
     assert "21 genuine failures (33 rows would say so)" in text
     assert "spoofing blocked by receivers: 300 rejected, 6 quarantined" in text
@@ -79,7 +85,7 @@ def test_cli_dry_run_and_missing_webhook(tmp_path):
     (tmp_path / "report.json").write_text(json.dumps(report()), encoding="utf-8")
     p = subprocess.run([sys.executable, str(ROOT / "src" / "notify.py"), "--report", str(tmp_path / "report.json"), "--dry-run"],
                        capture_output=True, text=True)
-    assert p.returncode == 0 and "*DMARC audit*" in p.stdout
+    assert p.returncode == 0 and p.stdout.startswith("*DMARC 2026-01-08* - ")  # round 13, T-04: the band's headline
     env = {"PATH": "", "SYSTEMROOT": "C:\\Windows"}
     p = subprocess.run([sys.executable, str(ROOT / "src" / "notify.py"), "--report", str(tmp_path / "report.json"),
                         "--env-file", str(tmp_path / "none.env")], capture_output=True, text=True)

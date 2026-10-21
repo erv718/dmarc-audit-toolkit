@@ -481,10 +481,59 @@ def trend_judgement(pts, headline=None):
     return word, reasons
 
 
-def summarize(report, previous=None, plan=None, known_senders=None, history=None):
+# the Slack message's lead (round 13): the status band in plain words, then where the full brief is
+SLACK_BRIEF = "Full brief: brief.html in %s (inside the company only)"
+DETAILS = "Details:"
+REST_DOMAINS = "- %d more %s: no failures, no change (brief.html Per domain)"
+
+
+def band_of(report, plan=None, previous=None, history=None):
+    """The status band (next_steps.json top) of this run, built as the status document builds it, for a summary
+    made without the document beside it (notify.py run on its own): None when the report gives no document."""
+    try:
+        doc = next_steps.build(report, plan, history, (), previous if isinstance(previous, dict) else None)
+    except Exception:  # an unusable report: the message keeps its older first line
+        return None
+    top = doc.get("top")
+    return top if isinstance(top, dict) and top.get("headline") else None
+
+
+def band_lines(top, date="", where=None):
+    """The message's first lines from the band: '*DMARC <date>* - <headline>', one numbered line per organization
+    of the strip ('`<org>` <badge> - <finding>', plain: no address, no subject), how many more, what changed and
+    what this data cannot show, then where the full brief is and the details' header."""
+    L = ["*DMARC%s* - %s" % ((" " + date) if date else "", top.get("headline") or "")]
+    for e in top.get("domains") or []:
+        if isinstance(e, dict):
+            L.append("%s. `%s` %s - %s" % (e.get("rank"), e.get("org"), e.get("badge"), e.get("finding_plain")))
+    more = top.get("more") if isinstance(top.get("more"), dict) else None
+    if more and more.get("count"):
+        words = ", ".join("%s %s" % (n, w) for w, n in _d(more.get("by_tier")).items())
+        L.append("+%d more organization%s (%s): Per domain lists them" % (
+            more["count"], "" if more["count"] == 1 else "s", words))
+    changed = _d(top.get("changed"))
+    if changed.get("plain"):
+        L.append("Since last run: %s." % changed["plain"])
+    gaps = [g for g in (top.get("data_gaps") or [])[:1] if isinstance(g, str)]
+    L.append("Not in this data: %s" % "; ".join(gaps + [next_steps.SCOPE_GAP_PLAIN]))
+    L.append(SLACK_BRIEF % (where or "audit-out/latest"))
+    L.append(DETAILS)
+    return L
+
+
+def summarize(report, previous=None, plan=None, known_senders=None, history=None, top=None, where=None):
     """Plain-text (Slack mrkdwn) message. Deterministic, no secrets. Deltas
     come from report["delta"] when the run carried one, else are recomputed
     from previous; pass rate and newly seen sources always need previous.
+
+    top: the status band (next_steps.json top) the run's document carries;
+    collect.py passes it, and without it the band is built here as the
+    document builds it (band_of), so both give the same message. The
+    message leads with it (band_lines); the per-domain lines that follow
+    keep only the domains the strip does not lead with that have genuine
+    failures, a change since the last run or a cut organization, and count
+    the rest on one line. where: the folder the brief is in, as the message
+    names it (default audit-out/latest).
 
     known_senders: every sender key seen in earlier runs (collect.py keeps
     them); with it, "newly identified" means never seen before, not merely
@@ -501,10 +550,13 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     none (NO_PLAN_LINE)."""
     lines = []
     gen = str(report.get("generated_utc") or "")
-    lines.append("*DMARC audit* %s" % gen[:16].replace("T", " "))
-
+    band = top if isinstance(top, dict) and top.get("headline") else band_of(report, plan, previous, history)
+    if band:
+        lines += band_lines(band, gen[:10] if re.match(r"\d{4}-\d{2}-\d{2}", gen) else "", where)
+    else:  # no band could be built: the message's older first line
+        lines.append("*DMARC audit* %s" % gen[:16].replace("T", " "))
+    strip = {str(e.get("lead") or "").lower() for e in (band or {}).get("domains") or [] if isinstance(e, dict)}
     maillog = report.get("maillog") if isinstance(report.get("maillog"), dict) else {}
-    by_dom = maillog.get("by_domain") if isinstance(maillog.get("by_domain"), dict) else {}
     dl = report.get("delta") if isinstance(report.get("delta"), dict) else None
     if dl is None and isinstance(previous, dict):
         # the documented --previous use with an audit.py report: the same rules as collect.py's delta (the
@@ -513,65 +565,23 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
             dl = audit.build_delta(report, previous)
         except Exception:  # a damaged earlier report: no delta, the rest of the message stands
             dl = None
-    dl_dom = _d(dl).get("by_domain") if isinstance(_d(dl).get("by_domain"), dict) else {}
-    gate = _d(report.get("gate"))
-    per = _d(gate.get("domains"))
-    cuts = audit.maillog_cuts(report)  # the orgs whose mail log this run cut: their counts are a floor
-    # a domain the run measured sending nothing: the plan moves it straight to quarantine, skipping the weekly
-    # ramp whose first step the gate judges, so its line leads with the plan and gives the gate's verdict as
-    # such - unless the gate's blockers hold that row too
-    quiet = {}
-    for c in _rows(plan.get("changes")) if isinstance(plan, dict) else []:
-        if isinstance(c, dict) and c.get("kind") == "no_mail" and c.get("domain"):
-            quiet.setdefault(str(c["domain"]).lower(), c.get("id") or "?")
-    # the domains in the one order every file follows: the status document's organization first, each
-    # organization's own domain before the names below it
     headline = next_steps.headline_org(report)
-    for dom in sorted(per, key=lambda d: (audit.domain_key(d, headline), str(d))):
-        g = _d(per[dom])
-        # the policy in the band's words when none was read (no DMARC record, lookup failed, not read): never p=unknown
-        policy = next_steps.policy_words(report, str(dom))
-        verdict = g.get("verdict") if isinstance(g.get("verdict"), str) else "?"
-        if str(dom).lower() in quiet:
-            left = audit.ramp_blockers_left(report, str(dom).lower())
-            line = "- `%s`: %s, next: no mail measured, quarantine now (plan %s); the gate's *%s* %s" % (
-                dom, policy, quiet[str(dom).lower()], verdict,
-                "is for the weekly ramp this skips" if not left else "holds that row too: %s" % left[0])
-        else:
-            # a domain with a plan row: the plan's first row is its next step, as next_steps.md's table and todo.md
-            # name it, each row with its id and status; else the gate's step, a policy it did not read in words
-            step = next_steps.plan_step(plan, str(dom).lower(), plan_note) if isinstance(plan, dict) else None
-            if step is None:
-                step = g.get("next_step") if isinstance(g.get("next_step"), str) else "?"
-                if step.lower().startswith("unknown"):
-                    step = next_steps._unread_step(report, str(dom))
-                if isinstance(plan, dict):  # a name a plan hold says needs a record of its own: one statement, the plan's
-                    step = audit.inherited_step(str(dom), step, plan)
-            line = "- `%s`: %s, gate *%s*, next: %s" % (dom, policy, verdict, step)
-        own = by_dom.get(dom)
-        # a domain under an org the row budget cut: its own count is the floor the gate decides on, and the
-        # whole window, counted server side, goes beside it when it was counted
-        full = full_window_line(maillog.get("window_totals"), dom)
-        cut = next((o for o in cuts if isinstance(o, str) and (dom == o or str(dom).endswith("." + o))), None)
-        unmeasured = (isinstance(own, dict) and not _whole(own.get("genuine_failures"))
-                      and next_steps.policy_unread_why(report, str(dom)) == "absent")
-        if unmeasured:  # with no DMARC record nothing it sends can fail DMARC: a zero would read as health
-            n = _whole(own.get("logical_messages"))
-            line += (" - failures not measurable without a DMARC record (%d messages)" % n if n
-                     else " - no mail-log rows of its own")
-        elif isinstance(own, dict) and _number(own.get("genuine_failures")) is not None:
-            line += " - %d genuine failures of its own" % _whole(own.get("genuine_failures"))
-            gone = min(_whole(own.get("excepted")), _whole(own.get("genuine_failures")))
-            if gone:  # the count holds every one; the share an exception covers is named beside it
-                line += " (%d of them formally excepted in audit.toml)" % gone
-            if cut:
-                kept = audit._cut_kept(cuts.get(cut))
-                line += " in the rows kept (%s; a floor: the gate, the census and the labels count these)" % (
-                    kept or "cut by %s" % (audit._cut_cause(cuts.get(cut)) or "an unrecorded cause"))
-            d = dl_dom.get(dom)
-            if isinstance(d, dict) and _number(d.get("genuine_failures")) is not None:
-                line += " (%+d vs last run)" % d["genuine_failures"]
-        lines.append(line + full)
+    per = _d(_d(report.get("gate")).get("domains"))
+    rest = 0
+    for e in domain_lines(report, plan, dl):
+        if not band:
+            lines.append(e["line"])
+            continue
+        # under the band: a domain of a cut organization keeps its line (its floor and its full-window totals); one
+        # the strip leads with is said there; any other is kept when it has failures of its own or a change since the
+        # last run, and counted with the rest otherwise
+        here = e["domain"].lower() in strip
+        if e["cut"] or (not here and (e["failing"] or e["changed"])):
+            lines.append(e["line"])
+        elif not here:
+            rest += 1
+    if band and rest:
+        lines.append(REST_DOMAINS % (rest, "domain" if rest == 1 else "domains"))
 
     summ = _d(report.get("summary"))
     sev = _d(summ.get("by_severity"))
@@ -719,6 +729,87 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     elif report.get("offline") is True or ("dns" in report and not report.get("dns")):
         lines.append(NO_PLAN_LINE)  # an offline run builds no plan: it says so, never "0 change(s) waiting"
     return "\n".join(lines)
+
+
+def domain_lines(report, plan=None, dl=None):
+    """One entry per audited name, in the one order every file of the run
+    follows (the status document's organization first, each organization's
+    own domain before the names below it): {"domain", "line", "failing",
+    "changed", "cut"} - its line as the message words it (its policy, in
+    words when none was read; the gate's verdict; its next step, the
+    plan's first row for it when the plan has one, else the gate's; its own
+    genuine failures, the share an exception covers, the floor a cut
+    organization's rows give and the full window beside it, and the change
+    since the last run), whether it has failures of its own, whether they
+    or its policy changed since the last run (dl: the run's delta), and
+    whether its organization's mail log was cut (or counted over the full
+    window)."""
+    maillog = report.get("maillog") if isinstance(report.get("maillog"), dict) else {}
+    by_dom = maillog.get("by_domain") if isinstance(maillog.get("by_domain"), dict) else {}
+    dl_dom = _d(dl).get("by_domain") if isinstance(_d(dl).get("by_domain"), dict) else {}
+    gate = _d(report.get("gate"))
+    per = _d(gate.get("domains"))
+    cuts = audit.maillog_cuts(report)  # the orgs whose mail log this run cut: their counts are a floor
+    # a domain the run measured sending nothing: the plan moves it straight to quarantine, skipping the weekly
+    # ramp whose first step the gate judges, so its line leads with the plan and gives the gate's verdict as
+    # such - unless the gate's blockers hold that row too
+    quiet = {}
+    for c in _rows(plan.get("changes")) if isinstance(plan, dict) else []:
+        if isinstance(c, dict) and c.get("kind") == "no_mail" and c.get("domain"):
+            quiet.setdefault(str(c["domain"]).lower(), c.get("id") or "?")
+    headline = next_steps.headline_org(report)
+    out = []
+    for dom in sorted(per, key=lambda d: (audit.domain_key(d, headline), str(d))):
+        g = _d(per[dom])
+        # the policy in the band's words when none was read (no DMARC record, lookup failed, not read): never p=unknown
+        policy = next_steps.policy_words(report, str(dom))
+        verdict = g.get("verdict") if isinstance(g.get("verdict"), str) else "?"
+        if str(dom).lower() in quiet:
+            left = audit.ramp_blockers_left(report, str(dom).lower())
+            line = "- `%s`: %s, next: no mail measured, quarantine now (plan %s); the gate's *%s* %s" % (
+                dom, policy, quiet[str(dom).lower()], verdict,
+                "is for the weekly ramp this skips" if not left else "holds that row too: %s" % left[0])
+        else:
+            # a domain with a plan row: the plan's first row is its next step, as next_steps.md's table and todo.md
+            # name it, each row with its id and status; else the gate's step, a policy it did not read in words
+            step = next_steps.plan_step(plan, str(dom).lower(), plan_note) if isinstance(plan, dict) else None
+            if step is None:
+                step = g.get("next_step") if isinstance(g.get("next_step"), str) else "?"
+                if step.lower().startswith("unknown"):
+                    step = next_steps._unread_step(report, str(dom))
+                if isinstance(plan, dict):  # a name a plan hold says needs a record of its own: one statement, the plan's
+                    step = audit.inherited_step(str(dom), step, plan)
+            line = "- `%s`: %s, gate *%s*, next: %s" % (dom, policy, verdict, step)
+        own = by_dom.get(dom)
+        # a domain under an org the row budget cut: its own count is the floor the gate decides on, and the
+        # whole window, counted server side, goes beside it when it was counted
+        full = full_window_line(maillog.get("window_totals"), dom)
+        cut = next((o for o in cuts if isinstance(o, str) and (dom == o or str(dom).endswith("." + o))), None)
+        unmeasured = (isinstance(own, dict) and not _whole(own.get("genuine_failures"))
+                      and next_steps.policy_unread_why(report, str(dom)) == "absent")
+        if unmeasured:  # with no DMARC record nothing it sends can fail DMARC: a zero would read as health
+            n = _whole(own.get("logical_messages"))
+            line += (" - failures not measurable without a DMARC record (%d messages)" % n if n
+                     else " - no mail-log rows of its own")
+        elif isinstance(own, dict) and _number(own.get("genuine_failures")) is not None:
+            line += " - %d genuine failures of its own" % _whole(own.get("genuine_failures"))
+            gone = min(_whole(own.get("excepted")), _whole(own.get("genuine_failures")))
+            if gone:  # the count holds every one; the share an exception covers is named beside it
+                line += " (%d of them formally excepted in audit.toml)" % gone
+            if cut:
+                kept = audit._cut_kept(cuts.get(cut))
+                line += " in the rows kept (%s; a floor: the gate, the census and the labels count these)" % (
+                    kept or "cut by %s" % (audit._cut_cause(cuts.get(cut)) or "an unrecorded cause"))
+            d = dl_dom.get(dom)
+            if isinstance(d, dict) and _number(d.get("genuine_failures")) is not None:
+                line += " (%+d vs last run)" % d["genuine_failures"]
+        delta = dl_dom.get(dom) if isinstance(dl_dom.get(dom), dict) else {}
+        out.append({"domain": str(dom), "line": line + full,
+                    "failing": isinstance(own, dict) and _whole(own.get("genuine_failures")) > 0 and not unmeasured,
+                    "changed": bool(_number(delta.get("genuine_failures")))
+                    or dom in _d(_d(dl).get("policy_changes")),
+                    "cut": bool(cut or full)})
+    return out
 
 
 NO_PLAN_LINE = "- plan: not in this run (offline: no DNS read)"

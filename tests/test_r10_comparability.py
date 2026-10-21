@@ -184,8 +184,12 @@ def test_c7_d1_a_short_whole_log_withholds_every_domains_delta(tmp_path):
     dl = now["delta"]
     assert dl["by_domain"] == {} and dl["maillog_window"]["domains_not_comparable"] == ["corp.example"]
     assert dl["maillog_window"]["log_comparable"] is False and dl["maillog_window"]["cut_orgs"] == {}
-    line = next(l for l in notify.summarize(now, prev).splitlines() if "`corp.example`" in l)
-    assert "20 genuine failures of its own" in line and "vs last run" not in line
+    # round 13, T-04: corp.example leads the status band's strip, so its count is said there; no delta beside it
+    text = notify.summarize(now, prev)
+    line = next(l for l in text.splitlines() if "`corp.example`" in l)
+    assert "20 of our own messages fail DMARC" in line and "vs last run" not in text
+    assert "Since last run: since %s: failure counts not compared (the two mail logs cover very different spans)." % (
+        prev["generated_utc"][:10]) in text
     md = audit.render_md(now)
     assert "- per domain:" not in md and "n/a (mail-log spans not comparable, see the note below)" in md
     # D1: a one-domain log covering 2 days now and 30 days last run

@@ -91,10 +91,12 @@ def test_a_domain_without_a_record_is_not_p_none():
     rep = report()
     rep["gate"]["domains"]["example.com"]["current_policy"] = None
     # round 13, T-12: a policy the run did not read is said in words (here DNS was not read), never p=unknown
+    # round 13, T-04: the domain leads the status band's strip, so its line there says it, in the band's badge words
     text = notify.summarize(rep)
-    assert "- `example.com`: not read, gate *no_go*" in text and "p=unknown" not in text and "p=None" not in text
+    assert "1. `example.com` not read - " in text and "p=unknown" not in text and "p=None" not in text
     rep["dns"] = {"example.com": {"domain": "example.com", "dmarc": None, "dmarc_status": "absent"}}
-    assert "- `example.com`: no DMARC record, gate *no_go*" in notify.summarize(rep)
+    text = notify.summarize(rep)
+    assert "1. `example.com` no record - anyone can send as it" in text and "p=unknown" not in text
 
 
 def test_the_cli_counts_the_runs_own_new_senders_as_new_and_checks_the_file(tmp_path):

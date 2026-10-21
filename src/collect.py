@@ -41,7 +41,12 @@ What it does, in order, and what it skips when it cannot:
      skips it; start from samples/owners.csv.example), and brief.html, the
      same document with the plan's records designed as one page (src/brief.py)
   9. post the summary to Slack or Teams (SLACK_WEBHOOK_URL in .env; --dry-run
-     prints it; --no-notify skips it)
+     prints it under its own header; --no-notify skips it; with no webhook
+     the run says summary.txt was written and not posted)
+ 10. end, after every note, with the run's last lines: done, the exit code
+     and what it means, the status band in plain words (next_steps.json
+     top: the headline, the most critical organizations, what changed, what
+     this data cannot show), the run folder and the file to open first
 
 Everything is read-only toward the tenant. No AI is involved at any step;
 the outputs are what a human reads, and what an AI agent may read later.
@@ -51,9 +56,9 @@ the outputs are what a human reads, and what an AI agent may read later.
   python src/collect.py example.com --offline --rua samples/rua --maillog samples/sample_maillog.csv --auth-column DMARC --no-notify
 
 Settings: audit.toml in the repo root (copy audit.example.toml) supplies the
-domains, known senders, retention, the notification switch and the formal
-exceptions the gate honours; a command-line flag beats the file. Secrets stay
-in .env.
+domains, known senders, retention, the notification switch, the change
+window and approver the ask ends with ([brief]) and the formal exceptions
+the gate honours; a command-line flag beats the file. Secrets stay in .env.
 
 Outputs under --out (default audit-out/):
   history/<UTC stamp>/   report.md report.json plan.md plan.json next_steps.md next_steps.json
@@ -688,15 +693,17 @@ def load_owners(explicit=None, skip=False):
         return [], None, str(err)
 
 
-def write_next_steps(run_dir, report, plan, entries, owners, owners_path, prev_report, prev_dir, note):
+def write_next_steps(run_dir, report, plan, entries, owners, owners_path, prev_report, prev_dir, note, settings=None):
     """next_steps.md and next_steps.json in the run dir, from the report, the
     plan (None when none was written), the metrics history, the owners rows
-    and the previous run. Returns the document, or None after a note: the
-    document is derived from files already on disk, so it never fails the run."""
+    and the previous run; settings: audit.toml's [brief] table (the change
+    window and approver the ask ends with). Returns the document, or None
+    after a note: the document is derived from files already on disk, so it
+    never fails the run."""
     prev_path = (prev_dir / "report.json").resolve() if prev_dir else None
     try:
         doc = next_steps.build(report, plan, entries, owners, prev_report,
-                               owners_path=owners_path, previous_path=prev_path)
+                               owners_path=owners_path, previous_path=prev_path, settings=settings)
         next_steps.write(doc, run_dir.resolve())  # absolute: next_steps resolves relative paths from the repo root
     except next_steps.UsageError as err:
         note("no next-steps document written: %s" % err)
@@ -1147,6 +1154,40 @@ def render_todo(report, plan, caveats=()):
     return "\n".join(L) + "\n"
 
 
+# what the run says about its summary, instead of the text itself (the text is in summary.txt)
+DRY_RUN_HEADER = "Slack summary (dry run, not posted):"
+NOT_POSTED = "summary.txt written (not posted: %s)"
+# what each exit code means, said on the run's done line
+EXIT_MEANING = {0: "nothing major found", 1: "findings to act on, not a crash"}
+OPEN_ALSO = (("detail", "next_steps.md"), ("records", "plan.md"), ("how to check", "verify.md"))
+
+
+def last_lines(report, top, code, strict_reasons, stamp, run_dir, latest, paint=None):
+    """The last lines a run prints (plain words: domains and counts, never an address or a subject): the done line
+    with the exit code and what it means, the status band's plain lines (next_steps.json top.lines_plain: the
+    headline, the most critical organizations, what changed, what this data cannot show), the run folder, and the
+    file to open first with the others beside it. Without a band, the done line and the paths."""
+    paint = paint or console.painter()
+    gate = (report.get("gate") or {}) if isinstance(report, dict) else {}
+    names = [d for d in (gate.get("domains") or {})] if isinstance(gate.get("domains"), dict) else []
+    orgs = top.get("orgs") if isinstance(top, dict) else None
+    if not isinstance(orgs, int):
+        orgs = len({next_steps.org_domain(str(d).lower()) for d in names})
+    meaning = ("--strict (%s)" % strict_reasons[0]) if strict_reasons and code == 1 else EXIT_MEANING.get(code, "")
+    done = "done: %d %s in %d %s audited - exit %d%s" % (
+        len(names), "domain" if len(names) == 1 else "domains", orgs, "organization" if orgs == 1 else "organizations",
+        code, (": " + meaning) if meaning else "")
+    out = [paint.bold(done)]
+    if isinstance(top, dict) and isinstance(top.get("lines_plain"), list):
+        out += [str(line) for line in top["lines_plain"]]
+    out.append(paint.bold("run %s:" % stamp) + " %s" % run_dir)
+    first = next((n for n in ("brief.html", "next_steps.md", "report.md") if (latest / n).exists()), None)
+    if first:
+        also = ["%s: %s" % (what, n) for what, n in OPEN_ALSO if n != first and (latest / n).exists()]
+        out.append(paint.bold("Open first:") + " %s%s" % (latest / first, ("  (%s)" % "; ".join(also)) if also else ""))
+    return out
+
+
 def main():
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", metavar="TOML",
@@ -1203,6 +1244,7 @@ def main():
             defaults = config_mod.collect_defaults(cfg)
             ap.set_defaults(**defaults)
         notify_cfg = config_mod.notify_settings(cfg)
+        brief_cfg = config_mod.brief_settings(cfg)
     except config_mod.ConfigError as err:
         die(str(err))
     args = ap.parse_args()
@@ -1469,7 +1511,8 @@ def main():
     (out / "metrics.md").write_text(render_metrics(entries), encoding="utf-8")
 
     # 8. the stakeholder document (entries already holds this run; next_steps skips it for the trend)
-    steps = write_next_steps(run_dir, report, plan_doc, entries, owners, owners_path, prev_report, prev_dir, note)
+    steps = write_next_steps(run_dir, report, plan_doc, entries, owners, owners_path, prev_report, prev_dir, note,
+                             brief_cfg)
     try:  # the same document designed as one page, from the files just written, as brief.py builds it by hand: it
         # never fails the run (absolute: brief resolves relative paths from the repo root)
         if steps is None:  # the note above says why there is no document; the page would have nothing to lay out
@@ -1524,7 +1567,8 @@ def main():
     # 9. summary and notification: the plan as written (plan_doc), never the empty stand-in an offline run uses
     # above - a plan this run did not build is not "0 changes waiting"
     try:
-        text = notify.summarize(report, prev_report, plan_doc, known_senders=known_before, history=entries)
+        text = notify.summarize(report, prev_report, plan_doc, known_senders=known_before, history=entries,
+                                top=(steps or {}).get("top"), where="%s/latest" % (out.name or "audit-out"))
     except Exception as exc:  # a damaged earlier report or history entry: the run's files still get written
         text = "*DMARC audit* summary not built: %s: %s (report.md and next_steps.md hold the run)" % (
             type(exc).__name__, exc)
@@ -1558,13 +1602,14 @@ def main():
         shutil.copy2(run_dir / "run.json", latest / "run.json")  # written after the RUN_FILES copy, like summary.txt
 
     write_run_json()  # now, so a failure inside the notification still leaves a run record
+    said = None  # what became of the summary, said once before the run's last lines; never the text unlabeled
     if args.no_notify:
         pass
     elif args.dry_run:
-        print(text)
+        said = "%s\n%s" % (DRY_RUN_HEADER, text)
     elif not notify_cfg["enabled"]:
         note("summary not posted: [notify] enabled = false in audit.toml")
-        print(text)
+        said = NOT_POSTED % "[notify] enabled = false in audit.toml"
     else:
         try:
             run_hunting.load_env(args.env_file)
@@ -1578,16 +1623,19 @@ def main():
             except RuntimeError as err:
                 note("summary not posted: %s" % err)
         else:
-            print(text)
+            said = NOT_POSTED % "no SLACK_WEBHOOK_URL"
     write_run_json()  # once more: the notification outcome is on record too
 
-    out_paint = console.painter()
-    if steps and steps.get("one_liner"):
-        print(out_paint.bold("next steps:") + " " + steps["one_liner"])
-    print(out_paint.bold("run %s:" % stamp) + " %s" % run_dir)
-    print(out_paint.bold("latest:") + " %s" % latest)
     for r in strict_reasons:
         print("strict: %s" % r, file=sys.stderr)
+    if said:
+        print(said)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    print()  # after every note: the run's last lines, what to read first
+    for line in last_lines(report, (steps or {}).get("top"), code, strict_reasons, stamp, run_dir, latest,
+                           console.painter()):
+        print(line)
     sys.exit(code)
 
 

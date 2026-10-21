@@ -185,7 +185,8 @@ def test_collect_writes_the_brief_into_the_run_and_into_latest(sample_run):
     # every section in its place, in order, each with its id - and no other id on the page
     assert re.findall(r'\sid="([^"]+)"', page) == list(brief.SECTION_IDS)
     assert re.findall(r'href="#([^"]+)"', page) == [sid for sid, _ in brief.SECTIONS]  # the contents, in order
-    assert "<p>%s</p>" % brief.prose(doc["one_liner"]) in section_of(page, "summary")
+    # round 13, T-02: the status band leads; the one-liner sits folded under The next step
+    assert "<p>%s</p>" % brief.prose(doc["one_liner"]) in section_of(page, "next-step")
     assert page.startswith("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n")
     assert '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">' in page
     assert '<meta http-equiv="Content-Security-Policy" content="%s">' % CSP in page
@@ -269,9 +270,14 @@ def test_the_brief_carries_the_documents_own_sentences(sample_run):
         assert brief.prose(t) in page, t
     for r in doc["per_domain"]:
         assert brief.prose(r["next_step"]) in section_of(page, "domains")
-    audience, sources = doc["sources"]["audience"], doc["sources"]["audience_line"][len(doc["sources"]["audience"]) + 2:]
-    assert '<p class="audience"><bdi>%s</bdi>.</p>' % audience in page and brief.prose(sources) in page
-    assert brief.VERIFY_LINE == next_steps.render_md(doc).split("\n\n")[2]  # the pointer next_steps.md opens with
+    # round 13, T-02: the sources and the verify.md pointer moved to the footer, as next_steps.md's Sources section
+    # says them; the masthead reads how to read the page (the default audience is not repeated)
+    sources = doc["sources"]["audience_line"][len(doc["sources"]["audience"]) + 2:]
+    foot = page[page.index('<footer id="footer"'):]
+    assert "<p>%s</p>" % brief.prose(sources) in foot and "<p>%s</p>" % brief.esc(brief.VERIFY_LINE) in foot
+    assert '<p class="reading">%s</p>' % brief.READING_LINE in page and '<p class="audience">' not in page
+    md = next_steps.render_md(doc)
+    assert brief.VERIFY_LINE in md.split("## Sources and how to check", 1)[1]
     # the tiles: genuine failures with the raw count beside them, and receivers' verdicts from spoofing_blocked
     st = doc["stand"]
     assert '<p class="figure">%d <span class="side">raw %d</span></p>' % (st["genuine_failures"],
@@ -313,9 +319,9 @@ def test_every_string_from_the_data_is_escaped_and_only_the_generators_marks_bec
             assert name in ATTRS, (tag, name)
             if name == "href":  # internal anchors only: a section, or a record card the page itself numbered
                 assert value.startswith("#") and value[1:] in ids
-                assert value[1:] in brief.SECTION_IDS or CARD_ID_RX.fullmatch(value[1:]), value
-            if name == "id":
-                assert value in brief.SECTION_IDS or CARD_ID_RX.fullmatch(value), value
+                assert value[1:] in brief.OLD_SECTION_IDS or CARD_ID_RX.fullmatch(value[1:]), value
+            if name == "id":  # a document without the status band keeps the page it had (round 13)
+                assert value in brief.OLD_SECTION_IDS or CARD_ID_RX.fullmatch(value), value
             if name == "class":
                 assert re.fullmatch(r"[a-z][a-z -]*", value), value
     for p in PAYLOADS:

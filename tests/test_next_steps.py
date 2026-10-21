@@ -17,11 +17,13 @@ import plan
 
 ROOT = Path(__file__).resolve().parent.parent
 OWNERS = ROOT / "samples" / "owners.csv.example"
-HEADINGS = ["## Where we stand (", "## What is failing", "## Per domain",
-            "## What happens next, by owner", "## The ask", "## Open questions"]
+# round 13, T-03: the status band's This week first, The next step after Where we stand, the sources last
+HEADINGS = ["## This week (the 45-second read)", "## Where we stand (", "## The next step for ", "## What is failing",
+            "## Per domain", "## What happens next, by owner", "## The ask", "## Open questions",
+            "## Sources and how to check"]
 DASHES = [chr(c) for c in range(0x2010, 0x2016)]  # hyphen, dashes and bar: never in the output
-# numbers the template itself carries: the 30-day window and the under-10 headline rule
-TEMPLATE_NUMBERS = {"30", str(next_steps.HEADLINE_MIN)}
+# numbers the template itself carries: the 30-day window, the under-10 headline rule and the 45-second read
+TEMPLATE_NUMBERS = {"30", str(next_steps.HEADLINE_MIN), "45"}
 no_root_owners = pytest.mark.skipif((ROOT / next_steps.DEFAULT_OWNERS).is_file(),
                                     reason="a private owners.csv at the repo root would be read")
 
@@ -55,6 +57,9 @@ def check_numbers(md, report, corpus_texts):
     next_steps computes from the window's own stamps."""
     corpus = "\n".join(PATH_RX.sub('""', t) for t in corpus_texts)
     allowed = set(TEMPLATE_NUMBERS)
+    stale = next_steps.top_gaps(report)["stale"]  # the evidence's age in days, from the report's own dates
+    if stale is not None:
+        allowed.add(str(stale))
     rate = ((report.get("rua") or {}).get("totals") or {}).get("pass_rate")
     if rate is not None:
         allowed.add("%.1f" % (100 * rate))
@@ -166,7 +171,9 @@ def test_sample_document_has_the_template_shape(sample, tmp_path):
     assert md.startswith("# DMARC rollout - status and next steps, %s\n" % day)
     headings_in_order(md)
     assert doc["one_liner"].startswith("example.com is at p=reject.")  # the org domain and its policy
-    assert "**%s**" % doc["one_liner"] in md
+    # round 13, T-03: the band's headline is the bold line; the one-liner, unchanged, opens The next step
+    assert md.split("\n\n")[1] == "**%s**" % doc["top"]["headline"]
+    assert "## The next step for example.com\n\n%s\n\n" % doc["one_liner"] in md and md.count(doc["one_liner"]) == 1
     assert (doc["org_domain"], doc["policy"]["p"], doc["date"]) == ("example.com", "reject", day)
     assert set(doc) >= {"tool", "version", "date", "org_domain", "policy", "next_step", "one_liner", "stand",
                         "failing", "per_domain", "actions_by_owner", "ask", "open_questions", "glossary", "sources"}

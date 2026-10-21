@@ -447,12 +447,13 @@ def test_r2_the_plan_md_row_the_table_and_todo_say_it_in_plain_words(tmp_path):
     ready = [c["id"] for c in p["changes"] if c["id"] in zero_risk and c["status"] == "now"]
     checked = [i for i in zero_risk if i not in ready]
     assert len(ready) == 6 and len(checked) == 2
-    assert ("approval to publish the %d zero-risk records (plan %s) in the next DNS change window; approval to "
-            "publish 2 more records (plan %s) once the checks listed with each are confirmed, of which 2 are park rows "
-            "that need the domain's unused check first; approval to move 3 domains that send no mail straight to "
-            "quarantine (plan %s) once the checks listed with each are confirmed"
-            % (len(ready), next_steps.id_range(ready), next_steps.id_range(checked),
-               next_steps.id_range(quiet))) in doc["ask"]
+    # round 13, T-11: under 60 words - the zero-risk ones with their first ids, the park rows by what they wait on,
+    # the quarantine-now rows apart (they change delivery); every id in the ask's lists (ask_parts)
+    assert ("approval to publish the %d zero-risk records (%s, %s, %s and 3 more); approval to publish 2 more "
+            "records (%s) once the domain's unused check is done; 3 domains that send no mail moved to quarantine "
+            "once their checks are confirmed"
+            % (len(ready), ready[0], ready[1], ready[2], next_steps.id_range(checked))) in doc["ask"]
+    assert doc["ask_parts"]["now"] == ready and doc["ask_parts"]["quiet"] == quiet
     todo = collect.render_todo(rep, p)
     assert ("## 2. Do now (plan priority 1, ready now: monitoring and hygiene with no mail impact and nothing to check "
             "first)") in todo
@@ -477,9 +478,13 @@ def test_r2_the_plan_md_row_the_table_and_todo_say_it_in_plain_words(tmp_path):
     assert ("- plan: 14 change(s) waiting: 6 ready now, zero-risk monitoring/hygiene, 6 after their checks (3 move "
             "domains that send no mail straight to quarantine), 2 not this week (held, gated or after another change "
             "to the same record); 1 hold(s)") in text
+    # round 13, T-04: spoofed.example leads a line of the status band's strip, so its per-domain line is the
+    # message's no more; the line itself says the same
+    lines = {e["domain"]: e["line"] for e in notify.domain_lines(rep, p)}
     assert ("- `spoofed.example`: p=none, next: no mail measured, quarantine now (plan %s); the gate's *no_go* is for "
             "the weekly ramp this skips - 30 genuine failures of its own"
-            % one(rows_by(p)["spoofed.example"], "no_mail")["id"]) in text
+            % one(rows_by(p)["spoofed.example"], "no_mail")["id"]) == lines["spoofed.example"]
+    text += "\n" + "\n".join(lines.values())
     # no single line recommends the ramp's low pct and quarantine now at once
     for line in (stands + "\n" + text).splitlines():
         assert not ("quarantine now" in line and "pct=10" in line), line
@@ -1052,9 +1057,12 @@ def test_r4_1_every_count_line_names_its_excepted_share(tmp_path):
             "excepted in audit.toml) - counted separately") in md
     line = next(l for l in next_steps.build(rep)["stand"]["lines"] if l.startswith("**Genuine failures"))
     assert line.startswith("**Genuine failures: 9** (6 of them formally excepted in audit.toml; raw row counts agree")
+    # round 13, T-04: corp.example leads the status band's strip; its per-domain line, and the mail log's line in
+    # the Slack message's details, name the excepted share
     summary = notify.summarize(rep)
     assert "- 7 genuine failures of its own (4 of them formally excepted in audit.toml)" in \
-        next(l for l in summary.splitlines() if l.startswith("- `corp.example`"))
+        notify.domain_lines(rep)[0]["line"]
+    assert "- mail log: 9 genuine failures (6 of them formally excepted in audit.toml)" in summary
     # an older report, whose census does not count the excepted ones per stream: the gate's total
     old = json.loads(json.dumps(rep))
     for r in old["maillog"]["census"]["by_sender"] + old["maillog"]["census"]["by_envelope"]:

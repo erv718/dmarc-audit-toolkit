@@ -4,7 +4,11 @@
 brief.html is next_steps.json (src/next_steps.py's document, as data) and,
 when the run has one, plan.json (src/plan.py's records), laid out for the
 people who read it: domain owners, IT leadership and whoever publishes DNS.
-It says what next_steps.md says, in the generator's words - every number,
+It leads with the status band (next_steps.json top: the headline,
+Protected?, the most critical finding per organization, the reader's call
+with each plan id linked to its record card, what changed and what this
+data cannot show) under a slim masthead, and says what next_steps.md says,
+in the generator's words - every number,
 verdict, policy value, plan id and finding id is copied from the two files,
 and no AI writes any of it (AGENTS.md rule 13) - and adds the plan's records
 as cards a DNS change ticket can be built from. collect.py writes it into
@@ -63,8 +67,19 @@ EMPTY_PLAN = "No DNS changes: the plan proposes no record and holds nothing."
 SECTIONS = (("stand", "Where we stand"), ("next-step", "The next step"), ("domains", "Per domain"),
             ("failing", "What is failing"), ("owners", "What happens next, by owner"), ("ask", "The ask"),
             ("dns", "DNS changes"), ("questions", "Open questions"), ("glossary", "Glossary"))
-# every id on the page, in page order: the masthead, the contents and the one-liner, the sections, the footer
-SECTION_IDS = ("top", "contents", "summary") + tuple(sid for sid, _ in SECTIONS) + ("footer",)
+# every id on the page, in page order: the masthead, the status band, the contents, the sections, the footer
+SECTION_IDS = ("top", "now", "contents") + tuple(sid for sid, _ in SECTIONS) + ("footer",)
+# a document without the status band (next_steps.json from before round 13, or one whose band was not built) keeps
+# the page it had: the masthead, the contents and the one-liner as the lede, then the sections
+OLD_SECTION_IDS = ("top", "contents", "summary") + tuple(sid for sid, _ in SECTIONS) + ("footer",)
+# the band's rows, in reading order: (key, label); every label is fixed text
+BAND_ROWS = (("protected", "Protected?"), ("critical", "Most critical"), ("call", "Your call"),
+             ("changed", "Since last run"), ("gaps", "Not in this data"))
+READING_LINE = ("Read the block below in 45 seconds; the sections after it are for the people who fix each item. "
+                "Sources and how to check are at the end.")
+ONE_PARAGRAPH = "The status in one paragraph"  # the one-liner's summary line, under The next step
+# the ask's lists as the page lays them out (next_steps.ASK_LINES: key, label, the statuses each holds)
+ASK_LINES = tuple((key, label) for key, label, _ in next_steps.ASK_LINES)
 # a record card's id, from its place in the DNS changes section (never from the data): the index links to it
 CARD_ID = "rec-%d"
 VERIFY_LINE = ("To check any number or record here yourself, follow verify.md next to this file: the lookup, query "
@@ -154,6 +169,36 @@ strong { font-weight: 650; }
 .lede { width: fit-content; max-width: 100%; background: var(--surface); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 1.1rem 1.25rem; }
 .lede p { font-size: 1.125rem; max-width: 70ch; }
+.masthead.slim { gap: 0.35rem; }
+.masthead.slim h1 { font-size: 1.5rem; }
+.eyebrow .pill { text-transform: none; letter-spacing: 0; }
+.reading { font-size: 0.875rem; color: var(--muted); max-width: 100ch; }
+.masthead.slim + .now { margin-top: -0.75rem; }
+.now { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 0.9rem 1.1rem; display: flex; flex-direction: column; gap: 0.6rem; break-inside: avoid; }
+.now .headline { font-size: 1.125rem; font-weight: 600; line-height: 1.4; max-width: 75ch; }
+.answers { display: flex; flex-direction: column; gap: 0.5rem; }
+.answer { display: grid; grid-template-columns: 8.5rem minmax(0, 1fr); gap: 0.15rem 1rem; align-items: baseline; }
+.answer dt { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); }
+.answer dd { font-size: 0.94rem; line-height: 1.45; min-width: 0; }
+.answer.quiet dd { color: var(--muted); font-size: 0.875rem; }
+.strip { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 0.35rem; }
+.strip li { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr); gap: 0.1rem 0.75rem; align-items: baseline; }
+.strip li.t1 { border-left: 3px solid var(--bad); padding-left: 0.5rem; margin-left: -0.6rem; }
+.strip li > .pill { justify-self: start; }
+.strip li.more { display: block; color: var(--muted); font-size: 0.875rem; }
+.now .tag { padding: 0 0.25rem; }
+.strip .what { min-width: 0; }
+.strip .who { font-family: var(--font-mono); font-weight: 600; }
+.strip .below { color: var(--muted); font-size: 0.875rem; }
+.idhost { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem; max-width: 100%; }
+.idhost .mono { font-size: 0.78rem; overflow-wrap: anywhere; }
+.ask .answers { margin-bottom: 0.75rem; }
+.ask .answer dd { display: flex; flex-wrap: wrap; gap: 0.3rem 0.9rem; }
+details.para { font-size: 0.875rem; }
+details.para summary { cursor: pointer; color: var(--muted); }
+details.para p { margin-top: 0.4rem; max-width: 70ch; }
 .section { display: flex; flex-direction: column; gap: 1rem; border-top: 1px solid var(--line); padding-top: 1.5rem; }
 .section-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 1rem; }
 .meta { font-family: var(--font-mono); font-size: 0.78rem; color: var(--muted); }
@@ -266,6 +311,9 @@ pre.value { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.875rem;
   .term { grid-template-columns: minmax(0, 1fr); }
   .fields { grid-template-columns: minmax(0, 1fr); }
   .field.short { grid-template-columns: 5.5rem minmax(0, 1fr); }
+  .answer { grid-template-columns: minmax(0, 1fr); }
+  .strip li { grid-template-columns: minmax(0, 1fr); }
+  .now { padding: 0.8rem 0.9rem; }
 }
 @media screen and (max-width: 48rem) {
   table.stack, table.stack tbody, table.stack tr, table.stack th, table.stack td { display: block; }
@@ -304,7 +352,7 @@ pre.value { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.875rem;
   .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .table-wrap { overflow: visible; }
   a { color: inherit; text-decoration: none; }
-  .tile, .card, .ask, tr, .checklist li, .zone { break-inside: avoid; }
+  .tile, .card, .ask, tr, .checklist li, .zone, .now { break-inside: avoid; }
   .zone, tr.org, .org-head, .pre > .k { break-after: avoid; }
 }
 """
@@ -844,6 +892,134 @@ def lede(doc):
     return '<section id="summary" class="lede" aria-label="In one line">%s</section>' % inner
 
 
+# ------------------------------------------------------------------ the status band: the 45-second read
+
+def top_of(doc):
+    """The document's status band (next_steps.json "top"), or None: an older document, or one whose band was not
+    built, renders the page it had."""
+    top = doc.get("top")
+    return top if isinstance(top, dict) and _text(top.get("headline")) else None
+
+
+def card_places(plan, head):
+    """{plan id: the place of its card on the page}, numbered as the DNS changes section numbers the cards (the
+    plan's own order), so a link to #rec-N lands on that row's card."""
+    if not isinstance(plan, dict):
+        return {}
+    changes = [c for c in _list(plan.get("changes")) if isinstance(c, dict)]
+    rows = plan_order(changes, plan_head(plan, head), by_ids="headline" not in plan)
+    return {_text(c.get("id")): n for n, c in enumerate(rows, 1) if _text(c.get("id"))}
+
+
+def plan_hosts(plan):
+    """{plan id: the host name its record goes at}."""
+    return {_text(c.get("id")): _text(c.get("hostname")) for c in _list(_dict(plan).get("changes"))
+            if isinstance(c, dict) and _text(c.get("id"))}
+
+
+def id_link(rid, places, hosts):
+    """A plan id as a tag linked to its record card (#rec-N), its host name in the title; a plain tag when the page
+    has no card for it (no plan.json beside the document)."""
+    rid = _text(rid)
+    host = _text((hosts or {}).get(rid))
+    title = (' title="%s"' % esc_name(host)) if host else ""
+    n = (places or {}).get(rid)
+    if n:
+        return '<a class="tag" href="#%s"%s>%s</a>' % (CARD_ID % n, title, esc(rid))
+    return '<span class="tag"%s>%s</span>' % (title, esc(rid))
+
+
+def band_parts(parts, places=None, hosts=None):
+    """A band line's parts as HTML: the generator's words through prose, a domain or an address through text_name
+    (one piece, isolated), a sender's subject inside its fixed frame through iso(marks()), a plan id as a tag
+    linked to its card. A part of any other shape is left out."""
+    out = []
+    for p in _list(parts):
+        if not (isinstance(p, list) and len(p) == 2 and isinstance(p[1], str)):
+            continue
+        kind, value = p
+        if kind in ("name", "addr", "host"):
+            out.append(text_name(value))
+        elif kind == "subject":
+            out.append(esc("(the sender's subject: \"") + iso(marks(value)) + esc("\")"))
+        elif kind == "id":
+            out.append(id_link(value, places, hosts))
+        else:  # each piece in its own isolate: a mark at its end moves nothing of the page's after it
+            out.append(iso(prose(value)))
+    return "".join(out)
+
+
+def answer(label, inner, quiet=False):
+    """One row of the band: its fixed label, then what it says."""
+    return '<div class="answer%s"><dt>%s</dt><dd>%s</dd></div>' % (" quiet" if quiet else "", esc(label), inner)
+
+
+def masthead_slim(doc, top):
+    """The masthead over the band: the eyebrow (DMARC rollout, the date, how many organizations and domains,
+    how far the evidence reaches, and a warning when it is old), the title, and one line on how to read the page
+    (a custom audience, --audience, in its place). The sources and the verify.md pointer are in the footer."""
+    src = _dict(doc.get("sources"))
+    eyebrow = ["<span>DMARC rollout</span>"]
+    date = _text(doc.get("date"))
+    if date:
+        eyebrow.append('<span class="mono">%s</span>' % esc(date))
+    orgs, names = _num(top.get("orgs")), _num(_dict(top.get("protected")).get("total"))
+    if orgs is not None and names is not None:
+        eyebrow.append('<span class="mono org">%s, %s</span>' % (esc(_counted(int(orgs), "organization")),
+                                                                 esc(_counted(int(names), "domain"))))
+    through = _text(top.get("evidence_through"))
+    if through:
+        eyebrow.append('<span class="mono org">evidence to %s</span>' % _unbroken(through))
+    stale = _num(top.get("stale"))
+    if stale:
+        eyebrow.append(pill("warn", "evidence is %d days old" % stale))
+    audience = _text(src.get("audience")).rstrip(".")
+    if audience and audience != next_steps.DEFAULT_AUDIENCE:
+        line = '<p class="audience">%s.</p>' % iso(prose(audience))
+    else:
+        line = '<p class="reading">%s</p>' % esc(READING_LINE)
+    # the eyebrow's parts with a space between them: the gap lays them out, and the text reads them apart
+    return '<div id="top" class="masthead slim">\n%s\n</div>' % "\n".join(
+        ['<p class="eyebrow">%s</p>' % " ".join(eyebrow), "<h1>Status and next steps</h1>", line])
+
+
+def strip_item(e, places, hosts):
+    """One organization of Most critical: its badge as a pill, its name, the names below it (muted), then what
+    is wrong and what to do; a tier-1 line (spoofed mail reached inboxes) marked."""
+    below = _dict(e.get("below"))
+    what = '<span class="who">%s</span>%s: %s. %s: %s.' % (
+        name_html(e.get("org")), (' <span class="below">(%s)</span>' % iso(prose(below["words"])))
+        if _text(below.get("words")) else "", band_parts(e.get("finding_parts")),
+        iso_text(_text(e.get("action_label")) or next_steps.NEXT), band_parts(e.get("action_parts"), places, hosts))
+    return '<li%s>%s<span class="what">%s</span></li>' % (' class="t1"' if e.get("tier") == 1 else "",
+                                                         pill(_text(e.get("pill")), _text(e.get("badge"))), what)
+
+
+def now_section(doc, plan, head):
+    """The status band (next_steps.json top): the headline, then Protected?, the most critical finding per
+    organization (worst first, the rest counted), the reader's call (each plan id a tag linked to its card),
+    what changed since the last run, and what this data cannot show."""
+    top = top_of(doc)
+    places, hosts = card_places(plan, head), plan_hosts(plan)
+    call = _dict(top.get("call"))
+    label = dict(BAND_ROWS)
+    rows = [answer(label["protected"], prose(_text(_dict(top.get("protected")).get("text")) or "not in this run"))]
+    items = [strip_item(e, places, hosts) for e in _list(top.get("domains")) if isinstance(e, dict)]
+    more = _dict(top.get("more"))
+    if _text(more.get("text")):
+        items.append('<li class="more">%s</li>' % prose(more["text"]))
+    if items:
+        rows.append(answer(label["critical"], '<ol class="strip">%s</ol>' % "".join(items)))
+    rows.append(answer(label["call"], band_parts(call["parts"], places, hosts) if _list(call.get("parts"))
+                       else prose(_text(call.get("text")) or NOT_IN_RUN)))
+    rows.append(answer(label["changed"], prose(_text(_dict(top.get("changed")).get("text")) or NOT_IN_RUN)))
+    gaps = _texts(top.get("gaps")) or [next_steps.SCOPE_GAP]
+    gaps[0] = next_steps.cap_sentence(gaps[0])  # the sentence's first letter, as next_steps.gaps_text writes it
+    rows.append(answer(label["gaps"], "; ".join(iso(prose(g)) for g in gaps) + ".", quiet=True))
+    return ('<section id="now" class="now" aria-label="This week">\n<p class="headline">%s</p>\n'
+            '<dl class="answers">%s</dl>\n</section>' % (prose(top["headline"]), "".join(rows)))
+
+
 def tile(label, figure, caption, side="", scope=""):
     """One KPI tile: the label above, the figure, a one-line caption below
     it and the scope the figure counts (scope: markup from log_scope or
@@ -965,16 +1141,27 @@ def stand_section(doc):
     return section("stand", "Where we stand", parts, meta)
 
 
-def next_step_section(doc):
+def one_paragraph(doc):
+    """The one-liner, under The next step it ends with, folded: the status in one paragraph for whoever wants it
+    after the band."""
+    text = _text(doc.get("one_liner"))
+    if not text:
+        return ""
+    return '<details class="para"><summary>%s</summary><p>%s</p></details>' % (esc(ONE_PARAGRAPH), prose(text))
+
+
+def next_step_section(doc, folded=False):
     """The organization's next step: its label and plan id, the gate's
     verdict, then what holds it - a plan step's prerequisites are the
     conditions that make it ready, a gate step's are what holds it - and the
     data an insufficient_data verdict asks for, each said once. A domain
     with no step left ('none - already at the end') has nothing on hold: its
-    gate's blockers are what is left to fix, and the pill is its gate's."""
+    gate's blockers are what is left to fix, and the pill is its gate's.
+    folded: the page leads with the status band, and the one-liner sits
+    here, folded (one_paragraph), instead of as the lede."""
     nxt = doc.get("next_step")
     if not isinstance(nxt, dict) or not _text(nxt.get("label")):
-        return section("next-step", "The next step", [])
+        return section("next-step", "The next step", [one_paragraph(doc)] if folded else [])
     label, ref = _text(nxt.get("label")), _text(nxt.get("ref"))
     at_end = label.lower().startswith("none") and not ref  # next_steps.py's own test for no step left
     cls, word = GATE_PILLS.get(_text(nxt.get("verdict")), NOT_CHECKED)
@@ -997,6 +1184,8 @@ def next_step_section(doc):
         parts.append(block("On hold while" if gate_step else "Ready when", checklist(prereqs)))
     if holds:  # the gate's blockers the plan row does not carry itself: observations, not boxes to tick
         parts.append(block("Also left" if at_end else "Also on hold while", bullets(holds)))
+    if folded:
+        parts.append(one_paragraph(doc))
     meta = ("for %s" % esc(org)) if org else ""
     return section("next-step", "The next step", ['<div class="step">%s</div>' % "".join(parts)], meta)
 
@@ -1386,9 +1575,31 @@ def owners_section(doc, head):
     return section("owners", "What happens next, by owner", parts)
 
 
-def ask_section(doc):
+def ask_lines(doc, plan, head):
+    """The ask's three lists (next_steps.json ask_parts.lines): Publish now, After a check, Not this week, each
+    plan id a tag linked to its card with its host name beside it; '' for a document without them."""
+    ap = _dict(doc.get("ask_parts"))
+    lines = _dict(ap.get("lines"))
+    if not lines:
+        return ""
+    hosts = dict(plan_hosts(plan), **{k: v for k, v in _dict(ap.get("hosts")).items() if isinstance(v, str)})
+    places = card_places(plan, head)
+    rows = []
+    for key, label in ASK_LINES:
+        ids = _texts(lines.get(key))
+        inner = "".join('<span class="idhost">%s%s</span>' % (
+            id_link(i, places, hosts), (' <span class="mono">%s</span>' % plain_name(hosts[i])) if _text(hosts.get(i))
+            else "") for i in ids) or '<span class="muted">none</span>'
+        rows.append(answer(label, inner))
+    return '<dl class="answers">%s</dl>' % "".join(rows)
+
+
+def ask_section(doc, plan=None, head=None):
+    """The ask: the plan's rows by when they can go out (ask_lines), then the ask's own sentence."""
     text = _text(doc.get("ask"))
-    return section("ask", "The ask", ['<div class="ask"><p>%s</p></div>' % prose(text)] if text else [])
+    lines = ask_lines(doc, plan, head)
+    inner = lines + ("<p>%s</p>" % prose(text) if text else "")
+    return section("ask", "The ask", ['<div class="ask">%s</div>' % inner] if inner else [])
 
 
 def _priority(c):
@@ -1626,12 +1837,14 @@ def glossary_section(doc):
         '<div class="term"><dt>%s</dt><dd>%s</dd></div>' % (esc(k), prose(v)) for k, v in terms)])
 
 
-def footer(doc, with_plan=False):
+def footer(doc, with_plan=False, sources=False):
     """The sources the document was built from, when the report was
     generated, and which version of the toolkit wrote it; with_plan says
     whether the page read plan.json too. Each value from the document (a
     date - kept on one line too - a tool, a path) is isolated from the
-    words around it."""
+    words around it. sources: the page leads with the status band, so the
+    audience line's sources and the verify.md pointer the masthead carried
+    are said here, at the end."""
     src = _dict(doc.get("sources"))
     facts = []
     when, tool = _text(src.get("report_generated_utc")), _text(src.get("report_tool"))
@@ -1655,19 +1868,31 @@ def footer(doc, with_plan=False):
     made = _text(doc.get("tool")) or "next_steps.py"
     version = _text(doc.get("version"))
     lines = []
-    if facts:
+    said = next_steps.sources_text(doc) if sources else ""
+    if said:  # the document's own sources line says all the short one would, and more: said once
+        lines.append("<p>%s</p>" % prose(said))
+    elif facts:
         lines.append("<p>Sources: %s.</p>" % "; ".join(facts))
     lines.append("<p>Written by %s%s from the run's own data and laid out by brief.py from next_steps.json%s: every "
                  "number traces to the run's files, and no sentence here was written by an AI.</p>"
                  % (iso_text(made), (" " + iso_text(version)) if version else "", " and plan.json" if with_plan else ""))
+    if sources:
+        lines.append("<p>%s</p>" % esc(VERIFY_LINE))
     return '<footer id="footer" class="foot">%s</footer>' % "".join(lines)
 
 
 # ------------------------------------------------------------------ the page
 
 def page_title(doc):
-    """'<organization> DMARC brief <date>', each part only when the document has it."""
+    """'<organization> DMARC brief <date>', each part only when the document has it; for a run of more than one
+    organization, 'DMARC brief <date>: <N> organizations, <M> domains', as the band's eyebrow counts them."""
     org, date = _text(doc.get("org_domain")), _text(doc.get("date"))
+    top = top_of(doc)
+    orgs = _num(top.get("orgs")) if top else None
+    names = _num(_dict(top.get("protected")).get("total")) if top else None
+    if orgs is not None and names is not None and orgs > 1:
+        return "DMARC brief%s: %s, %s" % ((" " + date) if date else "", _counted(int(orgs), "organization"),
+                                          _counted(int(names), "domain"))
     return " ".join(([org] if org else []) + ["DMARC brief"] + ([date] if date else []))
 
 
@@ -1681,10 +1906,15 @@ def render(doc, plan=None, fragment=False):
     doc = doc if isinstance(doc, dict) else {}
     plan = plan if isinstance(plan, dict) else None
     head = _text(doc.get("org_domain")) or None
-    body = "\n".join([masthead(doc), contents(), lede(doc), stand_section(doc), next_step_section(doc),
-                      domains_section(doc, plan, head), failing_section(doc), owners_section(doc, head),
-                      ask_section(doc), dns_section(plan, head), questions_section(doc, head),
-                      glossary_section(doc), footer(doc, plan is not None)])
+    top = top_of(doc)
+    if top is None:  # an older document, or one whose band was not built: the page it had
+        lead = [masthead(doc), contents(), lede(doc), stand_section(doc), next_step_section(doc)]
+    else:  # the band first, then the sections; the one-liner folded under The next step, the sources at the end
+        lead = [masthead_slim(doc, top), now_section(doc, plan, head), contents(), stand_section(doc),
+                next_step_section(doc, folded=True)]
+    body = "\n".join(lead + [domains_section(doc, plan, head), failing_section(doc), owners_section(doc, head),
+                             ask_section(doc, plan, head), dns_section(plan, head), questions_section(doc, head),
+                             glossary_section(doc), footer(doc, plan is not None, sources=top is not None)])
     main = '<main class="brief">\n%s\n</main>\n' % body
     title = "<title>%s</title>\n<style>\n%s</style>\n" % (esc(page_title(doc)), CSS)
     if fragment:

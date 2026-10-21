@@ -488,8 +488,9 @@ def test_k1_an_audited_name_whose_own_lookup_failed_is_not_checked_either():
     # check first is never asked as a zero-risk record (round 13, T-05: its status is after 1 check)
     doc = next_steps.build(rep, p)
     assert m["status"] == "check" and m["status_text"] == "after 1 check"
-    assert ("approval to publish 1 record (plan %s) once the checks listed with it are confirmed, of which 1 needs a "
-            "lookup of the name's own _dmarc record first (publish only if it has none)" % m["id"]) in doc["ask"]
+    # round 13, T-11: the ask stays under 60 words, so a group says in short what its rows wait on
+    assert ("approval to publish 1 record (plan %s) once a lookup shows the name has no record of its own"
+            % m["id"]) in doc["ask"]
     assert "zero-risk" not in doc["ask"]
     assert [g["next_step"] for g in doc["per_domain"] if g["domains"] == ["mkt.corp.example"]] == [
         "publish a p=none monitoring record (once a lookup shows it has no record of its own)"]
@@ -607,10 +608,12 @@ def test_k1_k2_next_steps_names_the_append_and_the_lookups_still_owed(monkeypatc
             and "- **1 monitoring record for shop.example** after the checks listed with it (plan %s)" % a["id"] in doc)
     assert len(corp) + 2 == len(p1)
     checked = [c for c in p1 if c not in ready]
-    assert ("approval to publish the 2 zero-risk records (plan %s, %s) in the next DNS change window; approval to "
-            "publish 4 more records (plan %s) once the checks listed with each are confirmed, of which 2 need a lookup "
-            "of the name's own _dmarc record first (publish only if it has none)"
-            % (ready[0], ready[1], next_steps.id_range(checked))) in doc
+    # round 13, T-11: the rows after a check by what each waits on, the ask under 60 words
+    lookups = [c["id"] for c in plan["changes"] if c["id"] in checked and next_steps.looks_first(c)]
+    assert len(lookups) == 2
+    assert ("approval to publish the 2 zero-risk records (%s, %s); approval to publish 2 more records (%s) once a "
+            "lookup shows the name has no record of its own; 2 more once the checks listed with each are confirmed"
+            % (ready[0], ready[1], next_steps.id_range(lookups))) in doc
 
 
 def own(domain, record, **over):

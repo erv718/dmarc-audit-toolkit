@@ -804,8 +804,9 @@ def test_report_md_gives_each_finding_its_first_check(run, monkeypatch):
 def test_next_steps_and_todo_point_to_verify_md(run):
     report, plan, _ = run
     md = next_steps.render_md(next_steps.build(report, plan))
+    # round 13, T-03: the pointer closes the document, in its Sources and how to check section
     assert "To check any number or record here yourself, follow verify.md next to this file" in \
-        md.split("## Where we stand", 1)[0]
+        md.split("## Sources and how to check", 1)[1].split("\n---\n", 1)[0]
     todo = collect.render_todo(report, plan)
     assert todo.split("## Where each domain stands", 1)[0].endswith(
         "verify.md, next to this file, says how to check every finding and every plan row yourself.\n\n")
