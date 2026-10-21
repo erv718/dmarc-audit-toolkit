@@ -163,7 +163,12 @@ def test_check_doc_reads_the_estates_brief_clean(estate, tmp_path):
     (tmp_path / "plan.json").write_text(json.dumps(estate["plan"], indent=1), encoding="utf-8")
     (tmp_path / "next_steps.json").write_text(json.dumps(estate["doc"], indent=1), encoding="utf-8")
     (tmp_path / "next_steps.md").write_text(next_steps.render_md(estate["doc"]), encoding="utf-8")
-    (tmp_path / "brief.html").write_text(brief.render(estate["doc"], estate["plan"]), encoding="utf-8")
+    page = brief.render(estate["doc"], estate["plan"])
+    (tmp_path / "brief.html").write_text(page, encoding="utf-8")
+    # the page as a reader's copy: the band's every figure, id and date is the run's (its eyebrow's parts read apart)
+    text = check_doc.html_text(page)
+    assert "DMARC rollout 2026-10-13 5 organizations, 9 domains evidence to 2026-10-08" in text
+    assert "Partly: 2 of 9 domains block spoofed mail." in text and "Not in this data" in text
     assert check_doc.main([str(tmp_path / "brief.html"), "--run", str(tmp_path)]) == 0
 
 
