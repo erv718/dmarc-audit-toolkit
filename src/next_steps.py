@@ -949,6 +949,7 @@ def maillog_view(report, headline=None):
     for key in ("genuine_failures", "raw_failing_rows", "raw_rows", "logical_messages",
                 "delivered_despite_fail", "blocked_despite_pass", "echo_messages"):
         view[key] = _n(counters.get(key))
+    view.update(relayed_counts(ml))
     if view["genuine_failures"] is None and verdicts:
         view["genuine_failures"] = len(genuine)
     if view["delivered_despite_fail"] is None and verdicts:
@@ -2720,13 +2721,33 @@ def where_we_stand(report, view, trend, window=None, policy=None, headline=None)
                      "genuine_failures_excepted": gone})
         text = "**Genuine failures: %d**" % gf
         share = ("%d of them formally excepted in audit.toml" % gone) if gone else ""
-        if raw is not None and raw > gf:
+        # messages that went only to an on-premises or external hop reached no mailbox here: whether they arrived is a
+        # question for message trace, so the echo gap is never called harmless while there are any. The passing
+        # copies of echoes said inside the gap's clause, the other passing ones at the line's end (an older report
+        # that does not split them says how many went that way, never that they passed)
+        relayed, echoed = view.get("relayed_only") or 0, view.get("relayed_only_echo")
+        in_gap = 0
+        if relayed > 0:
+            data["relayed_only"] = relayed
+            data.update({k: view[k] for k in ("relayed_only_passed", "relayed_only_echo") if view.get(k) is not None})
+        if raw is not None and raw > gf and relayed > 0:
+            in_gap = echoed if echoed and echoed > 0 else 0
+            text += (" (%sraw counts would say %d - the gap is failing copies of messages that also had a passing copy%s)"
+                     % ((share + "; ") if share else "", raw,
+                        ("; %d of those passing copies went only to an on-premises or external hop - check message "
+                         "trace" % in_gap) if in_gap else ""))
+        elif raw is not None and raw > gf:
             text += " (%sraw counts would say %d - the gap is relay echoes, not broken senders)" % (
                 (share + "; ") if share else "", raw)
         elif raw is not None:
             text += " (%sraw row counts agree: no relay echoes)" % ((share + "; ") if share else "")
         elif share:
             text += " (%s)" % share
+        relayed_tail = ""
+        rest, words = relayed_gap(view)
+        rest -= in_gap
+        if rest > 0:
+            relayed_tail = "; " + (RELAYED_MORE if in_gap else words) % (rest, _plural(rest, "message"))
         span = span_phrase(view.get("window"))
         data["maillog_window"] = view.get("window")
         if span:
@@ -2761,7 +2782,7 @@ def where_we_stand(report, view, trend, window=None, policy=None, headline=None)
         if not view["auth_column"]:
             text += ("; the export carried no authentication column, so failure here means never delivered "
                      "rather than failed DMARC")
-        lines.append(text)
+        lines.append(text + relayed_tail)
         ddf = view["delivered_despite_fail"]
         data["delivered_despite_fail"] = ddf
         data["delivered_despite_fail_senders"] = view["ddf_senders"][:3]
@@ -2834,6 +2855,127 @@ def where_we_stand(report, view, trend, window=None, policy=None, headline=None)
                          % (trend["label"], "; ".join(why) or "the two runs do not share a failure count or a pass rate"))
     data["lines"] = lines
     return data
+
+
+# What the run cannot see (the status band's "Not in this data", spec 3.9): at most GAPS_SHOWN of the data gaps, the
+# rest counted, and always last the one thing no run of this toolkit sees - a message that never arrived
+SCOPE_GAP = "bounces and lost mail (NDRs): use message trace"
+GAPS_SHOWN = 2
+STALE_DAYS = 7  # evidence older than this many days before the run is said to be old
+RELAYED_GAP = "%d %s passed but went only to an on-premises or external hop: check message trace"
+RELAYED_MORE = "%d more %s passed but went only to an on-premises or external hop: check message trace"
+# an older report counts the messages that went that way without saying which of them passed
+RELAYED_ANY = "%d %s went only to an on-premises or external hop: check message trace"
+RELAYED_KEYS = ("relayed_only", "relayed_only_passed", "relayed_only_echo")
+
+
+def relayed_counts(ml):
+    """{relayed_only, relayed_only_passed, relayed_only_echo} of a report's
+    mail-log section (dedupe.summarize): the messages that went only to an
+    on-premises or external hop and reached no mailbox here, the ones among
+    them a copy of which passed, and the ones that are echoes too (a
+    failing copy beside the passing one). From its counters, else message
+    by message from its verdicts when they say it (an older report's
+    counters carry relayed_only alone, or nothing); None where neither
+    does."""
+    ml = audit._dict(ml)
+    counters = audit._dict(ml.get("counters"))
+    out = {k: _n(counters.get(k)) for k in RELAYED_KEYS}
+    verdicts = [v for v in ml["verdicts"] if isinstance(v, dict)] if isinstance(ml.get("verdicts"), list) else []
+    if any("relayed_only" in v for v in verdicts):
+        relayed = [v for v in verdicts if v.get("relayed_only")]
+        derived = {"relayed_only": len(relayed), "relayed_only_passed": sum(1 for v in relayed if v.get("passed")),
+                   "relayed_only_echo": sum(1 for v in relayed if v.get("echo_present"))}
+        out = {k: derived[k] if out[k] is None else out[k] for k in RELAYED_KEYS}
+    return out
+
+
+def relayed_gap(counts):
+    """(n, words) for the messages that passed but went only to an
+    on-premises or external hop (counts: relayed_counts' keys, or a view
+    that carries them): the ones a copy of which passed, said so
+    (RELAYED_GAP); when the counts do not split them (an older report),
+    every message that went that way, never said to have passed
+    (RELAYED_ANY). n is 0 when there are none."""
+    counts = counts if isinstance(counts, dict) else {}
+    passed = _n(counts.get("relayed_only_passed"))
+    if passed is not None:
+        return max(passed, 0), RELAYED_GAP
+    return max(_n(counts.get("relayed_only")) or 0, 0), RELAYED_ANY
+
+
+def _date_of(value):
+    """A date from a 'YYYY-MM-DD...' stamp, else None."""
+    day = _day(value)
+    try:
+        return datetime.strptime(day, "%Y-%m-%d").date() if day else None
+    except ValueError:
+        return None
+
+
+def top_gaps(report, headline=None):
+    """What this run's data cannot show, in plain words, for the status
+    band (top.gaps, top.evidence_through, top.stale; spec 3.9): {"gaps",
+    "evidence_through", "stale", "data_gaps"}. The data gaps, in this order:
+    no DNS read (an offline run); each organization whose mail log was not
+    pulled; the organizations the row budget cut, in one clause with the
+    hours kept (and the full window's failures when collect.py counted
+    them); no mail log; no aggregate reports; evidence older than
+    STALE_DAYS days before the run; messages that passed but went only to
+    an on-premises or external hop (relayed_gap: maillog.counters.
+    relayed_only_passed, or relayed_only in an older report, which then
+    never says they passed). gaps holds the first GAPS_SHOWN of them, how
+    many more there are, and last, always, SCOPE_GAP. evidence_through:
+    the newest of the mail log's last stamp and the aggregate reports' end
+    date; stale: the days it lies before the run when that is more than
+    STALE_DAYS, else None. Deterministic: the report's own dates only,
+    never the clock. The status band (top) takes gaps, evidence_through
+    and stale from here as they are."""
+    doc = audit._dict(report)
+    ml = doc.get("maillog") if isinstance(doc.get("maillog"), dict) else None
+    rua = doc.get("rua") if isinstance(doc.get("rua"), dict) else None
+    data = []
+    if not doc.get("dns"):
+        data.append("offline run: DNS not read, so policies come from the aggregate reports or are unknown")
+    cuts = audit.maillog_cuts(doc)
+    ordered = sorted(cuts.items(), key=lambda kv: (audit.domain_key(kv[0], headline), kv[0]))
+    for org, info in ordered:
+        if audit._dict(info).get("reason") == "not pulled":
+            data.append("mail log for %s not read this run (its pull failed): its senders are not checked" % org)
+    kept = [(org, info["kept_hours"]) for org, info in ordered
+            if isinstance(audit._dict(info).get("kept_hours"), int) and not isinstance(info["kept_hours"], bool)
+            and info["kept_hours"] > 0]
+    if kept:
+        hours = list(dict.fromkeys(h for _, h in kept))
+        text = "%s: the row budget kept only the newest %s hours, so %s counts are floors" % (
+            audit._names([org for org, _ in kept], len(kept)), audit._names([str(h) for h in hours], len(hours)),
+            "its" if len(kept) == 1 else "their")
+        full = full_window(doc)
+        if full:
+            text += " (%d genuine %s over the full window)" % (full["genuine_failures"],
+                                                             _plural(full["genuine_failures"], "failure"))
+        data.append(text)
+    if ml is None:
+        data.append("no mail log: our own senders are not checked")
+    if rua is None:
+        data.append("no aggregate reports: what outside receivers see is not in this run")
+    window = ml.get("window") if ml and isinstance(ml.get("window"), dict) else {}
+    totals = rua.get("totals") if rua and isinstance(rua.get("totals"), dict) else {}
+    dates = [d for d in (_date_of(window.get("to")), _date_of(totals.get("end_date"))) if d]
+    newest = max(dates) if dates else None
+    ran = _date_of(doc.get("generated_utc"))
+    stale = (ran - newest).days if newest and ran and (ran - newest).days > STALE_DAYS else None
+    if stale:
+        data.append("the newest evidence is from %s, %d days before this run" % (newest.isoformat(), stale))
+    relayed, words = relayed_gap(relayed_counts(ml))
+    if relayed > 0:
+        data.append(words % (relayed, _plural(relayed, "message")))
+    gaps = data[:GAPS_SHOWN]
+    if len(data) > GAPS_SHOWN:
+        gaps.append("(+%d more under Where we stand)" % (len(data) - GAPS_SHOWN))
+    gaps.append(SCOPE_GAP)
+    return {"gaps": gaps, "evidence_through": newest.isoformat() if newest else None, "stale": stale,
+            "data_gaps": data}
 
 
 SUBJECT_CUT = 60  # characters of a subject a line of this document quotes; the whole one is in next_steps.json

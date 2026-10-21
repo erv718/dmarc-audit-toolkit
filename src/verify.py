@@ -49,7 +49,7 @@ import functools
 import json
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import audit
@@ -479,6 +479,69 @@ def census_steps(report, domain):
     return [kql_step("sender_census", domain, says)]
 
 
+TRACE_DAYS = 2  # how far back the message-trace step looks from the run
+TRACE_SENDERS = 3  # own senders a domain's section gives a message-trace step, the busiest failing first
+
+
+def _trace_window(report):
+    """(start, end) stamps for the message-trace step: TRACE_DAYS before the run's own generation time, and that
+    time; None when the report carries no usable time."""
+    try:
+        end = datetime.fromisoformat(str(report.get("generated_utc") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    end = end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+    start = end - timedelta(days=TRACE_DAYS)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return start.astimezone(timezone.utc).strftime(fmt), end.astimezone(timezone.utc).strftime(fmt)
+
+
+ADDRESS_RX = re.compile(r"[^\s@'\"`]+@[a-z0-9_-]+(?:\.[a-z0-9_-]+)+")  # a sender address that goes into a command
+
+
+def message_trace_steps(report, domain):
+    """What the mail log cannot show, for this domain's own senders that
+    fail: the census streams whose From domain is this audited name or an
+    unaudited name under it (audit._home_domain), counted by what they
+    failed as our own system after the formal exceptions (their
+    likely_counts, else their label), one per address, the busiest first,
+    at most TRACE_SENDERS. A copy that never arrived - a bounce, a
+    non-delivery report, a hop that failed - is in neither the mail log
+    nor the aggregate reports, so each gets a read-only message-trace
+    lookup over the TRACE_DAYS before the run, failed messages only. A
+    spoofed address never gets one: its mail is not ours to trace."""
+    window = _trace_window(report)
+    census = _d(_d(report.get("maillog")).get("census"))
+    audited = [_name(d) for d in _d(_d(report.get("gate")).get("domains"))]
+    audited += [_name(d) for d in _l(_d(report.get("inputs")).get("domains"))]
+    audited = [d for d in dict.fromkeys(audited) if d] or [domain]
+    failing = {}
+    for r in _l(census.get("by_sender")):
+        if not isinstance(r, dict) or audit._home_domain(_name(r.get("domain")), audited)[0] != domain:
+            continue
+        n = max((_n(r.get("genuine_failures")) or 0) - (_n(r.get("excepted")) or 0), 0)
+        label = r.get("likely_after") if "likely_after" in r else r.get("likely")
+        own = next_steps._split({"count": n, "likely_counts": r.get("likely_counts"), "likely": label}).get(
+            next_steps.OWN, 0)
+        sender = str(r.get("sender") or "").strip().lower()
+        if own > 0 and ADDRESS_RX.fullmatch(sender):
+            failing[sender] = failing.get(sender, 0) + own
+    if not window or not failing:
+        return []
+    start, end = window
+    out = []
+    for sender, n in sorted(failing.items(), key=lambda kv: (-kv[1], kv[0]))[:TRACE_SENDERS]:
+        out.append(step("command", "%s: message trace for %s, our own system, %d of whose messages failed with no "
+                                   "passing copy. The mail log and the aggregate reports cannot show a copy that never "
+                                   "arrived (a bounce, a non-delivery report, a hop that failed); message trace can. Each "
+                                   "row it returns is a message to one recipient that failed delivery in the %d days "
+                                   "before the run; an empty answer means none failed in that window."
+                                   % (EXO, sender, n, TRACE_DAYS),
+                        "Get-MessageTraceV2 -SenderAddress %s -StartDate %s -EndDate %s -Status Failed"
+                        % (ps(sender), ps(start), ps(end))))
+    return out
+
+
 def maillog_steps(report, domain):
     """Checks for one audited domain's share of the mail log: its own rows'
     counts (the census query), a cut organization's full window and the
@@ -572,6 +635,7 @@ def maillog_steps(report, domain):
         steps.append(kql_step("dkim_alignment", org, "the spf_only column shows the senders that pass on SPF alone: %s%s; "
                                                      "%s." % (shown_so, " and %d more" % (len(so) - 3) if len(so) > 3 else "",
                                                               window_note(report, domain, 30))))
+    steps += message_trace_steps(report, domain)
     rc = recount_command(report, domain)
     if rc:
         u = _under(report, domain)

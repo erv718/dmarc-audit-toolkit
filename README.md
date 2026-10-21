@@ -291,8 +291,10 @@ Read them in this order, all under `audit-out/latest/`:
    `let sender_domain` line set), with the figure the report counted (for an
    organization the row budget or the API cap cut, the full-window figure collect.py
    counted, with the report's own as the floor beside it); the
-   command that recounts the files the run read; the admin page and the
-   read-only cmdlet behind each tenant finding; and for each plan row what
+   command that recounts the files the run read; for each sender of ours
+   that fails, a read-only message-trace lookup (`Get-MessageTraceV2`) for
+   what the mail log cannot show, a copy that never arrived; the admin page
+   and the read-only cmdlet behind each tenant finding; and for each plan row what
    the lookup shows before, what to publish, what it shows after the TTL,
    how to roll back, and the proof each prerequisite asks for. `report.md`
    shows each finding's first check on its verify line;
@@ -688,6 +690,19 @@ would leave the machine.
   does until `--max-rows` is raised - and the Slack trend, which compares the
   first and last of the last four runs, once the cut run has left that
   window.
+- **"Mail did not arrive"**: the toolkit cannot see it. The mail log
+  records the mail the tenant accepted and where it handed each copy (an
+  inbox, junk, quarantine, an on-premises or external hop), and the
+  aggregate reports what outside receivers decided; a bounce, a
+  non-delivery report (NDR), a message refused before the tenant accepted
+  it or a later hop that failed is in neither, so a quiet failure count
+  says nothing about mail that never arrived. Ask message trace:
+  `verify.md` gives, per sender of ours that fails, `Get-MessageTraceV2
+  -SenderAddress <address> -StartDate <two days before the run> -EndDate
+  <the run> -Status Failed` (Exchange Online PowerShell, read-only). When
+  `next_steps.md` says messages or passing copies "went only to an
+  on-premises or external hop", they left the tenant without reaching a
+  mailbox here: message trace says whether they arrived.
 - **One of your own platforms shows as `unknown` in the aggregate reports**,
   with "SPF passes for ..., which looks like the forwarding hop": if the
   domains that signal names send for you, list every one of them among the

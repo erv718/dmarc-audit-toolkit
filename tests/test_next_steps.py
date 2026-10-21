@@ -171,8 +171,14 @@ def test_sample_document_has_the_template_shape(sample, tmp_path):
     assert set(doc) >= {"tool", "version", "date", "org_domain", "policy", "next_step", "one_liner", "stand",
                         "failing", "per_domain", "actions_by_owner", "ask", "open_questions", "glossary", "sources"}
     c = rep["maillog"]["counters"]
-    assert "- **Genuine failures: %d** (raw counts would say %d - the gap is relay echoes" % (
-        c["genuine_failures"], c["raw_failing_rows"]) in md
+    # round 13, T-09: messages went only to an on-premises hop, so the echo gap is never called harmless; the sample's
+    # are single passing copies, not echoes, so the gap's clause counts none of them and the line's end says them
+    assert (c["relayed_only"], c["relayed_only_passed"], c["relayed_only_echo"]) == (6, 6, 0)
+    line = next(l for l in md.splitlines() if l.startswith("- **Genuine failures: "))
+    assert line.startswith("- **Genuine failures: %d** (raw counts would say %d - the gap is failing copies of messages "
+                           "that also had a passing copy), over " % (c["genuine_failures"], c["raw_failing_rows"]))
+    assert line.endswith("; 6 messages passed but went only to an on-premises or external hop: check message trace")
+    assert "not broken senders" not in md and "of those passing copies" not in md
     assert "- **Delivered despite failing: %d**" % c["delivered_despite_fail"] in md
     disp = rep["rua"]["totals"]["by_disposition"]
     assert "- **Mail refused or quarantined by receivers under our policy: %d rejected / %d quarantined**" % (
