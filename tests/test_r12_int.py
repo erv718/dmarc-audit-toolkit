@@ -788,11 +788,15 @@ def test_tied_senders_are_named_in_one_order_in_every_file(tmp_path):
     named = {name: [line for line in text.splitlines() if "abe@" in line and "zed@" in line]
              for name, text in (("next_steps.md", md), ("report.md", report_md), ("todo.md", todo),
                                 ("verify.md", mpath.read_text(encoding="utf-8")), ("brief.html", page))}
-    assert all(named.values()) and len(named["next_steps.md"]) >= 5 and len(named["report.md"]) >= 4
+    assert all(named.values()) and len(named["next_steps.md"]) >= 4 and len(named["report.md"]) >= 4
     for name, lines in named.items():
         for line in lines:
             assert line.index("zed@") < line.index("abe@"), (name, line)
-    assert "top senders: zed@example.com x5, abe@example.com x5" in doc["ask"]
+    # the policy was not read (offline, no reports): reading it is the ask, and what the gate found is a gap to close,
+    # never what holds reading the policy (round 13, T-12)
+    assert "top senders: zed@example.com x5, abe@example.com x5" not in doc["ask"]
+    assert [q for q in doc["open_questions"] if q["kind"] == "blocker" and q["question"].startswith(
+        "Can we close this gap on example.com") and "top senders: zed@example.com x5, abe@example.com x5" in q["question"]]
     assert "10 from 2 of our own senders (zed@example.com x5, abe@example.com x5)" in doc["one_liner"]
     by = rep["maillog"]["by_domain"]["example.com"]
     assert [t["sender"] for t in by["top_senders"]] == [t["sender"] for t in by["top_senders_after"]] == [

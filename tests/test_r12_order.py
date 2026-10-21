@@ -376,7 +376,8 @@ def test_todo_md_names_the_domains_in_order(run):
 
 def test_summary_txt_names_the_domains_in_order(run):
     text = notify.summarize(run["report"], None, run["plan"])
-    assert re.findall(r"^- `([^`]+)`: p=", text, re.M) == ORDER
+    # a policy the run did not read is said in words, never p=unknown (round 13, T-12): every line, whatever it says
+    assert re.findall(r"^- `([^`]+)`: (?:p=|no DMARC record|lookup failed|not read|invalid record)", text, re.M) == ORDER
 
 
 def test_verify_md_runs_domain_by_domain_in_order(run, tmp_path):

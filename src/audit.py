@@ -17,7 +17,7 @@ DOMAIN plus an overall verdict that is the worst of them:
                       count here is not evidence of health
 
 Every verdict names the concrete step being gated (gate.next_step):
-  p=none                   -> p=quarantine at a low pct
+  p=none                   -> p=quarantine at pct=25 (the plan's first ramp step)
   p=quarantine, pct < 100  -> raise pct
   p=quarantine, pct = 100  -> p=reject
   p=reject, no sp=         -> add an explicit sp=
@@ -1140,6 +1140,12 @@ def inherited_step(domain, step, plan):
             "that move until it has one, or sp= is added); %s" % (domain, domain, follows))
 
 
+# The first step off p=none: the plan's first ramp step (plan.PCT_STEPS[0]), so the gate, the plan and every file
+# give one next step at one share. audit.py does not import plan at module level (plan imports audit): a test ties
+# the two together
+RAMP_FIRST_PCT = 25
+
+
 def next_step(policy, tags=None, spf_terminator=None, spf_status=None, record_at=None, inherited=False, domain=None):
     """The concrete policy step this gate decides on (see the module docstring).
     A name without a record of its own (inherited) has no p= step of its
@@ -1147,7 +1153,8 @@ def next_step(policy, tags=None, spf_terminator=None, spf_status=None, record_at
     (the methodology's monitoring-first rule) when it inherits none, and
     staying put otherwise - never a move on the parent's record, which read
     literally would change the apex. An apex at reject whose sp=none leaves
-    its subdomains at none is not at the end: sp= is the next step."""
+    its subdomains at none is not at the end: sp= is the next step. The
+    move off p=none is the plan's own first ramp step (RAMP_FIRST_PCT)."""
     tags = tags or {}
     where = f" on the record at {record_at}" if record_at else ""
     if policy is None:
@@ -1162,7 +1169,7 @@ def next_step(policy, tags=None, spf_terminator=None, spf_status=None, record_at
     pct = str(tags.get("pct", "100")).strip()
     pct_n = int(pct) if pct.isdigit() else 100
     if policy == "none":
-        return "move to p=quarantine at a low pct (for example pct=10)" + where
+        return f"move to p=quarantine at pct={RAMP_FIRST_PCT}" + where
     if policy == "quarantine":
         if pct_n < 100:
             return f"raise pct from {pct_n} toward 100 while at p=quarantine" + where

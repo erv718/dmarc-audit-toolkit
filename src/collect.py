@@ -929,28 +929,36 @@ def render_todo(report, plan, caveats=()):
     L.append("")
     per = gate.get("domains") or {}
     # a domain the run measured sending nothing skips the weekly ramp whose first step the gate judges: its line
-    # leads with the quarantine-now row (section 2) and gives the gate's verdict as the ramp's - unless the
-    # gate's blockers hold that row too. A domain the plan parks, or gives a record of its own, leads with those
-    # rows the same way: the gate's ramp step is not its next step
-    quiet = {c.get("domain"): c.get("id") for c in changes if isinstance(c, dict) and c.get("kind") == "no_mail"}
-    own = {}  # the priority-1 rows that replace the gate's step: park rows, and the domain's own _dmarc record
-    for c in changes:
-        if not isinstance(c, dict) or c.get("priority") != 1 or c.get("domain") in quiet:
-            continue
-        if c.get("kind") == "park" or (c.get("kind") == "new" and c.get("hostname") == "_dmarc.%s" % c.get("domain")):
-            own.setdefault(c["domain"], []).append(c)
+    # leads with the quarantine-now row and gives the gate's verdict as the ramp's - unless the gate's blockers hold
+    # that row too. Any other domain with a plan row leads with the plan's first row the same way, as next_steps.md's
+    # table and summary.txt name it (next_steps.plan_step), each row with its id, the section that lists it and its
+    # status: the gate's ramp step is the next step only of a domain the plan has no row for. A policy the run did
+    # not read is said in words (no DMARC record, lookup failed, not read), never p=unknown
+    quiet = {c.get("domain"): c for c in changes if isinstance(c, dict) and c.get("kind") == "no_mail"}
+
+    def where(c):
+        """' (P-02, section 2c: needs the report address)': a row's id, the section of this file that lists it, and
+        its status."""
+        status, text, _ = plan_mod.status_of(c)
+        prio = c.get("priority")
+        section = (("2" if status == "now" else "2b" if status == "check" else "2c") if prio == 1
+                   else "3" if prio == 2 else "5")
+        return " (%s, section %s: %s)" % (c.get("id") or "?", section, text)
+
     dns = report.get("dns") if isinstance(report.get("dns"), dict) else {}
     for d, g in sorted(per.items(), key=lambda kv: (audit.domain_key(kv[0], headline), str(kv[0]))):
+        policy = next_steps.policy_words(report, d)
         if d in quiet:
             left = audit.ramp_blockers_left(report, d)
-            L.append("- %s: p=%s, next step: no mail measured, quarantine now (%s, section 2); the gate's %s %s"
-                     % (d, g.get("current_policy") or "unknown", quiet[d], g.get("verdict"),
+            L.append("- %s: %s, next step: no mail measured, quarantine now%s; the gate's %s %s"
+                     % (d, policy, where(quiet[d]), g.get("verdict"),
                         "is for the weekly ramp this skips" if not left else "holds that row too: %s" % left[0]))
-        elif d in own:
-            what = "; then ".join("%s (%s, section 2)" % (next_steps.step_label(c), c.get("id")) for c in own[d])
-            L.append("- %s: p=%s, gate %s, next step: %s" % (d, g.get("current_policy") or "unknown", g.get("verdict"), what))
-        else:
+            continue
+        step = next_steps.plan_step(plan, str(d).lower(), where)
+        if step is None:
             step = str(g.get("next_step") or "")
+            if step.lower().startswith("unknown"):
+                step = next_steps._unread_step(report, d)
             at = re.search(r"\s+on the record at (\S+)$", step)
             doc = dns.get(d) if isinstance(dns.get(d), dict) else {}
             if doc.get("inherited"):
@@ -961,7 +969,7 @@ def render_todo(report, plan, caveats=()):
                 elif at and at.group(1) != "_dmarc." + d:
                     # the gate's step on the parent's record is the apex's step, not this name's
                     step = "none of its own: it follows %s and moves with the apex's step" % at.group(1)
-            L.append("- %s: p=%s, gate %s, next step: %s" % (d, g.get("current_policy") or "unknown", g.get("verdict"), step))
+        L.append("- %s: %s, gate %s, next step: %s" % (d, policy, g.get("verdict"), step))
     if not per:
         L.append("- no per-domain verdict in this run")
     L.append("")
@@ -1513,9 +1521,10 @@ def main():
     maybe_missed = sorted(notify.senders_maybe_missed(report, new_senders))
     announced = [k for k in new_senders if k not in maybe_missed]
 
-    # 9. summary and notification
+    # 9. summary and notification: the plan as written (plan_doc), never the empty stand-in an offline run uses
+    # above - a plan this run did not build is not "0 changes waiting"
     try:
-        text = notify.summarize(report, prev_report, plan, known_senders=known_before, history=entries)
+        text = notify.summarize(report, prev_report, plan_doc, known_senders=known_before, history=entries)
     except Exception as exc:  # a damaged earlier report or history entry: the run's files still get written
         text = "*DMARC audit* summary not built: %s: %s (report.md and next_steps.md hold the run)" % (
             type(exc).__name__, exc)

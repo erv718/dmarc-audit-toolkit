@@ -510,8 +510,8 @@ def test_c17_a_go_verdict_is_ready_and_its_notes_hold_nothing(tmp_path):
     assert g["verdict"] == "go"
     for older in (False, True):  # the gate's own fields, then an older report's prose
         doc, md = doc_md(assemble(gate, dns("none"), ml))
-        assert doc["one_liner"].endswith("The next safe step is to move to p=quarantine at a low pct (for example "
-                                         "pct=10), and it is ready now.")
+        # round 13, T-12: the gate's first step is the plan's first ramp step, at its share
+        assert doc["one_liner"].endswith("The next safe step is to move to p=quarantine at pct=25, and it is ready now.")
         assert doc["ask"].startswith("The ask this week: a go-ahead to move to p=quarantine")
         assert not [q for q in doc["open_questions"] if q["kind"] == "blocker"]
         assert ("From the audit on example.com (information; it holds nothing):\n- unaudited subdomains a.example.com "

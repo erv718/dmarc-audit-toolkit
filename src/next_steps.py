@@ -85,6 +85,7 @@ LIKELY_WORDS = {"likely_spoof": "looks like spoofing",
 OWN, SPOOF, UNCLEAR = "likely_misconfigured_sender", "likely_spoof", "unknown"
 GATE_WORDS = {"go": "ready", "no_go": "not yet", "insufficient_data": "needs more data"}
 FIRST_STEP = "publish a monitoring-only DMARC record for %s so reports start"
+READ_POLICY = "run online, or supply aggregate reports that cover it"  # how a policy the run did not read gets read
 # the step before any record that reports can go out, while the plan's rows carry plan.RUA_PLACEHOLDER: the
 # collect.py option that sets the report address (--rua takes report files), and the setting that does the same
 CHOOSE_RUA = "choose where DMARC reports go (a mailbox you own, or a reporting service)"
@@ -1995,10 +1996,16 @@ def current_policy(report, domain):
 
 
 def policy_text(report, domain):
+    """(the per-domain table's Policy today, the pct= it states): 'p=<policy>'
+    with a pct below 100 and where it is inherited from; a p= receivers do
+    not apply as 'invalid record (p=<value>)'; when no policy was read, why,
+    in the status words (UNREAD_WORDS: no DMARC record, lookup failed, not
+    read), never 'unknown' - the words todo.md and summary.txt use too
+    (policy_words)."""
     policy = current_policy(report, domain)
     dns_doc = audit._dict(audit._dict(report.get("dns")).get(domain))
-    if not policy:
-        return ("no DMARC record" if dns_doc.get("dmarc_status") == "absent" else "unknown"), None
+    if not policy or policy_unread_why(report, domain) == "unrecognised":
+        return policy_words(report, domain), None
     tags = policy_tags(report, domain)
     text = "p=" + policy
     pct = tags.get("pct", "")
@@ -2008,6 +2015,24 @@ def policy_text(report, domain):
     if dns_doc.get("inherited") and dns_doc.get("dmarc_source"):
         text += " (inherited from %s)" % dns_doc["dmarc_source"]
     return text, (pct if low else None)
+
+
+# why no policy was read (policy_unread_why), in the status words every short line uses (the band's, spec 4.1)
+UNREAD_WORDS = {"absent": "no DMARC record", "unverified": "lookup failed", "unread": "not read"}
+
+
+def policy_words(report, domain):
+    """A domain's policy as todo.md and summary.txt name it: 'p=<policy>'
+    when one was read, 'invalid record (p=<value>)' for a p= receivers do
+    not apply, and when none was read, why (UNREAD_WORDS: no DMARC record,
+    lookup failed, not read) - never 'p=unknown'."""
+    policy = current_policy(report, domain)
+    why = policy_unread_why(report, domain)
+    if why == "unrecognised":
+        return "invalid record (p=%s)" % policy
+    if policy is not None:
+        return "p=" + policy
+    return UNREAD_WORDS.get(why, UNREAD_WORDS["unread"])
 
 
 # A report from before the gate split its reasons into blockers and notes: the gate's framing of the
@@ -2377,7 +2402,9 @@ def org_next(report, plan, org, own=None):
     leads instead when the plan parks it); a lookup that failed or an
     unreadable record asks for a re-run before any record is published; a
     policy receivers do not apply asks for the record to be corrected; DNS
-    never read asks for the data, never a go-ahead. The plan's
+    never read asks for the data, never a go-ahead, and nothing the audit
+    found holds reading the policy (it stands whatever the policy is, and
+    is asked as a gap to close, never as 'on hold while'). The plan's
     quarantine-now row (no mail measured) is the step whatever the policy,
     with its checks. While any plan row carries the placeholder report
     address (its status is address) the step is choosing where DMARC
@@ -2420,8 +2447,10 @@ def org_next(report, plan, org, own=None):
                      "or reject), so they apply none" % (org, current_policy(report, org)),
                      "gate", "fix_record", verdict, notes, held, [b["text"] for b in held])
     if why == "unread":
-        return _step("determine %s's DMARC policy" % org, "gate", "unread", verdict, notes, items,
-                     [b["text"] for b in items])
+        # reading the policy waits on nothing the audit found: what it found stands whatever the policy turns out to
+        # be, so it holds nothing here (the blockers ride along for the open questions; the evidence an
+        # insufficient_data verdict asks for is the step's data)
+        return _step("determine %s's DMARC policy" % org, "gate", "unread", verdict, notes, items, (), holds=[])
     if why == "absent" or gate_step.lower().startswith("unknown"):
         rec = next((c for c in changes if c.get("kind") in ("new", "park")
                     and str(c.get("hostname") or "").lower() == "_dmarc." + org), None)
@@ -2527,6 +2556,9 @@ def _own_domain_sentence(org, policy, strm):
         if not gf:
             return lead + "None of them failed with no passing copy."
     if not gf:
+        if seen and strm.get("no_record"):  # with no record nothing can fail DMARC: none failing is no news
+            return ("%s's failures are not measurable without a DMARC record (%d %s in the mail log): with no record, "
+                    "no message can fail DMARC." % (org, seen, _plural(seen, "message")))
         if seen:
             return "None of %s's own mail failed with no passing copy in the mail log (%d %s checked)." % (
                 org, seen, _plural(seen, "message"))
@@ -2644,6 +2676,12 @@ def one_liner(org, policy, pct, since, strm, nxt):
         tail = "The first step is to %s." % nxt["label"]
         if nxt.get("holds"):
             tail += " What the audit found stands whatever the record says: %s." % "; ".join(nxt["holds"])
+    elif nxt and nxt.get("kind") == "unread" and not _needs_data(nxt):
+        # the policy was not read: reading it is the step, and nothing the audit found holds that
+        tail = "The first step is to %s: %s." % (nxt["label"], READ_POLICY)
+        found = [b["text"] for b in nxt.get("blockers") or [] if b.get("kind") != "data"]
+        if found:
+            tail += " What the audit found stands whatever the policy is: %s." % "; ".join(found)
     elif policy == "reject":
         tail = "No policy step is left"
         if nxt and not nxt["label"].lower().startswith("none"):
@@ -3287,7 +3325,7 @@ def _unread_step(report, domain):
     if why == "unrecognised":
         return "correct the record: p=%s is not a policy receivers apply" % current_policy(report, domain)
     if why == "unread":
-        return "read the policy first: run online, or supply aggregate reports that cover it"
+        return "read the policy first: " + READ_POLICY
     return "publish a monitoring-only DMARC record so reports start (no record found)"
 
 
@@ -3319,6 +3357,30 @@ def gate_words(report, domain, verdict, step="", first=()):
     shared = {str(b) for b in shared} if isinstance(shared, list) else set()
     own = [str(b) for b in first or () if b] or [b for b in blockers if b not in shared] or blockers
     return ("%s - held by: %s" % (word, cut_subject(plain(own[0]), HELD_BY_CUT))) if own else word
+
+
+def plan_step(plan, domain, note=None):
+    """The next step the plan gives one domain, in the words every file
+    uses for it (the per-domain table here, todo.md, summary.txt): its
+    quarantine-now row when it has one, else its first row in the plan's
+    own order (table_step), then the second - 'or ..., one a week' when
+    both rewrite one DMARC record from today's value (this week's
+    alternatives, as the plan says on each), ', then ...' otherwise - and
+    how many more the plan holds. note(row), when given, is said after
+    each row it names (an id and its status). None when the plan has no
+    row for the domain."""
+    changes = sorted(changes_for(plan, domain), key=lambda c: c.get("kind") != "no_mail")
+    if not changes:
+        return None
+    note = note or (lambda c: "")
+    step = table_step(changes[0]) + note(changes[0])
+    if len(changes) > 1:
+        same = (str(changes[0].get("hostname") or "").startswith("_dmarc.")
+                and all(str(changes[0].get(k)) == str(changes[1].get(k)) for k in ("hostname", "current")))
+        step += (" or %s, one a week" if same else ", then %s") % (table_step(changes[1]) + note(changes[1]))
+    if len(changes) > 2:
+        step += " (+%d more in the plan)" % (len(changes) - 2)
+    return step
 
 
 def per_domain(report, plan, headline=None):
@@ -3382,15 +3444,7 @@ def per_domain(report, plan, headline=None):
             # never shown as the subdomain's own move (read literally it would downgrade the apex)
             audit_step = "no record of its own: it follows %s and moves with the apex's step" % at.group(1)
         if changes:
-            step = table_step(changes[0])
-            if len(changes) > 1:
-                # two rows that rewrite one DMARC record from today's value are this week's alternatives (the
-                # plan says so on each), not a sequence
-                same = (str(changes[0].get("hostname") or "").startswith("_dmarc.")
-                        and all(str(changes[0].get(k)) == str(changes[1].get(k)) for k in ("hostname", "current")))
-                step += (" or %s, one a week" if same else ", then %s") % table_step(changes[1])
-            if len(changes) > 2:
-                step += " (+%d more in the plan)" % (len(changes) - 2)
+            step = plan_step(plan, d)
         elif holds:
             step = "hold: " + str(holds[0].get("reason") or "").split(" - ")[0]
         elif held:  # the plan's hold on the apex names this name: that is its step, never 'only if it needs one'
@@ -4111,7 +4165,10 @@ def build_ask(plan, org, nxt, policy):
         parts.append("not this week: %s" % "; ".join("plan %s, %s" % (id_range(_ids(rows)) or "?", words)
                                                      for words, rows in by_words.items()))
     at_end = not nxt or nxt["label"].lower().startswith("none")
-    first = nxt is not None and nxt.get("kind") in ("first", "recheck", "fix_record")
+    # a step before any policy step: the first record, a re-run, a record to correct, or reading the policy (which
+    # nothing the audit found holds; when the gate asks for its data, that is the ask instead)
+    first = nxt is not None and (nxt.get("kind") in ("first", "recheck", "fix_record")
+                                 or (nxt.get("kind") == "unread" and not _needs_data(nxt)))
     # the rows the clauses above already ask for, and the ones that are not for this week
     asked = {c.get("id") for c in now + checked + quiet + unhosted + waiting + placeholder if c.get("id")}
     which = "the step after that" if parts else "the next step"
@@ -4133,6 +4190,7 @@ def build_ask(plan, org, nxt, policy):
         parts.append("a decision on %s: %s%s" % (h.get("domain") or org, _hold_summary(h.get("reason")), more))
     if first:
         text = ("the first step is to %s; no policy could be read" % (FIRST_STEP % org) if nxt.get("kind") == "first"
+                else "the first step is to %s (%s)" % (nxt["label"], READ_POLICY) if nxt.get("kind") == "unread"
                 else "the first step is to %s" % nxt["label"])
         if parts:
             return "The ask this week: " + _join(parts, "and") + " - " + text + "."
@@ -4201,7 +4259,7 @@ def open_questions(report, plan, org, nxt, owners, groups, headline=None):
             elif nxt.get("kind") == "first":
                 q = ("Can we close this gap on %s (a monitoring-only record reports it but does not fix it): %s?"
                      % (org, b["text"]))
-            elif nxt.get("kind") in ("recheck", "fix_record"):
+            elif nxt.get("kind") in ("recheck", "fix_record", "unread"):  # nothing it found holds reading the record
                 q = "Can we close this gap on %s (it stands whatever its DMARC record says): %s?" % (org, b["text"])
             elif at_end:
                 q = "Can we close this gap on %s (enforcement does not fix it by itself): %s?" % (org, b["text"])
@@ -4351,6 +4409,8 @@ def build(report, plan=None, metrics=None, owners=(), previous=None, date=None, 
         since = date  # the delta shows the policy changed in this very run
     own = own_domain_view(report, view, org)
     strm = streams(view, rua, own, _excepted_ips(report), head)
+    if strm is not None and strm.get("scope") in OWN_SCOPES:  # DNS shows no record at all: nothing it sends can fail
+        strm["no_record"] = policy is None and policy_unread_why(report, org) == "absent"
     if strm is not None and own is not None and not own.get("subdomains"):
         spoof_n = (strm.get("by_likely") or {}).get(SPOOF, 0)
         if spoof_n:  # the plan's split: a lure word in the subject is a strong sign; the envelope or a billing word is not

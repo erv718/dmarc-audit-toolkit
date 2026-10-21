@@ -26,7 +26,7 @@ built from, and what a person or an agent may change before sending it.
 | The one-liner (bold) | policy today (and since when, if the history shows the change), how many of our own streams still fail, how many could be our own vendors (a spoof label on the envelope or a billing word alone, no lure word) and how many look like spoofing, each with the deliveries its own streams had and what let them in, the next safe step and what it is ready when | `gate`, `dns`, `maillog.census`, the plan's next enforcement step and its prerequisites |
 | Where we stand | genuine failures with the raw count alongside (for an organization the row budget or the API cap cut, the full-window totals counted in advanced hunting beside that organization's own floor; the gate, the census and the labels rest on the rows kept, the plan reads the totals for its quarantine-now and sp= decisions); when passing copies went only to an on-premises or external hop, how many (check message trace; the toolkit never sees a message that did not arrive); delivered despite failing, with the overrides that let it in when the mail log recorded them; spoofing blocked by receivers; trend versus the previous run (withheld, with the reason, when the row budget cut a mail log or the mail-log spans or the outside views are not comparable) | `maillog.counters`, `maillog.window_totals`, `rua.by_disposition`, `delta` (else `--previous`, else `metrics.json`) |
 | What is failing | the top failing envelope domains and sender addresses, each with its heuristic label (an address failing under two labels is one row per label; a spoof with a lure word that reached a mailbox has a line of its own, never only a note); senders outside the audited domains; the outside view from aggregate reports | `maillog.census`, `maillog.by_domain`, `rua.failing_streams` |
-| Per domain | one row per audited domain: policy today, gate (with what holds it: "not yet - held by: ..." names the domain's own first blocker, its own failing streams included and never another domain's; "no step left" where the policy is at its end), next step ("no mail measured: quarantine now" for a domain the run measured sending nothing, its gate verdict marked as the one for the weekly ramp that row skips), and its mail flow as the tenant measured it ("sends: N out, M in", "nothing sent or received", or "not measured"), then one line on what that view cannot see (a third party sending as the domain straight to outside recipients shows only in the aggregate reports) | `gate.domains`, `dns`, the plan, `mailflow` |
+| Per domain | one row per audited domain: policy today (when none was read, why: "no DMARC record", "lookup failed", "not read"; a p= receivers do not apply is an "invalid record"), gate (with what holds it: "not yet - held by: ..." names the domain's own first blocker, its own failing streams included and never another domain's; "no step left" where the policy is at its end), next step (the plan's first row for the domain, the same step todo.md and summary.txt name; "no mail measured: quarantine now" for a domain the run measured sending nothing, its gate verdict marked as the one for the weekly ramp that row skips), and its mail flow as the tenant measured it ("sends: N out, M in", "nothing sent or received", or "not measured"), then one line on what that view cannot see (a third party sending as the domain straight to outside recipients shows only in the aggregate reports) | `gate.domains`, `dns`, the plan, `mailflow` |
 | What happens next, by owner | one action per failing sender, override (named, with what to change, when the mail log recorded it - after the sender passes DMARC when the mail it lets in is ours or may be, since doing it first junks that mail too), SPF-only sender, unknown source and DNS change, grouped by the owner the owners file names; the last group is `Unassigned - needs an owner` | `findings`, the plan's changes, `maillog.census`, `owners.csv` |
 | The ask | the approval or DNS window for this week's step, and what holds the step after it, by each plan row's status: only the rows ready now are zero-risk records to publish, the rows after a check are asked once their checks are confirmed (a domain the run measured sending nothing apart, with its checks; the records for a name whose own `_dmarc` record nobody saw counted as needing a lookup first), a row whose DNS host is unknown waits on finding it, and a held row or a second change to one record is "not this week" | the plan rows' statuses, its quarantine-now rows and the next enforcement step |
 | Open questions | unmet prerequisites, gaps enforcement does not close, heuristics not yet verified, unassigned items | `gate.reasons`, `findings` with `verified: false`, the plan's holds |
@@ -193,7 +193,7 @@ In a real run you would leave both exactly as the generator wrote them.
 # DMARC rollout - status and next steps, 2026-09-29
 
 **example.com is at p=none. 6 senders still fail. The next safe step is
-p=quarantine at pct=10, and it is ready once the statements system (3
+p=quarantine at pct=25, and it is ready once the statements system (3
 misconfigured messages) is DKIM-signed.**
 
 ## Where we stand (last 30 days, deduplicated)
@@ -209,7 +209,7 @@ misconfigured messages) is DKIM-signed.**
 
 | Domain | Policy today | Gate | Next step |
 |---|---|---|---|
-| `example.com` | p=none | no_go | p=quarantine at pct=10 once statements is signed |
+| `example.com` | p=none | no_go | p=quarantine at pct=25 once statements is signed |
 
 ## What happens next, by owner
 
@@ -221,5 +221,5 @@ misconfigured messages) is DKIM-signed.**
 
 ## The ask
 
-Approval to move example.com to `p=quarantine; pct=10` in this Thursday's
+Approval to move example.com to `p=quarantine; pct=25` in this Thursday's
 DNS window.

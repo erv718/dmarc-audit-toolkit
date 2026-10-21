@@ -18,8 +18,9 @@ own files, and names every token in the copy the run does not carry:
   - a finding id (DMARC-002) that is neither among report.json's findings
     nor in report.md
   - a p=, sp= or pct= value the run's files never write (the fixed
-    explanations every run prints, which name p=reject and pct=10 whatever
-    the run found, do not count, in the run's files or in the copy)
+    explanations a run prints whatever it found - p=reject in report.md's
+    gate rule, and pct=10 in the example older runs gave of a low pct - do
+    not count, in the run's files or in the copy)
   - the punctuation and spacing the voice rules forbid: any dash but the
     hyphen (the em dash, the en dash, the minus sign and the other Unicode
     dashes), curly and angle quotes, the ellipsis characters, any space but
@@ -98,8 +99,10 @@ POLICY_RX = re.compile(r"(?<![A-Za-z0-9_])(?:p|sp|pct)=[A-Za-z0-9]+", re.I)
 QUOTED_RX = re.compile(r'"([^"\n]*)"')
 ODD_RX = re.compile(r"[^\t\x20-\x7e]")  # any character the voice check looks at: all but printable ASCII and tab
 # the explanations the run's files print on every run, whatever the run found: report.md's gate rule and the label
-# of its DKIM evidence line name p=reject, and the gate's first enforcement step gives pct=10 as an example of a low
-# pct. A value in them is not a value the run states, so none is read there - in the run's files or in the copy
+# of its DKIM evidence line name p=reject, and in runs before round 13 the gate's first enforcement step gave pct=10
+# as an example of a low pct (it now names the plan's first ramp step, a value the run states; the entry stays so an
+# older run still checks clean). A value in them is not a value the run states, so none is read there - in the run's
+# files or in the copy
 FIXED_TEXT = (re.compile(r"(?m)^Gate rule: .*$"), re.compile(r"aligned-DKIM evidence \(needed before p=reject\)"),
               re.compile(r"\(for example pct=10\)"))
 # the voice rules: hyphens only, straight quotes, three dots, plain spaces, nothing invisible (code points as

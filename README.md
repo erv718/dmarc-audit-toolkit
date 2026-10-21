@@ -254,7 +254,10 @@ Read them in this order, all under `audit-out/latest/`:
    sentence is assembled from the run and every number is copied from it, so
    any tenant that runs the toolkit gets the same document from the same
    inputs. `next_steps.json` is the same content as data.
-2. **`todo.md`**: one prioritised list. Decide the holds first, then the
+2. **`todo.md`**: one prioritised list. It opens with where each domain
+   stands: its policy, gate and next step - the plan's first row for it,
+   with the section that lists the row and its status, the same step
+   `next_steps.md` and the Slack summary name. Decide the holds first, then the
    priority-1 DNS rows (the zero-risk monitoring and hygiene rows, and a
    "quarantine now" row once its checks are confirmed), then the senders to
    fix DKIM-first, then tenant configuration, then the gated enforcement
@@ -528,7 +531,9 @@ weeks of local history even though the API still only shows 30 days, and
 `metrics.md` turns that into the trend line.
 
 **Slack, off by default.** Set `SLACK_WEBHOOK_URL` in `.env` and each run posts
-one message: policy and gate per domain, deduplicated failure counts next to
+one message: policy, gate and next step per domain (the plan's first row for
+it, as `next_steps.md` and `todo.md` name it; a policy the run could not read
+says why - no DMARC record, lookup failed, not read), deduplicated failure counts next to
 the raw ones (with the overrides that let failing mail in, when the mail log
 recorded them), the worst failing senders from the census, spoofing blocked by
 receivers, newly identified senders (new to the whole history, not just absent

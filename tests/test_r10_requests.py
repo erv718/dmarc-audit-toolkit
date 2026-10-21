@@ -464,10 +464,14 @@ def test_r2_the_plan_md_row_the_table_and_todo_say_it_in_plain_words(tmp_path):
     assert after.count("  - before applying: no sender that mails monthly or less often (statements, renewals) "
                        "uses this domain") == 3
     stands = todo.split("## Where each domain stands", 1)[1].split("## 1.", 1)[0]
-    assert ("- brand.example: p=unknown, next step: no mail measured, quarantine now (%s, section 2); the gate's no_go "
-            "is for the weekly ramp this skips" % brand["id"]) in stands
-    assert ("- spoofed.example: p=none, next step: no mail measured, quarantine now (%s, section 2); the gate's no_go "
-            "is for the weekly ramp this skips" % one(rows_by(p)["spoofed.example"], "no_mail")["id"]) in stands
+    # round 13, T-12: a policy the run did not read in words, never p=unknown; the row with the section listing it
+    # and its status
+    spoofed = one(rows_by(p)["spoofed.example"], "no_mail")
+    assert brand["status"] == spoofed["status"] == "check"
+    assert ("- brand.example: no DMARC record, next step: no mail measured, quarantine now (%s, section 2b: %s); the "
+            "gate's no_go is for the weekly ramp this skips" % (brand["id"], brand["status_text"])) in stands
+    assert ("- spoofed.example: p=none, next step: no mail measured, quarantine now (%s, section 2b: %s); the gate's "
+            "no_go is for the weekly ramp this skips" % (spoofed["id"], spoofed["status_text"])) in stands
     text = notify.summarize(rep, plan=p)
     # the summary counts the rows by their status too (round 13, T-05): zero-risk only for the ones ready now
     assert ("- plan: 14 change(s) waiting: 6 ready now, zero-risk monitoring/hygiene, 6 after their checks (3 move "

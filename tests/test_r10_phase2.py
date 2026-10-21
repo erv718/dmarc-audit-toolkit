@@ -591,12 +591,13 @@ def test_g2_the_report_and_the_document_say_per_domain_what_was_measured(tmp_pat
     out = next_steps.render_md(doc)
     step = "read the policy first: run online, or supply aggregate reports that cover it"
     assert "| Domain | Policy today | Gate | Next step | Mail flow |" in out
-    assert "| `example.com` | unknown | needs more data | %s | sends: 100 out, 20 in (30 days, tenant) |" % step in out
+    # a policy the run did not read says why (round 13, T-12): DNS was not read here
+    assert "| `example.com` | not read | needs more data | %s | sends: 100 out, 20 in (30 days, tenant) |" % step in out
     # subdomains share a row only when their mail flow reads the same
-    assert ("| `a.example.com`, `b.example.com` | unknown | needs more data | %s | nothing sent or received in 30 days "
+    assert ("| `a.example.com`, `b.example.com` | not read | needs more data | %s | nothing sent or received in 30 days "
             "(tenant) |" % step) in out
-    assert "| `c.example.com` | unknown | needs more data | %s | not measured |" % step in out
-    assert "| `other.example` | unknown | needs more data | %s | not measured |" % step in out
+    assert "| `c.example.com` | not read | needs more data | %s | not measured |" % step in out
+    assert "| `other.example` | not read | needs more data | %s | not measured |" % step in out
     assert ("Mail flow is what passed through our own tenant in the last 30 days with that domain as the sender: out is "
             "mail our people and systems sent, in is mail that arrived from outside (a vendor sending for us, or a "
             "spoof); the counts are close estimates, and zero means none. Mail a third party sends as one of our "
@@ -608,7 +609,7 @@ def test_g2_the_report_and_the_document_say_per_domain_what_was_measured(tmp_pat
     assert ("- not measured in this run: collect.py measures every audited domain's mail flow with one advanced "
             "hunting query on each run that has the app registration's token") in audit.render_md(rep)
     out = next_steps.render_md(next_steps.build(rep))
-    assert "| `example.com` | unknown | needs more data | %s | not measured |" % step in out
+    assert "| `example.com` | not read | needs more data | %s | not measured |" % step in out
     assert ("Mail flow was not measured in this run (it is counted in our tenant on every run that can reach it). "
             "Mail a third party sends as one of our domains straight to outside recipients never passes through our "
             "tenant, so only the aggregate reports show it.") in out

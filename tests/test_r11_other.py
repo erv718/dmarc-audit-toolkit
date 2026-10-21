@@ -708,7 +708,9 @@ def test_n31_todo_leads_with_the_rows_that_replace_the_gates_step():
         {"id": "P-07", "domain": "old.corp.example", "kind": "park", "priority": 1, "record": "TXT", "hostname": "old.corp.example",
          "value": "v=spf1 -all", "current": "none", "why": "parked", "prerequisites": []}], "holds": []}
     todo = collect.render_todo(rep, plan)
-    assert "- old.corp.example: p=none, gate no_go, next step: park it with p=reject (P-06, section 2); then park it with SPF -all (P-07, section 2)" in todo
+    # round 13, T-12: the plan's step in next_steps.md's words, each row with the section listing it and its status
+    assert ("- old.corp.example: p=none, gate no_go, next step: park it with p=reject (P-06, section 2: ready now), then "
+            "park it with SPF -all (P-07, section 2: ready now)") in todo
     assert "- x.corp.example: p=none, gate no_go, next step: none of its own: it follows _dmarc.corp.example and moves with the apex's step" in todo
     assert "pct=10" not in todo.split("## 1.")[0]
 

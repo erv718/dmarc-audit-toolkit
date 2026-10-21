@@ -1195,11 +1195,20 @@ def test_check_doc_line_numbers_count_line_feeds_only(quiet_run, tmp_path):
 
 def test_check_doc_does_not_take_the_gates_example_pct_for_a_value_the_run_states(quiet_run, tmp_path):
     corpus = "\n".join((quiet_run / f).read_text(encoding="utf-8") for f in ("report.md", "next_steps.md"))
-    assert "(for example pct=10)" in corpus  # the gate's fixed wording names it on every first step
+    # round 13, T-12: the gate's first step names the plan's first ramp step, a value the run states, and no example
+    assert "(for example pct=10)" not in corpus and "move to p=quarantine at pct=25" in corpus
     copy = tmp_path / "ticket.md"
     copy.write_text("Value (publish exactly this): v=DMARC1; p=quarantine; pct=10; rua=mailto:reports@example.com;\n"
                     "The gate says: move to p=quarantine at a low pct (for example pct=10).\n", encoding="utf-8")
     assert problem_lines(copy, quiet_run) == (1, ["line 1: pct=10: policy value the run's files never write"])
+    # a run from before it named the example on every first step: still never read as a value the run states
+    older = run_copy(quiet_run, tmp_path, "older")
+    for name in ("report.md", "next_steps.md"):
+        text = (older / name).read_text(encoding="utf-8")
+        (older / name).write_text(text.replace("move to p=quarantine at pct=25",
+                                               "move to p=quarantine at a low pct (for example pct=10)"), encoding="utf-8")
+    assert "(for example pct=10)" in (older / "report.md").read_text(encoding="utf-8")
+    assert problem_lines(copy, older) == (1, ["line 1: pct=10: policy value the run's files never write"])
 
 
 def test_check_doc_reads_dates_grouped_numbers_and_percentages_as_what_they_are(quiet_run, tmp_path):

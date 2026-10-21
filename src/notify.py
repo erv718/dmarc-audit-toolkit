@@ -2,7 +2,9 @@
 """Post a short status to Slack after an audit run.
 
 Reads report.json (and optionally the previous run's report.json and this
-run's plan.json) and writes one message: policy and gate per domain (with the
+run's plan.json) and writes one message: policy, gate and next step per
+domain (the plan's first row for it when the plan has one; a policy the run
+could not read in words, never p=unknown; with the
 domain's own genuine failures when the report attributes the mail log per
 domain, maillog.by_domain, and for a domain under an organization the row
 budget cut, the full-window totals collect.py counted in advanced hunting,
@@ -11,7 +13,8 @@ overrides that let mail in despite failing, when the log recorded them),
 the worst census entries (maillog.census), what
 changed since last time (new findings, resolved findings, newly identified
 senders, spoofing blocked, failure counts), the trend over the last runs,
-and how many plan rows are waiting. When the report carries its own delta
+and how many plan rows are waiting (an offline run says it has no plan).
+When the report carries its own delta
 (audit.py --previous writes report.delta) the deltas come from there;
 --previous is then only needed for the pass-rate and newly-seen-source
 deltas, which the delta does not hold. Aggregates only: domains, counts and
@@ -488,7 +491,14 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     absent last week. history: the metrics.json entries, newest last, for
     the trend line over the last TREND_RUNS runs. The per-domain lines run
     in the one order every file of the run follows, led by the organization
-    the status document leads with (next_steps.headline_org)."""
+    the status document leads with (next_steps.headline_org); each names
+    the domain's policy (in words when none was read: no DMARC record,
+    lookup failed, not read) and its next step - the plan's first row for
+    it when the plan has one (next_steps.plan_step, as next_steps.md's
+    table and todo.md name it), else the gate's - and for a domain with no
+    DMARC record, that its failures are not measurable rather than a zero.
+    plan None: no plan line, except for an offline run, which says it has
+    none (NO_PLAN_LINE)."""
     lines = []
     gen = str(report.get("generated_utc") or "")
     lines.append("*DMARC audit* %s" % gen[:16].replace("T", " "))
@@ -519,24 +529,37 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     headline = next_steps.headline_org(report)
     for dom in sorted(per, key=lambda d: (audit.domain_key(d, headline), str(d))):
         g = _d(per[dom])
-        policy = g.get("current_policy") if isinstance(g.get("current_policy"), str) else None
+        # the policy in the band's words when none was read (no DMARC record, lookup failed, not read): never p=unknown
+        policy = next_steps.policy_words(report, str(dom))
         verdict = g.get("verdict") if isinstance(g.get("verdict"), str) else "?"
         if str(dom).lower() in quiet:
             left = audit.ramp_blockers_left(report, str(dom).lower())
-            line = "- `%s`: p=%s, next: no mail measured, quarantine now (plan %s); the gate's *%s* %s" % (
-                dom, policy or "unknown", quiet[str(dom).lower()], verdict,
+            line = "- `%s`: %s, next: no mail measured, quarantine now (plan %s); the gate's *%s* %s" % (
+                dom, policy, quiet[str(dom).lower()], verdict,
                 "is for the weekly ramp this skips" if not left else "holds that row too: %s" % left[0])
         else:
-            step = g.get("next_step") if isinstance(g.get("next_step"), str) else "?"
-            if isinstance(plan, dict):  # a name a plan hold says needs a record of its own: one statement, the plan's
-                step = audit.inherited_step(str(dom), step, plan)
-            line = "- `%s`: p=%s, gate *%s*, next: %s" % (dom, policy or "unknown", verdict, step)
+            # a domain with a plan row: the plan's first row is its next step, as next_steps.md's table and todo.md
+            # name it, each row with its id and status; else the gate's step, a policy it did not read in words
+            step = next_steps.plan_step(plan, str(dom).lower(), plan_note) if isinstance(plan, dict) else None
+            if step is None:
+                step = g.get("next_step") if isinstance(g.get("next_step"), str) else "?"
+                if step.lower().startswith("unknown"):
+                    step = next_steps._unread_step(report, str(dom))
+                if isinstance(plan, dict):  # a name a plan hold says needs a record of its own: one statement, the plan's
+                    step = audit.inherited_step(str(dom), step, plan)
+            line = "- `%s`: %s, gate *%s*, next: %s" % (dom, policy, verdict, step)
         own = by_dom.get(dom)
         # a domain under an org the row budget cut: its own count is the floor the gate decides on, and the
         # whole window, counted server side, goes beside it when it was counted
         full = full_window_line(maillog.get("window_totals"), dom)
         cut = next((o for o in cuts if isinstance(o, str) and (dom == o or str(dom).endswith("." + o))), None)
-        if isinstance(own, dict) and _number(own.get("genuine_failures")) is not None:
+        unmeasured = (isinstance(own, dict) and not _whole(own.get("genuine_failures"))
+                      and next_steps.policy_unread_why(report, str(dom)) == "absent")
+        if unmeasured:  # with no DMARC record nothing it sends can fail DMARC: a zero would read as health
+            n = _whole(own.get("logical_messages"))
+            line += (" - failures not measurable without a DMARC record (%d messages)" % n if n
+                     else " - no mail-log rows of its own")
+        elif isinstance(own, dict) and _number(own.get("genuine_failures")) is not None:
             line += " - %d genuine failures of its own" % _whole(own.get("genuine_failures"))
             gone = min(_whole(own.get("excepted")), _whole(own.get("genuine_failures")))
             if gone:  # the count holds every one; the share an exception covers is named beside it
@@ -693,7 +716,18 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
 
     if isinstance(plan, dict):
         lines.append(plan_line(plan))
+    elif report.get("offline") is True or ("dns" in report and not report.get("dns")):
+        lines.append(NO_PLAN_LINE)  # an offline run builds no plan: it says so, never "0 change(s) waiting"
     return "\n".join(lines)
+
+
+NO_PLAN_LINE = "- plan: not in this run (offline: no DNS read)"
+
+
+def plan_note(row):
+    """' (plan P-01, needs the report address)': one plan row's id and the
+    status plan.py gave it, after the step a per-domain line names it by."""
+    return " (plan %s, %s)" % (row.get("id") or "?", plan_mod.status_of(row)[1])
 
 
 def plan_line(plan):

@@ -764,7 +764,7 @@ def test_each_gate_reason_names_the_finding_behind_it_and_where_its_steps_are(ru
     assert ("reached a mailbox - let in by an Exchange transport rule x4, which external receivers do not have - check: "
             "MAILFLOW-002") in corp
     assert "not gated here; add them to the domain list to gate them - check: the unaudited-subdomains check" in corp
-    assert ("- step being gated: move to p=quarantine at a low pct (for example pct=10) on the record at "
+    assert ("- step being gated: move to p=quarantine at pct=25 on the record at "  # the plan's first ramp step (T-12)
             "_dmarc.corp.example - check: the policy check above") in corp
     assert "check: DMARC-005 (Findings below)" in section("dup.example")
     assert ("- parked.example: NO DMARC RECORD - no policy, no reporting, invisible to you - check: DMARC-001 (Findings "
