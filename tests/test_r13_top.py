@@ -152,6 +152,15 @@ def test_message_trace_is_for_our_own_failing_senders_only(incident, tmp_path):
                      "-EndDate 2026-10-09T06:00:00Z -Status Failed"]
     # no usable run time: no window to give, so no step
     assert verify.message_trace_steps(dict(rep, generated_utc="not a time"), "example.com") == []
+    # more own senders than a section gives steps: the busiest first, in the one rank, and the rest named, never dropped
+    log = F.O.Log(overrides=True).add("staff@example.com", "Weekly #", 20)
+    for k, name in enumerate(("e", "d", "c", "b", "a")):
+        log.add("%s@example.com" % name, "Status report #", 2 + k, env="example.com", dmarc="fail")
+    rep = F.T.audited(tmp_path / "five", {"example.com": F.T.own_record("example.com")}, log)
+    steps = verify.message_trace_steps(rep, "example.com")
+    assert [s["code"].split()[2] for s in steps] == ["'a@example.com'", "'b@example.com'", "'c@example.com'"]
+    assert steps[-1]["text"].endswith(" 2 more of our own senders fail here (d@example.com, e@example.com): the same "
+                                      "lookup with each address.")
 
 
 def test_the_gaps_run_in_their_order_two_shown_and_the_scope_line_last():

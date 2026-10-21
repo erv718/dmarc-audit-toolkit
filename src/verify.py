@@ -504,18 +504,20 @@ def message_trace_steps(report, domain):
     fail: the census streams whose From domain is this audited name or an
     unaudited name under it (audit._home_domain), counted by what they
     failed as our own system after the formal exceptions (their
-    likely_counts, else their label), one per address, the busiest first,
-    at most TRACE_SENDERS. A copy that never arrived - a bounce, a
-    non-delivery report, a hop that failed - is in neither the mail log
-    nor the aggregate reports, so each gets a read-only message-trace
-    lookup over the TRACE_DAYS before the run, failed messages only. A
-    spoofed address never gets one: its mail is not ours to trace."""
+    likely_counts, else their label), one per address, in the one rank
+    every list of senders follows (audit.sender_rank), at most
+    TRACE_SENDERS - the last one names the rest, for the same lookup. A
+    copy that never arrived - a bounce, a non-delivery report, a hop that
+    failed - is in neither the mail log nor the aggregate reports, so each
+    gets a read-only message-trace lookup over the TRACE_DAYS before the
+    run, failed messages only. A spoofed address never gets one: its mail
+    is not ours to trace."""
     window = _trace_window(report)
     census = _d(_d(report.get("maillog")).get("census"))
     audited = [_name(d) for d in _d(_d(report.get("gate")).get("domains"))]
     audited += [_name(d) for d in _l(_d(report.get("inputs")).get("domains"))]
     audited = [d for d in dict.fromkeys(audited) if d] or [domain]
-    failing = {}
+    failing, sent = {}, {}
     for r in _l(census.get("by_sender")):
         if not isinstance(r, dict) or audit._home_domain(_name(r.get("domain")), audited)[0] != domain:
             continue
@@ -524,13 +526,16 @@ def message_trace_steps(report, domain):
         own = next_steps._split({"count": n, "likely_counts": r.get("likely_counts"), "likely": label}).get(
             next_steps.OWN, 0)
         sender = str(r.get("sender") or "").strip().lower()
+        sent[sender] = sent.get(sender, 0) + (_n(r.get("messages")) or 0)
         if own > 0 and ADDRESS_RX.fullmatch(sender):
             failing[sender] = failing.get(sender, 0) + own
     if not window or not failing:
         return []
     start, end = window
+    head = next_steps.headline_org(report)
+    ranked = sorted(failing.items(), key=lambda kv: audit.sender_rank(kv[0], kv[1], head, sent.get(kv[0])))
     out = []
-    for sender, n in sorted(failing.items(), key=lambda kv: (-kv[1], kv[0]))[:TRACE_SENDERS]:
+    for sender, n in ranked[:TRACE_SENDERS]:
         out.append(step("command", "%s: message trace for %s, our own system, %d of whose messages failed with no "
                                    "passing copy. The mail log and the aggregate reports cannot show a copy that never "
                                    "arrived (a bounce, a non-delivery report, a hop that failed); message trace can. Each "
@@ -539,6 +544,12 @@ def message_trace_steps(report, domain):
                                    % (EXO, sender, n, TRACE_DAYS),
                         "Get-MessageTraceV2 -SenderAddress %s -StartDate %s -EndDate %s -Status Failed"
                         % (ps(sender), ps(start), ps(end))))
+    rest = [sender for sender, _ in ranked[TRACE_SENDERS:]]
+    if rest:  # never dropped unsaid: the same lookup serves each of them
+        named = ", ".join(rest[:TRACE_SENDERS]) + (" and %d more" % (len(rest) - TRACE_SENDERS)
+                                                    if len(rest) > TRACE_SENDERS else "")
+        out[-1]["text"] += (" %d more of our own %s here (%s): the same lookup with each address."
+                            % (len(rest), "sender fails" if len(rest) == 1 else "senders fail", named))
     return out
 
 
