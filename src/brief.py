@@ -943,42 +943,53 @@ def band_parts(parts, places=None, hosts=None):
     domain or an address through text_name (one piece, isolated), a host name
     the same in mono, a sender's subject inside its fixed frame through
     iso(marks()), a plan id as a tag linked to its card. The '(' before a tag
-    and the ')' or ',' after it are glued to it (class nb), so a line never
-    starts with a lone ')'. A part of any other shape is left out."""
+    and the ')' or ',' after it (or after the short host name that follows a
+    tag) are glued to it, and a tag to its short host name (class nb), so a
+    line never starts with a lone ')' and an id never ends a line its host
+    name starts; a host name longer than NAME_KEEP is left free to break
+    between its labels. A part of any other shape is left out."""
     pieces = []
     for p in _list(parts):
         if not (isinstance(p, list) and len(p) == 2 and isinstance(p[1], str)):
             continue
         kind, value = p
         if kind in ("name", "addr"):
-            pieces.append(["html", text_name(value)])
-        elif kind == "host":
-            pieces.append(["html", '<span class="mono">%s</span>' % text_name(value)])
+            pieces.append(["html", text_name(value), "", ""])
+        elif kind == "host":  # a long one is no piece to glue: it may need the whole line, and breaks inside
+            pieces.append(["host" if len(_text(value)) <= NAME_KEEP else "html",
+                           '<span class="mono">%s</span>' % text_name(value), "", ""])
         elif kind == "subject":
-            pieces.append(["html", esc("(the sender's subject: \"") + iso(marks(value)) + esc("\")")])
+            pieces.append(["html", esc("(the sender's subject: \"") + iso(marks(value)) + esc("\")"), "", ""])
         elif kind == "id":
             pieces.append(["id", id_link(value, places, hosts), "", ""])
         else:
-            pieces.append(["text", value])
+            pieces.append(["text", value, "", ""])
     for k, piece in enumerate(pieces):
-        if piece[0] != "id":
+        if piece[0] not in ("id", "host"):
             continue
         before = pieces[k - 1] if k else None
         after = pieces[k + 1] if k + 1 < len(pieces) else None
-        if before is not None and before[0] == "text" and before[1].endswith("("):
+        if piece[0] == "id" and before is not None and before[0] == "text" and before[1].endswith("("):
             before[1], piece[2] = before[1][:-1], "("
         m = CLOSING_RX.match(after[1]) if after is not None and after[0] == "text" else None
         if m:
             piece[3], after[1] = m.group(0), after[1][m.end():]
-    out = []
-    for piece in pieces:
-        if piece[0] == "text":  # each piece in its own isolate: a mark at its end moves nothing of the page's after it
-            if piece[1]:
-                out.append(iso(prose(piece[1])))
-        elif piece[0] == "id" and (piece[2] or piece[3]):
-            out.append('<span class="nb">%s%s%s</span>' % (esc(piece[2]), piece[1], esc(piece[3])))
+    out, k = [], 0
+    while k < len(pieces):
+        kind, value, lead, tail = pieces[k]
+        if kind == "id" and k + 2 < len(pieces) and pieces[k + 1][:2] == ["text", " "] and pieces[k + 2][0] == "host":
+            host = pieces[k + 2]  # 'P-08 _dmarc.alerts,': the id, its host name and what closes them, on one line
+            out.append('<span class="nb">%s%s%s %s%s</span>' % (esc(lead), value, esc(tail), host[1], esc(host[3])))
+            k += 3
+            continue
+        if kind == "text":  # each piece in its own isolate: a mark at its end moves nothing of the page's after it
+            if value:
+                out.append(iso(prose(value)))
+        elif lead or tail:
+            out.append('<span class="nb">%s%s%s</span>' % (esc(lead), value, esc(tail)))
         else:
-            out.append(piece[1])
+            out.append(value)
+        k += 1
     return "".join(out)
 
 

@@ -91,6 +91,13 @@ def test_a_list_of_ids_keeps_its_brackets_on_its_tags_lines():
                     '</span><bdi> </bdi><span class="nb"><span class="tag">P-03</span>)</span><bdi> - needs the report '
                     'address</bdi>')
     assert ".nb { white-space: nowrap; }" in brief.CSS
+    # a tag and its short host name stay on one line, with what closes them; a long host name may break inside
+    parts = [["text", "ready now: "], ["id", "P-08"], ["text", " "], ["host", "_dmarc.alerts"], ["text", ", "],
+             ["id", "P-09"], ["text", " "], ["host", "_dmarc." + "x" * 40], ["text", "; more"]]
+    html = brief.band_parts(parts, {}, {})
+    assert ('<span class="nb"><span class="tag">P-08</span> <span class="mono"><span class="d">_dmarc.alerts</span>'
+            '</span>,</span>') in html
+    assert '<span class="tag">P-09</span><bdi> </bdi><span class="mono"><span class="d dl">' in html
 
 
 def test_outside_receivers_failing_is_said_beside_the_mail_logs_count(tmp_path):
