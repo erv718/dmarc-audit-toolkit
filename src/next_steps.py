@@ -3567,6 +3567,8 @@ def _org_line(o, plan, recorded, owner_of, head, policy_of, quiet, carried, chec
         if small:
             flags.append("small")
         if o.get("rua_seen"):  # the mail log speaks for the tier; what outside receivers saw failing is said beside it
+            if text.startswith(NOTHING_OURS):  # never "nothing failing" beside a failing count: whose view each is
+                text = NOTHING_OURS + " in the mail log" + text[len(NOTHING_OURS):]
             text += "; %d failing %s" % (o["rua_seen"], OUTSIDE_ONLY)
         if carried and o["no_rows"] and o["off_tenant"]:
             text += " " + OFF_TENANT

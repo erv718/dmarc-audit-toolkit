@@ -111,6 +111,13 @@ def test_outside_receivers_failing_is_said_beside_the_mail_logs_count(tmp_path):
     assert net["tier"] == 6 and "small" in net["flags"]
     assert net["finding_plain"] == ("small failures only (6, under 10); 56 failing at outside receivers (aggregate "
                                     "reports)")
+    # nothing failing in the mail log, and outside receivers see failures: whose view each is, never a contradiction
+    clean = F.O.Log(overrides=True).add("staff@example.net", "Roster #", 20)
+    rep = F.T.audited(tmp_path / "clean", {"example.net": docs["example.net"]}, clean, [report], flows=flows,
+                      sources={"example.net": ["tenant"]})
+    net = lines_by_org(next_steps.build(rep)["top"])["example.net"]
+    assert net["finding_plain"] == ("nothing of ours failing in the mail log; 56 failing at outside receivers "
+                                    "(aggregate reports)")
 
 
 def test_the_plain_lines_name_the_envelope_a_failing_sender_came_in_through(incident):
