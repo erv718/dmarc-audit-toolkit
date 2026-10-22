@@ -3352,7 +3352,7 @@ def _band_row(plan, members, lead):
     return first, same or ([first] if first.get("id") else [])
 
 
-def _step_parts(row, same, level=0):
+def _step_parts(row, same):
     """A strip line's next step as parts: '<short step> (<ids>) - <status>' when the rows share one status,
     '<short step> - <id> <status>, <id> <status>' when they do not - each row's own status, never the first
     one's for all of them."""
@@ -3689,8 +3689,8 @@ def _run_parts(ids, cap=None):
     """Plan ids as parts, as the call lists a group: a run of three or more
     consecutive ids as one range ('P-01 to P-05'), the others one by one,
     ', ' between them; past cap items (a range is one), ' and <k> more' with
-    k the ids not named - only when that is shorter than naming them all
-    (four or five items read faster whole than as three and a count)."""
+    k the ids not named - only past cap + 3 items, where counting the rest
+    takes fewer words than naming them."""
     ids = [str(i) for i in ids if i]
     items = []
     for run in id_runs(ids):
@@ -3809,9 +3809,9 @@ def plan_parts(plan):
 
 def _ids_cap(key, level):
     """How many items of a group's ids the call names at a level of detail
-    (call_level): None every one, 3 the first three, 0 none. The rows ready
-    now and the groups one check clears keep their ids longest; the rows
-    that are not for this week lose theirs first."""
+    (build_top's, SHED): None every one, 3 the first three, 0 none. The rows
+    ready now and the groups one check clears keep their ids longest; the
+    rows that are not for this week lose theirs first."""
     cap_at, drop_at = {"own": (SHED["own_ids"], 99), "steps": (SHED["far_ids"], SHED["far_ids"]),
                        "host": (SHED["far_ids"], SHED["far_ids"]), "later": (SHED["later_ids"], SHED["later_ids"])}.get(
         key, (SHED["hosts"], 99))
@@ -3823,8 +3823,8 @@ def _ids_cap(key, level):
 def _now_parts(pp, level):
     """The call's rows ready now with no mail impact: how many, then each id
     with its host name as its zone's console wants it (relative_host), zone by
-    zone - at most NOW_NAMED, the rest counted; from level 5 on the ids
-    alone."""
+    zone - at most NOW_NAMED, the rest counted; from SHED["hosts"] on the
+    ids alone."""
     ids = pp["now"]
     n = len(ids)
     out = [["text", "approve %d DNS %s with no mail impact - ready now" % (n, _plural(n, "record"))]]
@@ -3884,9 +3884,10 @@ def _call(plan, pp, report, tail="", level=0):
     call words (spec 3.10), plain the call in plain words (_call_plain).
     The rows ready now are named each with its host name; every group that
     waits names its ids, runs as ranges, in GROUP_ORDER; the holds name
-    their domains, and one hold what it decides. level (0 to 5): past the
-    band's word budget the least actionable groups name fewer ids
-    (_ids_cap), one hold's reason and the host names go last. tail
+    their domains, and one or two what they decide. level (0 to
+    BAND_LEVELS, SHED): past the band's word budget the least actionable
+    groups name fewer ids (_ids_cap) and the ones that wait longest are
+    counted together, what a hold decides goes, and the host names last. tail
     (window_words) ends it when the plan holds rows to decide on; with no
     plan, or a plan with no row and no hold, there is nothing to decide and
     no window to name."""
