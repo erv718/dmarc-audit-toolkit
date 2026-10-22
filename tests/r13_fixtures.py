@@ -14,7 +14,7 @@ ESTATE_APEX = "v=DMARC1; p=quarantine; sp=none; rua=%s; ruf=mailto:forensics@exa
 ESTATE_DATE = "2026-10-13"
 
 
-def estate_parts(tmp_path, net_clean=False, nobodys_stream=False):
+def estate_parts(tmp_path, net_clean=False, nobodys_stream=False, two_records=False):
     """The five-organization estate's inputs: (docs, log, reports, flows, sources, hosts). example.com with
     sending and quiet subdomains and a delegated zone (shop.example.com); example.net on p=none reporting
     to a vendor; brand.example at reject; example.org with no record and no mail; parked.example with
@@ -22,7 +22,8 @@ def estate_parts(tmp_path, net_clean=False, nobodys_stream=False):
     hold a failing vendor stream as example.com (198.51.100.20), a spoof receivers delivered as
     example.com (203.0.113.66) and one as example.net (203.0.113.9). net_clean: example.net has nothing
     failing (no failing sender in the log, no spoof stream), so its gate is go; nobodys_stream: the reports
-    also hold a failing stream with no From domain (192.0.2.99), which nothing attributes to one name."""
+    also hold a failing stream with no From domain (192.0.2.99), which nothing attributes to one name;
+    two_records: example.net publishes two DMARC records (DMARC-005), as the DNS-window review's dup estate."""
     inp = tmp_path / "inputs"
     inp.mkdir(parents=True, exist_ok=True)
     docs = {
@@ -38,6 +39,8 @@ def estate_parts(tmp_path, net_clean=False, nobodys_stream=False):
                                     spf_lookups=0, dkim_selectors=[], dkim_status="absent", mx=[],
                                     mx_status="absent", findings=T.fid("DMARC-001", "SPF-001")),
     }
+    if two_records:
+        docs["example.net"]["findings"] = T.fid("DMARC-002", "DMARC-005")
     senders = [
         ("staff@example.com", "Weekly team update #", {"times": 60}),
         ("noreply@example.com", "Your receipt #", {"dmarc": "fail", "times": 12}),
@@ -324,3 +327,144 @@ def stress(tmp_path):
     plan = plan_mod.build_plan(rep, inventory, RUA)
     doc = next_steps.build(rep, plan=plan, date=ESTATE_DATE, org_name="example.com")
     return {"report": rep, "plan": plan, "inventory": inventory, "doc": doc}
+
+
+# ------------------------------------------------------------------ a weekly run at scale: thirteen organizations
+
+WS_RUA = "mailto:dmarc-reports@corp.example"
+WS_APEX = "v=DMARC1; p=quarantine; sp=none; rua=%s; fo=1;" % WS_RUA
+WS_SUBS = ["hr", "billing", "alerts", "news", "support", "events", "mkt", "careers"]
+WS_QUIET = ["archive", "labs", "test", "legacy"]
+WS_PUBLISHED = ["hr", "billing", "news", "support"]  # own p=none records published between the two weeks
+WS_HOSTS = {"corp.example": "Route53", "corp-brand.example": "Cloudflare", "corp.co.uk": "CSC", "corp.de": "CSC",
+            "corp.fr": "CSC", "corpbank.example": "Route53", "corp-careers.example": "Cloudflare",
+            "corp-events.example": "GoDaddy", "corp-foundation.example": "Cloudflare", "corp-labs.example": "Route53",
+            "parked-one.example": "unknown", "parked-two.example": "unknown", "old-brand.example": "GoDaddy"}
+WS_OWNERS = ("pattern,owner,channel,note\ncorp.example,Messaging team,#mail-ops,\n*.corp.example,Messaging team,#mail-ops,\n"
+             "corp-brand.example,Brand web team,#brand-web,\ncorp.co.uk,UK IT,#uk-it,\n"
+             "corpbank.example,Bank security,#bank-sec,\n")
+
+
+def weekly_docs(week):
+    """The weekly review's thirteen organizations (28 audited names, 12 of them under corp.example): DNS as week 1
+    or week 2 finds it (four subdomains publish p=none records of their own between the two)."""
+    docs = {"corp.example": T.own_record("corp.example", WS_APEX)}
+    for s in WS_SUBS + WS_QUIET:
+        name = s + ".corp.example"
+        docs[name] = (T.own_record(name, "v=DMARC1; p=none; rua=%s;" % WS_RUA) if week >= 2 and s in WS_PUBLISHED
+                      else T.inherits(name, WS_APEX, "_dmarc.corp.example"))
+    brand = "v=DMARC1; p=none; rua=mailto:dmarc@corp-brand.example;"
+    docs["corp-brand.example"] = T.own_record("corp-brand.example", brand)
+    docs["shop.corp-brand.example"] = T.own_record("shop.corp-brand.example", "v=DMARC1; p=none; rua=%s;" % WS_RUA)
+    docs["mail.corp-brand.example"] = T.inherits("mail.corp-brand.example", brand, "_dmarc.corp-brand.example")
+    uk = "v=DMARC1; p=none; rua=%s;" % WS_RUA
+    docs["corp.co.uk"] = T.own_record("corp.co.uk", uk)
+    docs["mail.corp.co.uk"] = T.inherits("mail.corp.co.uk", uk, "_dmarc.corp.co.uk")
+    docs["corp.de"] = T.own_record("corp.de", "v=DMARC1; p=quarantine; pct=25; rua=%s;" % WS_RUA)
+    docs["corp.fr"] = T.dns_doc("corp.fr", findings=T.fid("DMARC-001"))
+    docs["corpbank.example"] = T.own_record("corpbank.example", "v=DMARC1; p=reject; rua=%s;" % WS_RUA)
+    for d in ("corp-careers.example", "corp-foundation.example", "corp-labs.example"):
+        docs[d] = T.own_record(d, "v=DMARC1; p=none; rua=%s;" % WS_RUA)
+    docs["corp-events.example"] = T.own_record("corp-events.example",
+                                               "v=DMARC1; p=none; rua=mailto:dmarc@events-vendor.invalid;")
+    for p in ("parked-one.example", "parked-two.example", "old-brand.example"):
+        docs[p] = T.dns_doc(p, spf=None, spf_status="absent", spf_terminator=None, spf_lookups=0, dkim_selectors=[],
+                            dkim_status="absent", mx=[], mx_status="absent", findings=T.fid("DMARC-001", "SPF-001"))
+    return docs
+
+
+def weekly_log(week):
+    """The week's mail log, its counts the weekly review's: our own senders failing (two let in by a transport
+    rule), vendors on a weak sign, lures receivers quarantined; week 2 doubles the receipts, fixes the alerts and
+    adds two new failing senders (one under corp.example, which the row budget cut in both weeks)."""
+    log = (O.Log(overrides=True)
+           .add("staff@corp.example", "Weekly team update #", 40, direction="Intra-org")
+           .add("noreply@corp.example", "Your receipt #", 112 if week >= 2 else 56, dmarc="fail", org=TRANSPORT_RULE)
+           .add("payroll@corp.example", "Payroll run # complete", 21, env="payroll-vendor.invalid", dmarc="fail")
+           .add("ceo@corp.example", "Urgent wire transfer #", 11, env="evil.invalid", where=O.QUARANTINED,
+                dmarc="fail")
+           .add("alerts@alerts.corp.example", "Service alert #", 12, dmarc="pass" if week >= 2 else "fail")
+           .add("hr@hr.corp.example", "Benefits enrolment #", 10, direction="Intra-org")
+           .add("rsvp@events.corp.example", "Event # reminder", 11, env="events-vendor.invalid", dmarc="fail")
+           .add("offers@mkt.corp.example", "Spring offer #", 11, dmarc="fail")
+           .add("team@corp-brand.example", "Brand standup #", 30, direction="Intra-org")
+           .add("orders@shop.corp-brand.example", "Order # shipped", 157, dmarc="fail", org=TRANSPORT_RULE)
+           .add("staff@corp.co.uk", "UK update #", 20, direction="Intra-org")
+           .add("billing@corp.co.uk", "Statement # ready", 30, dmarc="fail")
+           .add("team@corp.de", "Wochenbericht #", 10, direction="Intra-org")
+           .add("factures@corp.fr", "Facture # disponible", 15, dmarc="fail")
+           .add("staff@corpbank.example", "Bank memo #", 10, direction="Intra-org")
+           .add("security@corpbank.example", "Your password expires today #", 30, env="lure.invalid",
+                where=O.QUARANTINED, dmarc="fail")
+           .add("hello@corp-events.example", "Save the date #", 15, dmarc="fail")
+           .add("donate@corp-foundation.example", "Thank you for your gift #", 30, env="donor-platform.invalid",
+                dmarc="fail")
+           .add("staff@corp-foundation.example", "Foundation notes #", 10, direction="Intra-org"))
+    if week >= 2:
+        log.add("newsletter@news.corp.example", "Weekly digest #", 60, dmarc="fail")
+        log.add("payslips@corp.co.uk", "Payslip # issued", 14, dmarc="fail")
+    return log
+
+
+def weekly_flows():
+    flows = {d: T.flow(40, 40) for d in weekly_docs(2)}
+    for s in WS_QUIET + ["parked-one", "parked-two", "old-brand"]:
+        flows[s + (".corp.example" if s in WS_QUIET else ".example")] = T.flow(0, 0)
+    return flows
+
+
+def weekly_week(tmp_path, week):
+    """One week's report as collect.py writes it under a row budget that cut corp.example and corp-brand.example
+    (maillog.cuts, and the full window counted in advanced hunting: maillog.window_totals)."""
+    inp = tmp_path / ("inputs-week%d" % week)
+    inp.mkdir(parents=True, exist_ok=True)
+    spoofs = [("203.0.113.%d" % (k + 1), 8 + 9 * k, "corp.example", None, None, "spoof%d.invalid" % k, "fail")
+              for k in range(6)]
+    reports = [T.rua_report(inp / "corp-example.xml", "corp.example", "quarantine", [
+                   ("192.0.2.10", 4000, "corp.example", "corp.example", "pass", "corp.example", "pass")] + spoofs,
+                   begin=T.BEGIN - 20 * T.DAY, end=T.BEGIN),
+               T.rua_report(inp / "corp-uk.xml", "corp.co.uk", "none", [
+                   ("192.0.2.40", 700, "corp.co.uk", "corp.co.uk", "pass", "corp.co.uk", "pass")],
+                   begin=T.BEGIN - 20 * T.DAY, end=T.BEGIN)]
+    docs = weekly_docs(week)
+    rep = T.audited(tmp_path / ("week%d" % week), docs, weekly_log(week), reports, flows=weekly_flows(),
+                    sources={d: ["tenant"] for d in docs})
+    rep["findings"] = audit.flatten_findings(rep)
+    rep["maillog"]["cuts"] = {
+        "corp.example": {"reason": "row budget", "kept_hours": 241 if week >= 2 else 256,
+                         "kept_from": "2026-09-28T13:00:00Z"},
+        "corp-brand.example": {"reason": "row budget", "kept_hours": 627, "kept_from": "2026-09-13T03:00:00Z"}}
+    rep["maillog"]["window_totals"] = {"hours": 720, "orgs": {
+        "corp.example": {"source": "Advanced Hunting aggregate", "by_domain": {
+            "corp.example": {"logical_messages": 900, "genuine_failures": 202, "delivered_despite_fail": 172},
+            "events.corp.example": {"logical_messages": 30, "genuine_failures": 30, "delivered_despite_fail": 30},
+            "mkt.corp.example": {"logical_messages": 30, "genuine_failures": 30, "delivered_despite_fail": 30},
+            "news.corp.example": {"logical_messages": 60, "genuine_failures": 60, "delivered_despite_fail": 60}}},
+        "corp-brand.example": {"source": "Advanced Hunting aggregate", "by_domain": {
+            "corp-brand.example": {"logical_messages": 90, "genuine_failures": 0, "delivered_despite_fail": 0},
+            "shop.corp-brand.example": {"logical_messages": 180, "genuine_failures": 180,
+                                        "delivered_despite_fail": 180}}}}}
+    if week >= 2:
+        rep["generated_utc"] = "2026-10-14T06:00:00Z"
+    return rep, docs
+
+
+def weekly(tmp_path):
+    """The weekly review's week 2 end to end, with week 1 as the previous run (the delta collect.py writes):
+    {"report", "plan", "inventory", "doc", "previous", "owners_path"}. The owners file names five owners."""
+    previous, _ = weekly_week(tmp_path, 1)
+    rep, docs = weekly_week(tmp_path, 2)
+    rep["delta"] = audit.build_delta(rep, previous)
+    hosts = {d: (org_of(d), WS_HOSTS[org_of(d)]) for d in docs}
+    inventory = inventory_of(hosts, weekly_flows())
+    plan = plan_mod.build_plan(rep, inventory, WS_RUA)
+    owners_path = tmp_path / "owners.csv"
+    owners_path.write_text(WS_OWNERS, encoding="utf-8")
+    doc = next_steps.build(rep, plan=plan, owners=next_steps.read_owners(owners_path), owners_path=str(owners_path),
+                           date="2026-10-14")
+    return {"report": rep, "plan": plan, "inventory": inventory, "doc": doc, "previous": previous,
+            "owners_path": owners_path}
+
+
+def org_of(name):
+    return plan_mod.org_domain(name)

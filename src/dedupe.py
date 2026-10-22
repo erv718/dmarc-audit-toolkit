@@ -539,18 +539,24 @@ def summarize(verdicts):
     their verdict; relayed_only_passed the ones among them a copy of which
     passed, and relayed_only_echo the ones that are also echoes (a failing
     copy beside the passing one): whether those arrived is a question for
-    message trace, which a reader must not mistake for an all-clear."""
+    message trace, which a reader must not mistake for an all-clear.
+    relayed_only_passed_by_domain and _by_sender say whose mail the passing
+    ones are (From domain, From address; the most first), so a reader knows
+    whose message trace to run."""
     vs = list(verdicts.values())
     by_likely = Counter(v["likely"] for v in vs if v["genuine_failure"])
     by_override = Counter(v["delivered_by"] for v in vs if v["delivered_despite_fail"] and v.get("delivered_by"))
+    relayed = [v for v in vs if v["relayed_only"] and v.get("passed")]
     out = {
         "logical_messages": len(vs),
         "multi_leg": sum(1 for v in vs if v["legs"] > 1),
         "genuine_failures": sum(1 for v in vs if v["genuine_failure"]),
         "echo_messages": sum(1 for v in vs if v["echo_present"]),
         "relayed_only": sum(1 for v in vs if v["relayed_only"]),
-        "relayed_only_passed": sum(1 for v in vs if v["relayed_only"] and v.get("passed")),
+        "relayed_only_passed": len(relayed),
         "relayed_only_echo": sum(1 for v in vs if v["relayed_only"] and v["echo_present"]),
+        "relayed_only_passed_by_domain": _most_first(Counter(v.get("domain") or "?" for v in relayed)),
+        "relayed_only_passed_by_sender": _most_first(Counter(v.get("sender") or "?" for v in relayed)),
         "delivered_despite_fail": sum(1 for v in vs if v["delivered_despite_fail"]),
     }
     if by_override or any("delivered_by" in v for v in vs):
@@ -561,6 +567,11 @@ def summarize(verdicts):
         "alignment": alignment_summary(vs),
     })
     return out
+
+
+def _most_first(counter):
+    """{key: count}, the most first, a tie by key: a counter as report.json carries it, the same bytes every run."""
+    return dict(sorted(counter.items(), key=lambda kv: (-kv[1], str(kv[0]))))
 
 
 def _dominant(counter):

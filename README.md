@@ -237,8 +237,11 @@ not posted):"; otherwise the run says `summary.txt written (not posted: ...)`
 and why, never the text unlabeled). After every note it ends with a few plain
 lines: `done: <M> domains in <N> organizations audited - exit <code>: <what
 it means>`, the status band's headline and its most critical organizations,
-what changed since the last run, what the data cannot show, the run folder,
-and `Open first: .../latest/brief.html` with the other files beside it.
+your call (`Your call: approve P-08, P-10 (ready now, no mail impact); ...`:
+the plan ids that can go out now, then how many wait and on what), what
+changed since the last run, what the data cannot show (old evidence always
+among it), the run folder, and `Open first: .../latest/brief.html` with the
+other files beside it.
 
 Exit codes: 0 clean, 1 at least one major or blocking finding, 2 a usage or
 setup error. A brand-new rollout will exit 1 for weeks; that is the findings
@@ -254,10 +257,14 @@ Read them in this order, all under `audit-out/latest/`:
    band, "This week (the 45-second read)": one headline, whether we are
    protected (each domain's policy counted), the most critical finding per
    organization - worst first, at most five, each with the one thing to do
-   first - your call on the plan's records, what changed since the last run,
-   and what this data cannot show (always: bounces and lost mail, which only
-   message trace sees). The same block leads `brief.html`, the run's last
-   lines and the Slack summary (`next_steps.json` `top`). Then where the
+   first - your call on the plan's records (the ones ready now by id, each
+   with its host name in its zone; the ones that wait, grouped by what they
+   wait on, with their ids; the plan holds by domain), what changed since the
+   last run, and what this data cannot show (always: bounces and lost mail,
+   which only message trace sees). The block stays within 300 words: past
+   that it sheds its least needed detail first. The same block leads
+   `brief.html`, the run's last lines and the Slack summary (`next_steps.json`
+   `top`). Then where the
    rollout stands, with the status in one paragraph under The next step,
    deduplicated failure counts with the raw number alongside,
    what is failing by envelope domain and by sender, a per-domain table
@@ -277,8 +284,9 @@ Read them in this order, all under `audit-out/latest/`:
    `next_steps.md` and the Slack summary name. Decide the holds first, then the
    priority-1 DNS rows (the zero-risk monitoring and hygiene rows, and a
    "quarantine now" row once its checks are confirmed), then the senders to
-   fix DKIM-first, then tenant configuration, then the gated enforcement
-   steps with their prerequisites.
+   fix DKIM-first, then tenant configuration, then the enforcement steps,
+   each with its status (the gate says not yet, or after its checks) and its
+   prerequisites.
    Every line says which file holds the evidence.
 3. **`report.md`**: the gate verdict per domain (`go`, `no_go`, or
    `insufficient_data` when a zero would only mean "no data"), each finding
@@ -556,13 +564,17 @@ weeks of local history even though the API still only shows 30 days, and
 one message. Its first line is the date and the status band's headline
 (`*DMARC <date>* - Partly: 2 of 9 domains block spoofed mail. ...`), then one
 line per most critical organization (its badge and what is wrong, in plain
-words), what changed since the last run, what the data cannot show and where
-the full brief is. Under "Details:" come the per-domain lines - policy, gate
-and next step (the plan's first row for it, as `next_steps.md` and `todo.md`
-name it; a policy the run could not read says why - no DMARC record, lookup
-failed, not read) - for the domains the band does not lead with that have
-failures of their own or a change since the last run, and for every domain
-of a cut organization; the others are counted on one line. Then
+words, with the envelope domain a failing sender came in through), your call
+(the plan ids ready now, and how many wait), what changed since the last run,
+what the data cannot show and where the full brief is. Under "Details:" come
+one line per cut organization (the floor its rows kept and what was counted
+over the full window) and the per-domain lines - policy, gate and next step
+(the plan's first row for it, as `next_steps.md` and `todo.md` name it; a
+policy the run could not read says why - no DMARC record, lookup failed, not
+read) - for the domains the band does not lead with that have failures of
+their own or a change since the last run; the others are counted on one line.
+`python src/notify.py --report audit-out/latest/report.json --dry-run` reads
+the `plan.json` beside the report unless `--plan` names another. Then
 deduplicated failure counts next to
 the raw ones (with the overrides that let failing mail in, when the mail log
 recorded them), the worst failing senders from the census, spoofing blocked by

@@ -770,17 +770,22 @@ def truncation_note(ml):
     return None
 
 
-def full_window(report):
+def full_window(report, only=None):
     """What collect.py counted in advanced hunting over the whole window for
     the organizations whose rows its row budget or the API cap cut
     (maillog.window_totals), added up over their From domains: {"orgs",
     "hours", "span", "genuine_failures", "delivered_despite_fail"}; None
-    when the report carries none. Beside the floor, never instead of it."""
+    when the report carries none. only: these organizations alone (a clause
+    that names some of them counts theirs, never another's). Beside the
+    floor, never instead of it."""
     ml = report.get("maillog") if isinstance(report.get("maillog"), dict) else {}
     wt = ml.get("window_totals") if isinstance(ml.get("window_totals"), dict) else {}
     orgs = wt.get("orgs") if isinstance(wt.get("orgs"), dict) else {}
+    wanted = None if only is None else {_dom(o) for o in only}
     names, gf, ddf = [], 0, 0
     for org, info in sorted(orgs.items()):
+        if wanted is not None and _dom(org) not in wanted:
+            continue
         bd = info.get("by_domain") if isinstance(info, dict) else None
         if not isinstance(bd, dict):
             continue
@@ -2961,69 +2966,143 @@ def _date_of(value):
         return None
 
 
-def top_gaps(report, headline=None):
+def _full_clause(doc, orgs):
+    """' (<n> genuine failures over the full window)' for these organizations' share of what collect.py counted
+    over the whole window (full_window), '' when it counted none of them."""
+    full = full_window(doc, orgs)
+    if not full:
+        return ""
+    n = full["genuine_failures"]
+    return " (%d genuine %s over the full window)" % (n, _plural(n, "failure"))
+
+
+def relayed_whose(ml, n):
+    """(rich, plain) words for the n messages that passed but went only to
+    an on-premises or external hop, by whose mail they are (the mail log's
+    counters relayed_only_passed_by_domain and _by_sender): the busiest From
+    domain ('36 example.com messages', or '36 messages, 30 of them as
+    example.com'), and in the rich words the sender most of them came from
+    ('all from hr@example.com'); (None, None) when the counters do not say."""
+    counters = audit._dict(audit._dict(ml).get("counters"))
+    def top(key):
+        rows = [(str(k), _n(v)) for k, v in audit._dict(counters.get(key)).items() if str(k) and (_n(v) or 0) > 0]
+        return sorted(rows, key=lambda kv: (-kv[1], kv[0]))[0] if rows else (None, 0)
+    dom, kd = top("relayed_only_passed_by_domain")
+    if not dom or not n:
+        return None, None
+    whole = kd >= n
+    subject = ("%d %s %s" % (n, dom, _plural(n, "message"))) if whole else "%d %s" % (n, _plural(n, "message"))
+    clauses = [] if whole else ["%d of them as %s" % (kd, dom)]
+    sender, ks = top("relayed_only_passed_by_sender")
+    said = clauses + (["%s from %s" % ("all" if ks >= n else "most", sender)] if sender and ks * 2 > n else [])
+    tail = " passed but went only to an on-premises or external hop: check message trace"
+
+    def words(cl):
+        return subject + "".join(", " + c for c in cl) + ("," if cl else "") + tail
+    return words(said), words(clauses)
+
+
+def top_gaps(report, headline=None, short=0):
     """What this run's data cannot show, in plain words, for the status
     band (top.gaps, top.evidence_through, top.stale; spec 3.9): {"gaps",
-    "evidence_through", "stale", "data_gaps"}. The data gaps, in this order:
-    no DNS read (an offline run); each organization whose mail log was not
-    pulled; the organizations the row budget cut, in one clause with the
-    hours kept (and the full window's failures when collect.py counted
-    them); no mail log; no aggregate reports; evidence older than
-    STALE_DAYS days before the run; messages that passed but went only to
-    an on-premises or external hop (relayed_gap: maillog.counters.
+    "evidence_through", "stale", "data_gaps", "gaps_plain"}. The data gaps,
+    in this order: no DNS read (an offline run); each organization whose
+    mail log was not pulled (with what collect.py counted for it over the
+    full window, when it did); the organizations the row budget cut, in one
+    clause with the hours kept (and their own share of the full window's
+    failures, when collect.py counted them); the ones only the API row cap
+    cut, the same way; no mail log; no aggregate reports; evidence older
+    than STALE_DAYS days before the run; messages that passed but went only
+    to an on-premises or external hop (relayed_gap: maillog.counters.
     relayed_only_passed, or relayed_only in an older report, which then
-    never says they passed). gaps holds the first GAPS_SHOWN of them, how
-    many more there are, and last, always, SCOPE_GAP. evidence_through:
-    the newest of the mail log's last stamp and the aggregate reports' end
-    date; stale: the days it lies before the run when that is more than
-    STALE_DAYS, else None. Deterministic: the report's own dates only,
-    never the clock. The status band (top) takes gaps, evidence_through
-    and stale from here as they are."""
+    never says they passed - and whose mail they are, relayed_whose). gaps
+    holds the first GAPS_SHOWN of them, the others named in a few words,
+    and last, always, SCOPE_GAP; gaps_plain the terminal's and Slack's: the
+    first data gap, old evidence whenever it is old, and the scope line
+    (no address). short (the band past its word budget): 1 the row
+    budget's clause without its hours, 2 the cut clauses without the full
+    window's figure too (Where we stand gives it), 3 a failed pull's
+    clause as the fact alone. evidence_through: the newest of the mail
+    log's last stamp and the aggregate reports' end date; stale: the days
+    it lies before the run when that is more than STALE_DAYS, else None.
+    Deterministic: the report's own dates only, never the clock. The status
+    band (top) takes gaps, evidence_through and stale from here as they
+    are."""
     doc = audit._dict(report)
     ml = doc.get("maillog") if isinstance(doc.get("maillog"), dict) else None
     rua = doc.get("rua") if isinstance(doc.get("rua"), dict) else None
-    data = []
+    data = []  # (rich, plain, the few words an overflow names it by)
+
+    def gap(rich, plain_words=None, named=None):
+        data.append((rich, plain_words or rich, named or rich))
     if not doc.get("dns"):
-        data.append("offline run: DNS not read, so policies come from the aggregate reports or are unknown")
+        gap("offline run: DNS not read, so policies come from the aggregate reports or are unknown",
+            named="DNS not read")
     cuts = audit.maillog_cuts(doc)
     ordered = sorted(cuts.items(), key=lambda kv: (audit.domain_key(kv[0], headline), kv[0]))
     for org, info in ordered:
         if audit._dict(info).get("reason") == "not pulled":
-            data.append("mail log for %s not read this run (its pull failed): its senders are not checked" % org)
+            full = None if short >= 2 else full_window(doc, [org])
+            counted = (" (%d genuine %s over the full window, counted in advanced hunting)" % (
+                full["genuine_failures"], _plural(full["genuine_failures"], "failure"))) if full else ""
+            if short >= 3:  # the band's last level: the fact alone
+                gap("%s's mail log not read this run (its pull failed)" % org, named="%s's mail log not read" % org)
+            else:
+                gap("mail log for %s not read this run (its pull failed): its senders are not checked%s" % (
+                    org, counted), named="%s's mail log not read" % org)
     kept = [(org, info["kept_hours"]) for org, info in ordered
             if isinstance(audit._dict(info).get("kept_hours"), int) and not isinstance(info["kept_hours"], bool)
             and info["kept_hours"] > 0]
     if kept:
+        names = [org for org, _ in kept]
         hours = list(dict.fromkeys(h for _, h in kept))
-        text = "%s: the row budget kept only the newest %s hours, so %s counts are floors" % (
-            audit._names([org for org, _ in kept], len(kept)), audit._names([str(h) for h in hours], len(hours)),
-            "its" if len(kept) == 1 else "their")
-        full = full_window(doc)
-        if full:
-            text += " (%d genuine %s over the full window)" % (full["genuine_failures"],
-                                                             _plural(full["genuine_failures"], "failure"))
-        data.append(text)
+        their = "its" if len(kept) == 1 else "their"
+        if short:
+            text = "%s: the row budget cut %s mail %s, so %s counts are floors" % (
+                audit._names(names, len(names)), their, _plural(len(kept), "log"), their)
+        else:
+            text = "%s: the row budget kept only the newest %s hours, so %s counts are floors" % (
+                audit._names(names, len(names)), audit._names([str(h) for h in hours], len(hours)), their)
+        gap(text + ("" if short >= 2 else _full_clause(doc, names)),
+            named="%s counts are floors" % audit._names(names, 3))
+    capped = [(org, audit._cut_hours_capped(info)) for org, info in ordered
+              if audit._dict(info).get("reason") == "api cap" and audit._cut_hours_capped(info)]
+    if capped:  # an hour that hit the API row cap keeps only the rows the cap let through: a floor too
+        names = [org for org, _ in capped]
+        hours = sum(len(h) for _, h in capped)
+        their = "its" if len(capped) == 1 else "their"
+        gap("%s: the API row cap cut %d %s of %s mail %s, so %s counts are floors%s" % (
+            audit._names(names, len(names)), hours, _plural(hours, "hour"), their, _plural(len(capped), "log"), their,
+            "" if short >= 2 else _full_clause(doc, names)), named="%s counts are floors" % audit._names(names, 3))
     if ml is None:
-        data.append("no mail log: our own senders are not checked")
+        gap("no mail log: our own senders are not checked", named="no mail log")
     if rua is None:
-        data.append("no aggregate reports: what outside receivers see is not in this run")
+        gap("no aggregate reports: what outside receivers see is not in this run", named="no aggregate reports")
     window = ml.get("window") if ml and isinstance(ml.get("window"), dict) else {}
     totals = rua.get("totals") if rua and isinstance(rua.get("totals"), dict) else {}
     dates = [d for d in (_date_of(window.get("to")), _date_of(totals.get("end_date"))) if d]
     newest = max(dates) if dates else None
     ran = _date_of(doc.get("generated_utc"))
     stale = (ran - newest).days if newest and ran and (ran - newest).days > STALE_DAYS else None
+    stale_gap = None
     if stale:
-        data.append("the newest evidence is from %s, %d days before this run" % (newest.isoformat(), stale))
+        stale_gap = "the newest evidence is from %s, %d days before this run" % (newest.isoformat(), stale)
+        gap(stale_gap, named="evidence %d days old" % stale)
     relayed, words = relayed_gap(relayed_counts(ml))
     if relayed > 0:
-        data.append(words % (relayed, _plural(relayed, "message")))
-    gaps = data[:GAPS_SHOWN]
-    if len(data) > GAPS_SHOWN:
-        gaps.append("(+%d more under Where we stand)" % (len(data) - GAPS_SHOWN))
+        rich, plain_words = relayed_whose(ml, relayed) if words == RELAYED_GAP else (None, None)
+        text = words % (relayed, _plural(relayed, "message"))
+        gap(rich or text, plain_words or text,
+            named="%d %s only to an outside hop" % (relayed, _plural(relayed, "message")))
+    gaps = [g[0] for g in data[:GAPS_SHOWN]]
+    if len(data) > GAPS_SHOWN:  # the others named, so the count never points at a gap no line states
+        gaps.append("(+%d more: %s)" % (len(data) - GAPS_SHOWN, ", ".join(g[2] for g in data[GAPS_SHOWN:])))
     gaps.append(SCOPE_GAP)
+    plain_gaps = [g[1] for g in data[:1]]
+    if stale_gap and stale_gap not in plain_gaps:  # old evidence reaches the terminal and Slack whatever else is said
+        plain_gaps.append(stale_gap)
     return {"gaps": gaps, "evidence_through": newest.isoformat() if newest else None, "stale": stale,
-            "data_gaps": data}
+            "data_gaps": [g[0] for g in data], "gaps_plain": plain_gaps + [SCOPE_GAP_PLAIN]}
 
 
 # ------------------------------------------------------------------ the status band (top): the 45-second read
@@ -3056,6 +3135,9 @@ STATUS_SENTENCE = {"reject": "refuses spoofed mail (p=reject)",
                    "invalid": "has a record receivers cannot apply (%s), so no policy",
                    "error": "could not be looked up, so its policy is unknown",
                    "unread": "was not read (offline run, no DNS)"}
+# two DMARC records at one name (DMARC-005): receivers apply neither and send no reports - an invalid record
+TWO_RECORDS = "two DMARC records"
+TWO_RECORDS_SENTENCE = "has two DMARC records: receivers apply no policy"
 # Protected?'s parts, in this order, each (status, one, many)
 VERDICT_PARTS = (("partial", "enforces a share (pct below 100)", "enforce a share (pct below 100)"),
                  ("none", "only reports (p=none)", "only report (p=none)"),
@@ -3102,15 +3184,26 @@ UNKNOWN_ALL = "Unknown: this run read no DNS (offline), so it cannot say."
 REPORT_AUTH_RX = re.compile(r"^the external-destination record exists: .* only when (\S+) publishes ")
 
 
+def _dns_finding_ids(report, domain):
+    """The finding ids DNS raised on one name this run (report.dns[d].findings)."""
+    doc = audit._dict(audit._dict(report.get("dns")).get(domain))
+    found = doc.get("findings") if isinstance(doc.get("findings"), list) else []
+    return {str(f.get("id")) for f in found if isinstance(f, dict) and f.get("id")}
+
+
 def band_status(report, domain):
     """(status, detail) of one audited name (spec 3.2): reject or quarantine
     when the policy applies to all failing mail (pct absent or 100), partial
     when to a share, none, absent (DNS shows no record), invalid (a p=
-    receivers do not apply), error (the lookup failed) or unread (DNS not
-    read and no report names it). detail is what a sentence quotes: 'p=<p>,
-    pct=<n>' for partial, 'p=<value>' for invalid, else ''."""
+    receivers do not apply, or two DMARC records at the name - DMARC-005:
+    receivers then apply neither), error (the lookup failed) or unread (DNS
+    not read and no report names it). detail is what a sentence quotes:
+    'p=<p>, pct=<n>' for partial, 'p=<value>' or TWO_RECORDS for invalid,
+    else ''."""
     policy = current_policy(report, domain)
     why = policy_unread_why(report, domain)
+    if "DMARC-005" in _dns_finding_ids(report, domain):
+        return "invalid", TWO_RECORDS
     if why == "unrecognised" or (policy is not None and policy not in ("none", "quarantine", "reject")):
         return "invalid", "p=%s" % policy
     if policy is None:
@@ -3124,6 +3217,8 @@ def band_status(report, domain):
 
 
 def _status_sentence(status, detail):
+    if status == "invalid" and detail == TWO_RECORDS:
+        return TWO_RECORDS_SENTENCE
     words = STATUS_SENTENCE.get(status, STATUS_SENTENCE["unread"])
     return words % detail if "%s" in words else words
 
@@ -3231,11 +3326,11 @@ def _override_words(by):
 
 
 def short_step(change):
-    """A plan row as the band's short step: 'quarantine now', 'park it', 'publish a monitoring record', 'add
-    reporting (rua)', 'add our report address', else step_label's words."""
+    """A plan row as the band's short step: 'go straight to quarantine', 'park it', 'publish a monitoring record',
+    'add reporting (rua)', 'add our report address', else step_label's words."""
     kind = change.get("kind")
     if kind == "no_mail":
-        return "quarantine now"
+        return "go straight to quarantine"
     if kind == "park":
         return "park it"
     label = step_label(change)
@@ -3244,16 +3339,34 @@ def short_step(change):
 
 def _band_row(plan, members, lead):
     """The organization's next plan row (its lead's quarantine-now row, else the lead's first row in the plan's own
-    order, else the organization's first) and the ids of the rows that do the same (same domain and kind): (row,
-    ids), or (None, [])."""
+    order, else the organization's first) and the rows that do the same (same domain and short step: a park
+    pair stays together, a set sp= row is never named under a move to reject): (row, rows), or (None, [])."""
     rows = [c for c in plan_changes(plan) if _dom(c.get("domain")) in members]
     mine = sorted((c for c in rows if _dom(c.get("domain")) == lead), key=lambda c: c.get("kind") != "no_mail")
     first = mine[0] if mine else (sorted(rows, key=lambda c: c.get("kind") != "no_mail")[0] if rows else None)
     if first is None:
         return None, []
-    same = [c.get("id") for c in rows if c.get("id") and c.get("kind") == first.get("kind")
-            and _dom(c.get("domain")) == _dom(first.get("domain"))]
-    return first, same or ([first.get("id")] if first.get("id") else [])
+    step = short_step(first)
+    same = [c for c in rows if c.get("id") and _dom(c.get("domain")) == _dom(first.get("domain"))
+            and short_step(c) == step]
+    return first, same or ([first] if first.get("id") else [])
+
+
+def _step_parts(row, same, level=0):
+    """A strip line's next step as parts: '<short step> (<ids>) - <status>' when the rows share one status,
+    '<short step> - <id> <status>, <id> <status>' when they do not - each row's own status, never the first
+    one's for all of them."""
+    texts = [row_status(c)[1] for c in same]
+    ids = [c.get("id") for c in same]
+    if len(set(texts)) <= 1:
+        return [["text", short_step(row) + " ("]] + _id_parts(ids) + [["text", ") - %s" % (texts[0] if texts else
+                                                                                         row_status(row)[1])]]
+    out = [["text", short_step(row) + " - "]]
+    for k, (i, t) in enumerate(zip(ids, texts)):
+        if k:
+            out.append(["text", ", "])
+        out += [["id", i], ["text", " " + t]]
+    return out
 
 
 def _ids_text(ids, cap=3):
@@ -3310,10 +3423,23 @@ def _band_words(parts):
     return len([w for w in _parts_text([p for p in parts if p[0] != "subject"]).split() if w != "-"])
 
 
-def _org_line(o, plan, recorded, owner_of, head, policy_of, quiet, carried, checked, days, report):
-    """One organization's strip line: (finding_parts, finding_plain, action_label, action_parts, action_plain,
-    ids, flags), by its tier (spec 4.2 and 4.3)."""
+def _via(s):
+    """' (via <envelope>)' for the plain words of a line that names a failing sender: the domain it came in
+    through, when that is not its own From domain; '' otherwise."""
+    if s is None or not s.get("env") or s["env"] == s["sender"].rpartition("@")[2]:
+        return ""
+    return " (via %s)" % s["env"]
+
+
+def _org_line(o, plan, recorded, owner_of, head, policy_of, quiet, carried, checked, days, report, level=0):
+    """One organization's strip line: (finding_parts, finding_plain,
+    action_label, action_parts, action_plain, ids, flags), by its tier (spec
+    4.2 and 4.3). level 1 on (the band past its word budget): the owner and
+    the keep-the-override clauses go, for the lines after the second."""
     tier, floor = o["tier"], "at least " if o["floor"] else ""
+    short = level >= SHED["keep"] and o.get("rank", 0) > 2
+    owned = level < SHED["owner"]  # the owner of the first two lines goes last of a line's clauses
+    when = "" if level >= SHED["tails"] and o.get("rank", 0) > 2 else " before the policy moves"
     small = o["small_n"]
     ids, flags = [], []
     if o["floor"]:
@@ -3355,23 +3481,25 @@ def _org_line(o, plan, recorded, owner_of, head, policy_of, quiet, carried, chec
             verb = " and receivers %s them" % ("refuse" if o["verb"] == "reject" else "junk")
         where = (" " + OUTSIDE_ONLY) if o["mode"].startswith("rua") else ""
         fp = [["text", "%s%d of our own %s fail DMARC%s%s" % (floor, n, _plural(n, "message"), where, verb)]]
-        plain_f = fp[0][1]
+        s = o["sender"]
+        # the plain words name the way the failing mail came in, so a terminal or Slack reader knows which sender
+        plain_f = "%s%d of our own %s fail DMARC%s%s%s" % (floor, n, _plural(n, "message"), where, _via(s), verb)
         rest = o["count"] - n if tier == 3 else 0
         if rest > 0:
             fp.append(["text", "; %d more could be our own vendors" % rest])
             plain_f += "; %d more could be our own vendors" % rest
-        s = o["sender"]
         if s is not None:
             owner = owner_of.get(s["sender"])
             if tier == 2:
-                ap = [["text", "DKIM-sign "], ["addr", s["sender"]],
-                      ["text", " (owner: %s)" % (owner if owner and owner != UNASSIGNED else "no owner yet")]]
+                ap = [["text", "DKIM-sign "], ["addr", s["sender"]]]
+                if not short and owned:
+                    ap.append(["text", " (owner: %s)" % (owner if owner and owner != UNASSIGNED else "no owner yet")])
                 noun, k = _override_noun(s["by"])
-                if noun:
+                if noun and not short:
                     ap.append(["text", "; keep %s that lets %d in until it passes" % (noun, k)])
                 plain_a = "fix that sender (brief.html names it)"
             else:
-                ap = [["text", "DKIM-sign "], ["addr", s["sender"]], ["text", " before the policy moves"]]
+                ap = [["text", "DKIM-sign "], ["addr", s["sender"]]] + ([["text", when]] if when else [])
                 plain_a = "fix that sender before the policy moves"
         else:  # no census stream to name (the aggregate reports carry it, or an older report): What is failing does
             who = "the senders the aggregate reports show failing" if o["mode"].startswith("rua") else "the failing senders"
@@ -3379,13 +3507,13 @@ def _org_line(o, plan, recorded, owner_of, head, policy_of, quiet, carried, chec
                 ap = [["text", "fix %s (What is failing names them)" % who]]
                 plain_a = "fix the failing senders (brief.html names them)"
             else:
-                ap = [["text", "fix %s before the policy moves" % who]]
+                ap = [["text", "fix %s%s" % (who, when)]]
                 plain_a = "fix the failing senders before the policy moves"
     elif tier == 3:  # could be our own vendors: the weak-sign spoof labels and the unclear ones
         n = o["vendor_n"]
         fp = [["text", "%s%d failing %s could be our own vendors" % (floor, n, _plural(n, "message"))]]
-        plain_f = fp[0][1]
         s = o["sender"]
+        plain_f = fp[0][1] + _via(s)
         if s is not None:
             fp += [["text", " ("], ["addr", s["sender"]]]
             if s["env"]:
@@ -3394,9 +3522,9 @@ def _org_line(o, plan, recorded, owner_of, head, policy_of, quiet, carried, chec
         if o["own_open"] > 0:
             fp.append(["text", "; %d more of our own" % o["own_open"]])
             plain_f += "; %d more of our own" % o["own_open"]
-        ap = [["text", "confirm who sends them before any policy step"]]
+        ap = [["text", "confirm who sends them" + (" before any policy step" if when else "")]]
         noun = _override_noun(s["by"])[0] if s is not None else ""
-        if noun:
+        if noun and not short:
             ap[0][1] += "; keep %s until they pass" % noun
         plain_a = "confirm who sends them"
     if tier >= 4:
@@ -3412,6 +3540,8 @@ def _org_line(o, plan, recorded, owner_of, head, policy_of, quiet, carried, chec
                 text = "Anyone can send as it"
                 if quiet and not carried:
                     text += "; nothing sent or received in %s" % days
+            elif st == "invalid" and o.get("detail") == TWO_RECORDS:
+                text = "Receivers apply no policy: it has two DMARC records"
             elif st == "invalid":
                 text = "Receivers apply no policy: the record is not valid"
             elif st == "error":
@@ -3436,6 +3566,8 @@ def _org_line(o, plan, recorded, owner_of, head, policy_of, quiet, carried, chec
             text += "; small failures only (%d, under %d)" % (small, HEADLINE_MIN)
         if small:
             flags.append("small")
+        if o.get("rua_seen"):  # the mail log speaks for the tier; what outside receivers saw failing is said beside it
+            text += "; %d failing %s" % (o["rua_seen"], OUTSIDE_ONLY)
         if carried and o["no_rows"] and o["off_tenant"]:
             text += " " + OFF_TENANT
         fp = [["text", text]]
@@ -3443,14 +3575,15 @@ def _org_line(o, plan, recorded, owner_of, head, policy_of, quiet, carried, chec
         if plan is None:
             step = "no plan this run"
         else:
-            row, rids = _band_row(plan, o["names"], o["lead"])
+            row, same = _band_row(plan, o["names"], o["lead"])
             if row is None:
-                step = "nothing to do"
+                # no row to publish: a plan hold on one of its names is what the reader decides first
+                held = [h for h in holds_for(plan) if _dom(h.get("domain")) in o["names"]]
+                step = ("settle the hold - %s" % hold_words(held[0].get("reason"))) if held else "nothing to do"
             else:
-                ids = rids
+                ids = [c.get("id") for c in same]
                 step = None
-                ap = [["text", short_step(row) + " ("]] + _id_parts(rids) + [
-                    ["text", ") - %s" % row_status(row)[1]]]
+                ap = _step_parts(row, same)
                 plain_a = _parts_text(ap)
         if not ap:
             ap = [["text", step]]
@@ -3508,30 +3641,153 @@ def _check_key(change):
 
 CHECK_GROUP_WORDS = {"report": "one report-authorization record at %s", "unused": "the domain's unused check",
                      "lookup": "a lookup of the name's own record", "own": "their own checks"}
+# the groups of rows after a check, in the order the call names them whatever their sizes: one check that clears a
+# whole group first (one report-authorization record at another organization, the domain's unused check, a lookup
+# of the name's own record), then the rows' own checks, then the steps past monitoring (priority 2 on) - so the one
+# record that unblocks several rows is never folded into "their own checks"
+GROUP_ORDER = ("report", "unused", "lookup", "own", "steps")
+NOW_NAMED = 8  # rows ready now the call names, each with its host name, before it counts the rest
+EMPTY_PLAN_CALL = "Nothing needs you this week: the plan has no rows."
+HOLD_CUT = 60  # characters of a plan hold's reason a band line quotes; the whole one is in plan.md
+# the plan holds on the records an organization's sending subdomains need of their own, as a band line names them
+SUBDOMAIN_HOLD_WORDS = {"sp": "sending subdomains need records of their own before sp= moves",
+                        "follow": "sending subdomains need records of their own before p=reject"}
+
+
+def relative_host(change, zone=None):
+    """A plan row's host name as a DNS console's name box wants it: relative
+    to its zone (zone, else the row's own: '_dmarc.alerts' in corp.example),
+    '@' for the zone's own name; the full name when there is no zone or the
+    host is not under it."""
+    host, zone = _dom(change.get("hostname")), _dom(zone or change.get("zone"))
+    if not host or not zone:
+        return host
+    if host == zone:
+        return "@"
+    return host[:-len(zone) - 1] if host.endswith("." + zone) else host
+
+
+def id_runs(ids):
+    """Plan ids in the order given, as runs of consecutive ones (the same
+    prefix, each number one more than the one before): [[ids of a run]]. An
+    id of any other shape is a run of its own."""
+    runs, last = [], None
+    for i in (str(x) for x in ids if x):
+        m = re.match(r"^([A-Za-z]+-)(\d+)$", i)
+        key = (m.group(1), int(m.group(2))) if m else None
+        if key and last and key[0] == last[0] and key[1] == last[1] + 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+        last = key
+    return runs
+
+
+def _run_parts(ids, cap=None):
+    """Plan ids as parts, as the call lists a group: a run of three or more
+    consecutive ids as one range ('P-01 to P-05'), the others one by one,
+    ', ' between them; past cap items (a range is one), ' and <k> more' with
+    k the ids not named - only when that is shorter than naming them all
+    (four or five items read faster whole than as three and a count)."""
+    ids = [str(i) for i in ids if i]
+    items = []
+    for run in id_runs(ids):
+        items += [run] if len(run) >= 3 else [[i] for i in run]
+    if cap is not None and len(items) <= cap + 3:
+        cap = None
+    out, said = [], 0
+    for k, item in enumerate(items):
+        if cap is not None and k >= cap:
+            break
+        if k:
+            out.append(["text", ", "])
+        out.append(["id", item[0]])
+        if len(item) > 1:
+            out += [["text", " to "], ["id", item[-1]]]
+        said += len(item)
+    if said < len(ids):
+        out.append(["text", " and %d more" % (len(ids) - said)])
+    return out
+
+
+def _name_parts(names, cap=3):
+    """Domain names as parts ('name'), 'a, b and c', past cap ' and <k> more'."""
+    names = [n for n in names if n]
+    shown = names[:cap]
+    out = []
+    for k, n in enumerate(shown):
+        if k:
+            out.append(["text", " and " if k == len(shown) - 1 and len(names) <= cap else ", "])
+        out.append(["name", n])
+    if len(names) > cap:
+        out.append(["text", " and %d more" % (len(names) - cap)])
+    return out
+
+
+def hold_words(reason):
+    """A plan hold as a band line names it, in a few words: the holds on the
+    records an organization's sending subdomains need of their own
+    (SUBDOMAIN_HOLD_WORDS), any other hold's first clause (what follows its
+    ' - ' is why), cut at HOLD_CUT characters at a word."""
+    text = str(reason or "")
+    if SP_HOLD.match(text):
+        return SUBDOMAIN_HOLD_WORDS["sp"]
+    if FOLLOW_P_HOLD.match(text):
+        return SUBDOMAIN_HOLD_WORDS["follow"]
+    return cut_subject(plain(text.split(" - ", 1)[0]).rstrip(" .;:"), HOLD_CUT)
+
+
+def step_words(rows):
+    """The rows past monitoring a call counts apart, by what they are: policy steps (priority 3 on), DKIM steps
+    (priority 2), or both."""
+    prios = {_n(c.get("priority")) for c in rows}
+    kind = ("policy" if all(p is not None and p >= 3 for p in prios) else "DKIM" if prios == {2} else
+            "policy and DKIM")
+    return "%s %s" % (kind, _plural(len(rows), "step"))
 
 
 def plan_parts(plan):
-    """The plan's rows by what each waits on, as the call and the ask list them (spec 3.7, T-11): now (ready now and
-    no mail impact: a priority-1 record that is no quarantine-now row), ready (any other row ready now), groups (the
-    rows after a check, by their first open check, the largest first - a tie: the group whose first row comes first
-    in the plan), host (their DNS host to find first), later (held, gated, or after another change to the same
-    record), address (carrying the placeholder report address) and holds. Each list holds plan ids in the plan's
-    order. None with no plan."""
+    """The plan's rows by what each waits on, as the call and the ask list
+    them (spec 3.7, T-11): now (ready now and no mail impact: a priority-1
+    record that is no quarantine-now row), ready (any other row ready now),
+    groups (the rows after a check: the priority-1 ones by their first open
+    check, in GROUP_ORDER - one report-authorization record at another
+    organization, the domain's unused check, a lookup of the name's own
+    record, then their own checks - the largest first within a kind and a
+    tie the group whose first row comes first in the plan; then the steps
+    past monitoring, priority 2 on, as one group), host (their DNS host to
+    find first), later (held, gated, or after another change to the same
+    record), address (carrying the placeholder report address), holds (how
+    many) and hold_list (each one's domain and what it decides, hold_words).
+    Each list holds plan ids in the plan's order; hosts maps each id to its
+    host name, zones to its zone and names to its host name relative to
+    that zone (relative_host). None with no plan."""
     if not isinstance(plan, dict):
         return None
+    holds = holds_for(plan)
     out = {"now": [], "ready": [], "groups": [], "host": [], "later": [], "address": [], "quiet": [],
-           "holds": len(holds_for(plan)), "hosts": {}}
-    groups = OrderedDict()
+           "holds": len(holds), "hold_list": [{"domain": _dom(h.get("domain")), "words": hold_words(h.get("reason"))}
+                                              for h in holds],
+           "hosts": {}, "zones": {}, "names": {}, "rows": 0}
+    groups, steps = OrderedDict(), []
     for c in plan_changes(plan):
         rid = c.get("id")
         if not rid:
             continue
+        out["rows"] += 1
+        zone = _dom(c.get("zone"))
         out["hosts"][rid] = str(c.get("hostname") or "")
+        out["zones"][rid] = zone
+        out["names"][rid] = relative_host(c, zone)
         status = row_status(c)[0]
+        priority = _n(c.get("priority"))
         if status == "now":
-            (out["now"] if _n(c.get("priority")) == 1 and c.get("kind") != "no_mail" else out["ready"]).append(rid)
+            (out["now"] if priority == 1 and c.get("kind") != "no_mail" else out["ready"]).append(rid)
         elif status == "check":
-            groups.setdefault(_check_key(c), []).append(rid)
+            if priority is not None and priority >= 2:
+                steps.append(c)
+            else:
+                groups.setdefault(_check_key(c), []).append(rid)
             if c.get("kind") == "no_mail":
                 out["quiet"].append(rid)
         elif status == "host":
@@ -3541,57 +3797,156 @@ def plan_parts(plan):
         else:
             out["later"].append(rid)
     order = list(groups)
-    ranked = sorted(order, key=lambda k: (-len(groups[k]), order.index(k)))
+    ranked = sorted(order, key=lambda k: (GROUP_ORDER.index(k[0]), -len(groups[k]), order.index(k)))
     out["groups"] = [{"key": k[0], "at": k[1], "words": CHECK_GROUP_WORDS[k[0]] % k[1] if k[1] else
                       CHECK_GROUP_WORDS[k[0]], "ids": groups[k]} for k in ranked]
+    if steps:
+        out["groups"].append({"key": "steps", "at": "", "words": step_words(steps), "ids": [c["id"] for c in steps]})
     return out
 
 
-def _call(plan, pp, report, tail=""):
-    """Your call (spec 3.7): {"text", "plain", "parts", "now", "groups", "host", "later", "holds", "address",
-    "words"} - words is the headline's call words (spec 3.10). tail (window_words) ends it when the plan holds
-    rows to decide on; with no plan there is nothing to approve, and no window to name."""
+def _ids_cap(key, level):
+    """How many items of a group's ids the call names at a level of detail
+    (call_level): None every one, 3 the first three, 0 none. The rows ready
+    now and the groups one check clears keep their ids longest; the rows
+    that are not for this week lose theirs first."""
+    cap_at, drop_at = {"own": (SHED["own_ids"], 99), "steps": (SHED["far_ids"], SHED["far_ids"]),
+                       "host": (SHED["far_ids"], SHED["far_ids"]), "later": (SHED["later_ids"], SHED["later_ids"])}.get(
+        key, (SHED["hosts"], 99))
+    if level >= drop_at:
+        return 0
+    return 3 if level >= cap_at else None
+
+
+def _now_parts(pp, level):
+    """The call's rows ready now with no mail impact: how many, then each id
+    with its host name as its zone's console wants it (relative_host), zone by
+    zone - at most NOW_NAMED, the rest counted; from level 5 on the ids
+    alone."""
+    ids = pp["now"]
+    n = len(ids)
+    out = [["text", "approve %d DNS %s with no mail impact - ready now" % (n, _plural(n, "record"))]]
+    if level >= SHED["hosts"]:
+        return out + [["text", " ("]] + _run_parts(ids, NOW_NAMED) + [["text", ")"]]
+    named = ids[:NOW_NAMED]
+    zones = OrderedDict()
+    for i in named:
+        zones.setdefault(pp["zones"].get(i) or "", []).append(i)
+    for k, (zone, zids) in enumerate(zones.items()):
+        if zone:
+            out += [["text", " in " if not k else ", and in "], ["name", zone], ["text", ": "]]
+        else:
+            out.append(["text", ": " if not k else ", and "])
+        for j, i in enumerate(zids):
+            if j:
+                out.append(["text", ", "])
+            out += [["id", i], ["text", " "], ["host", pp["names"].get(i) or pp["hosts"].get(i) or "?"]]
+    if n > len(named):
+        out.append(["text", " and %d more" % (n - len(named))])
+    return out
+
+
+def _call_plain(pp, tail=""):
+    """Your call in plain words, for the terminal and Slack (no address, no
+    subject): the ids ready now, then how many wait on checks, need their
+    DNS host or are not for this week, and the holds by domain."""
+    parts = []
+    if pp["now"]:
+        named = pp["now"][:NOW_NAMED]
+        more = len(pp["now"]) - len(named)
+        parts.append("approve %s%s (ready now, no mail impact)" % (", ".join(named),
+                                                                 (" and %d more" % more) if more else ""))
+    elif not pp["ready"]:
+        parts.append("nothing to approve yet")
+    if pp["ready"]:
+        n = len(pp["ready"])
+        parts.append("%d %sready now (%s)" % (n, "more " if pp["now"] else "", ", ".join(pp["ready"][:NOW_NAMED])))
+    checks = sum(len(g["ids"]) for g in pp["groups"])
+    if checks:
+        parts.append("%d %s on checks" % (checks, _plural(checks, "waits", "wait")))
+    if pp["host"]:
+        n = len(pp["host"])
+        parts.append("%d %s %s DNS host found first" % (n, _plural(n, "needs", "need"), _plural(n, "its", "their")))
+    if pp["later"]:
+        parts.append("%d not this week" % len(pp["later"]))
+    if pp["holds"]:
+        doms = list(dict.fromkeys(h["domain"] for h in pp["hold_list"] if h["domain"]))
+        parts.append("decide %d plan %s%s" % (pp["holds"], _plural(pp["holds"], "hold"),
+                                             (" (%s)" % audit._names(doms, 3)) if doms else ""))
+    return "; ".join(parts) + tail
+
+
+def _call(plan, pp, report, tail="", level=0):
+    """Your call (spec 3.7): {"text", "plain", "parts", "now", "groups",
+    "host", "later", "holds", "address", "words"} - words is the headline's
+    call words (spec 3.10), plain the call in plain words (_call_plain).
+    The rows ready now are named each with its host name; every group that
+    waits names its ids, runs as ranges, in GROUP_ORDER; the holds name
+    their domains, and one hold what it decides. level (0 to 5): past the
+    band's word budget the least actionable groups name fewer ids
+    (_ids_cap), one hold's reason and the host names go last. tail
+    (window_words) ends it when the plan holds rows to decide on; with no
+    plan, or a plan with no row and no hold, there is nothing to decide and
+    no window to name."""
     tail = tail or ""
     if pp is None:
         text = NO_PLAN_CALL if not report.get("dns") else NO_PLAN_BUILT
-        return {"text": text, "plain": text, "parts": [["text", text]], "now": [], "groups": [], "host": 0, "later": 0,
-                "holds": 0, "address": False, "words": "nothing to approve (no plan this run)"}
+        return {"text": text, "plain": text[0].lower() + text[1:-1], "parts": [["text", text]], "now": [],
+                "groups": [], "host": 0, "later": 0, "holds": 0, "address": False,
+                "words": "nothing to approve (no plan this run)"}
     base = {"now": list(pp["now"]), "groups": [{"words": g["words"], "ids": list(g["ids"])} for g in pp["groups"]],
             "host": len(pp["host"]), "later": len(pp["later"]), "holds": pp["holds"], "address": bool(pp["address"])}
+    if not pp["rows"] and not pp["holds"]:
+        return dict(base, text=EMPTY_PLAN_CALL, plain=EMPTY_PLAN_CALL[0].lower() + EMPTY_PLAN_CALL[1:-1],
+                    parts=[["text", EMPTY_PLAN_CALL]], words="nothing needs you this week")
     if pp["address"]:
         n = len(pp["address"])
         text = CALL_ADDRESS % (n, "records carry" if n != 1 else "record carries")
         text = text[:-1] + tail + "."
-        return dict(base, text=text, plain=text, parts=[["text", text]], words="choose where DMARC reports go first")
+        carry = "records carry" if n != 1 else "record carries"
+        return dict(base, text=text, plain="choose where DMARC reports go first: until then %d %s a placeholder and "
+                                           "none is ready%s" % (n, carry, tail),
+                    parts=[["text", text]], words="choose where DMARC reports go first")
+    checks = sum(len(g["ids"]) for g in pp["groups"])
     parts = []
     if pp["now"]:
-        n = len(pp["now"])
-        parts.append([["text", "approve %d DNS %s with no mail impact (" % (n, _plural(n, "record"))]]
-                     + _id_parts(pp["now"]) + [["text", ") - ready now"]])
-    else:
-        parts.append([["text", "nothing can go out unchecked"]])
+        parts.append(_now_parts(pp, level))
+    elif not pp["ready"]:
+        parts.append([["text", "nothing can go out unchecked" if checks else "nothing can go out this week"]])
     if pp["ready"]:
         n = len(pp["ready"])
-        parts.append([["text", "%d more ready now (" % n]] + _id_parts(pp["ready"]) + [["text", ")"]])
-    checks = [g for g in pp["groups"]]
-    if checks:
-        top = checks[0]
-        n = len(top["ids"])
-        parts.append([["text", "%d after %s (" % (n, top["words"])]] + _id_parts(top["ids"]) + [["text", ")"]])
-        rest = sum(len(g["ids"]) for g in checks[1:])
-        if rest and top["at"] == "" and top["words"] == CHECK_GROUP_WORDS["own"]:
-            # the largest group is the rows' own checks already: the rest by what they wait on, never 'own' twice
-            parts.append([["text", "%d after %s" % (rest, checks[1]["words"] if len(checks) == 2 else "other checks")]])
-        elif rest:
-            parts.append([["text", "%d after their own checks" % rest]])
+        parts.append([["text", "%d %sready now (" % (n, "more " if pp["now"] else "")]]
+                     + _run_parts(pp["ready"], _ids_cap("ready", level)) + [["text", ")"]])
+    lists = [(g["key"], ("%d %s after their checks" % (len(g["ids"]), g["words"])) if g["key"] == "steps" else
+              "%d after %s" % (len(g["ids"]), g["words"]), g["ids"]) for g in pp["groups"]]
     if pp["host"]:
         n = len(pp["host"])
-        parts.append([["text", "%d %s %s DNS host found first" % (n, _plural(n, "needs", "need"),
-                                                                 _plural(n, "its", "their"))]])
+        lists.append(("host", "%d %s %s DNS host found first" % (n, _plural(n, "needs", "need"),
+                                                                 _plural(n, "its", "their")), pp["host"]))
     if pp["later"]:
-        parts.append([["text", "%d not this week" % len(pp["later"])]])
+        lists.append(("later", "%d not this week" % len(pp["later"]), pp["later"]))
+    if level >= SHED["merge"]:  # the rows that wait longest, counted together: past monitoring, no DNS host, later
+        far = [x for x in lists if x[0] in ("steps", "host", "later")]
+        if len(far) > 1:
+            n = sum(len(x[2]) for x in far)
+            lists = [x for x in lists if x[0] not in ("steps", "host", "later")] + [
+                ("later", "%d more not ready this week" % n, [i for x in far for i in x[2]])]
+    for key, words, ids in lists:
+        cap = _ids_cap(key, level)
+        parts.append([["text", words]] + (([["text", " ("]] + _run_parts(ids, cap) + [["text", ")"]]) if cap != 0
+                                          else []))
     if pp["holds"]:
-        parts.append([["text", "decide %d plan %s" % (pp["holds"], _plural(pp["holds"], "hold"))]])
+        hl = pp["hold_list"]
+        doms = list(dict.fromkeys(h["domain"] for h in hl if h["domain"]))
+        head = [["text", "decide %d plan %s" % (pp["holds"], _plural(pp["holds"], "hold"))]]
+        if len(hl) <= 2 and all(h["domain"] and h["words"] for h in hl) and level < SHED["hold_why"]:
+            head.append(["text", " ("])  # one or two holds: each with what it decides
+            for k, h in enumerate(hl):
+                head += [["text", ", and " if k else ""], ["name", h["domain"]], ["text", ": %s" % h["words"]]]
+            head.append(["text", ")"])
+        elif doms:
+            head += [["text", " ("]] + _name_parts(doms) + [["text", ")"]]
+        parts.append(head)
     flat = []
     for k, p in enumerate(parts):
         if k:
@@ -3600,21 +3955,43 @@ def _call(plan, pp, report, tail=""):
     flat = _cap_first(flat)
     flat.append(["text", tail + "."])
     text = _parts_text(flat)
-    n_now, n_check = len(pp["now"]) + len(pp["ready"]), sum(len(g["ids"]) for g in pp["groups"])
+    n_now = len(pp["now"]) + len(pp["ready"])
     if n_now:
         words = "approve %d DNS %s" % (n_now, _plural(n_now, "record"))
-    elif n_check:
-        words = "%d DNS %s %s on a check" % (n_check, _plural(n_check, "record"), _plural(n_check, "waits", "wait"))
+    elif checks:  # nothing can be approved yet: said first, so the words never read as an ask
+        words = "nothing to approve yet - %d DNS %s %s on %s" % (
+            checks, _plural(checks, "record"), _plural(checks, "waits", "wait"), _plural(checks, "a check", "checks"))
     elif pp["host"]:  # nothing to approve, but someone has to find where a zone is hosted
         n = len(pp["host"])
         words = "find the DNS host of %d %s" % (n, _plural(n, "record"))
     else:
         words = "nothing needs you this week"
-    return dict(base, text=text, plain=text, parts=flat, words=words)
+    return dict(base, text=text, plain=_call_plain(pp, tail), parts=flat, words=words)
 
 
-def _delta_parts(report, head, rich=True, new_identities=None):
-    """Since last run's parts (spec 3.8), each a (kind, text) pair, and the lists behind them."""
+def resolved_words(f, rich=True):
+    """A finding the previous run had and this one does not, as Since last
+    run names it: the domain it was on (its source, 'dns:<domain>'), its
+    title up to the first ' - ' (what follows is why) - quoted in the rich
+    words, so it never reads as a live problem - and its id:
+    'harborfoods.example: "DMARC has no rua" (DMARC-003)'. A title that is
+    only its id says the id once."""
+    raw = str(f.get("title") or "").strip()
+    fid = str(f.get("id") or "").strip()
+    src = str(f.get("source") or "")
+    dom = _dom(src.split(":", 1)[1]) if src.startswith("dns:") else ""
+    title = "" if not raw or raw == fid else plain(raw.split(" - ", 1)[0]).rstrip(" .;:")
+    said = ('"%s"' % title if rich else title) if title else ""
+    if said and fid:
+        said += " (%s)" % fid
+    said = said or fid or plain(raw)
+    return ("%s: %s" % (dom, said)) if dom else said
+
+
+def _delta_parts(report, head, rich=True, new_identities=None, short=0):
+    """Since last run's parts (spec 3.8), each a (kind, text) pair, and the lists behind them. short (the band past
+    its word budget, 1 to 3): the comparison a cut withheld says no cause (the band's Not in this data says it),
+    from 2 on names no organization, and at 3 a sender a cut may have missed is 'maybe new'."""
     dl = report.get("delta") if isinstance(report.get("delta"), dict) else {}
     out, data = [], {"worse": [], "better": [], "fixed": [], "new": [], "records": [], "withheld": None}
     byd = audit._dict(dl.get("by_domain"))
@@ -3640,19 +4017,29 @@ def _delta_parts(report, head, rich=True, new_identities=None):
             doms = list(dict.fromkeys(s["domain"] or s["sender"].rpartition("@")[2] for s in data["fixed"]))
             out.append(("fixed", "fixed - " + audit._names(["%s %s sender no longer fails" % (
                 "an" if d[:1] in "aeiou" else "a", d) for d in doms], 3)))
-    new = []
-    for s in dl.get("new_senders") if isinstance(dl.get("new_senders"), list) else []:
-        if not isinstance(s, dict):
-            continue
-        n = (_n(s.get("genuine_failures")) or 0) - (_n(s.get("excepted")) or 0)
-        if n > 0:
-            new.append({"sender": str(s.get("sender") or "?").lower(), "domain": _dom(s.get("domain")),
-                        "envelope": _dom(s.get("envelope_domain")), "count": n})
-    merged = OrderedDict()
-    for s in new:  # one entry per address, as every list of senders counts one
-        m = merged.setdefault(s["sender"], dict(s, count=0))
-        m["count"] += s["count"]
-    new = sorted(merged.values(), key=lambda s: audit.sender_rank(s["sender"], s["count"], head))
+    def failing_new(rows):
+        """The failing senders of a list of new senders, one entry per address (as every list of senders counts
+        one), the busiest first."""
+        found = []
+        for s in rows if isinstance(rows, list) else []:
+            if not isinstance(s, dict):
+                continue
+            n = (_n(s.get("genuine_failures")) or 0) - (_n(s.get("excepted")) or 0)
+            if n > 0:
+                found.append({"sender": str(s.get("sender") or "?").lower(), "domain": _dom(s.get("domain")),
+                              "envelope": _dom(s.get("envelope_domain")), "count": n})
+        merged = OrderedDict()
+        for s in found:
+            m = merged.setdefault(s["sender"], dict(s, count=0))
+            m["count"] += s["count"]
+        return sorted(merged.values(), key=lambda s: audit.sender_rank(s["sender"], s["count"], head))
+
+    def plain_sender(s):
+        """'a corp.co.uk sender', and the envelope it came through when that is not its From domain."""
+        dom = s["domain"] or s["sender"].rpartition("@")[2]
+        env = s["envelope"] if s["envelope"] and s["envelope"] != dom else ""
+        return "%s %s sender%s" % ("an" if dom[:1] in "aeiou" else "a", dom, (" via %s" % env) if env else "")
+    new = failing_new(dl.get("new_senders"))
     rua = audit._dict(report.get("rua"))
     counts = audit.from_counts(rua)
     fresh = []
@@ -3670,14 +4057,23 @@ def _delta_parts(report, head, rich=True, new_identities=None):
         if rich:
             named = ["%s x%d" % (s["sender"], s["count"]) for s in new]
         else:
-            named = ["%s via %s x%d" % (s["domain"] or s["sender"].rpartition("@")[2], s["envelope"] or "?", s["count"])
-                     for s in new]
+            named = ["%s x%d" % (plain_sender(s), s["count"]) for s in new]
         named += ["%s as %s x%d" % (f["ip"], f["as"] or "?", f["count"]) for f in fresh]
         out.append(("new", "new - " + audit._names(named, 3)))
+    # a failing sender first seen under an organization the previous run's row budget cut: new, or only missed by
+    # that cut - said so, never left out (the week's busiest new sender can be one)
+    maybe = failing_new(dl.get("new_senders_held"))
+    if maybe:
+        data["new_or_missed"] = maybe
+        named = ["%s x%d" % (s["sender"] if rich else plain_sender(s), s["count"]) for s in maybe]
+        out.append(("new", ("maybe new - " if short >= 3 else "new (or missed by the last run's cut) - ")
+                    + audit._names(named, 3)))
     pol = audit._dict(dl.get("policy_changes"))
     recs = []
     for d in audit.order_domains(list(pol), head):
-        p = audit._dict(pol.get(d))
+        p = pol.get(d)
+        if not isinstance(p, dict) or not (p.get("from") or p.get("to")):  # a damaged entry reads as absent
+            continue
         recs.append("%s %s -> %s" % (d, ("p=%s" % p["from"]) if p.get("from") else "no policy read",
                                       ("p=%s" % p["to"]) if p.get("to") else "no policy read"))
     for d, ch in sorted(audit._dict(dl.get("record_changes")).items(), key=lambda kv: audit.domain_key(kv[0], head)):
@@ -3689,8 +4085,8 @@ def _delta_parts(report, head, rich=True, new_identities=None):
     resolved = [f for f in (dl.get("findings_resolved") if isinstance(dl.get("findings_resolved"), list) else [])
                 if isinstance(f, dict) and str(f.get("title") or "").strip()]
     if resolved:
-        titles = list(dict.fromkeys(plain(str(f["title"]).strip()) for f in resolved))
-        out.append(("resolved", "resolved - " + audit._names(titles, 2)))
+        said = list(dict.fromkeys(resolved_words(f, rich) for f in resolved))
+        out.append(("resolved", "resolved - " + audit._names(said, 2)))
     mw = audit._dict(dl.get("maillog_window"))
     if mw.get("comparable") is False:
         cut = audit._dict(mw.get("cut_orgs"))
@@ -3707,7 +4103,9 @@ def _delta_parts(report, head, rich=True, new_identities=None):
                 why = "%s cut %s" % (cause or "a cut", which)
             else:
                 why = "their mail logs were cut in one run or both"
-            data["withheld"] = "failure counts for %s not compared (%s)" % (audit._names(orgs, 3), why)
+            data["withheld"] = ("the cut organizations' counts not compared" if short >= 2 else
+                                "failure counts for %s not compared%s" % (audit._names(orgs, 3),
+                                                                         "" if short else " (%s)" % why))
         elif mw.get("orgs_not_shared"):
             data["withheld"] = "failure counts not compared (%s)" % _orgs_reason(mw["orgs_not_shared"], head)
         elif mw.get("log_comparable") is False:
@@ -3718,8 +4116,10 @@ def _delta_parts(report, head, rich=True, new_identities=None):
     return out, data
 
 
-def _changed(report, head, trend, new_identities=None):
-    """Since last run (spec 3.8): {"text", "plain", "since", worse, better, fixed, new, records, withheld}."""
+def _changed(report, head, trend, new_identities=None, short=0):
+    """Since last run (spec 3.8): {"text", "plain", "since", worse, better,
+    fixed, new, records, withheld}. plain is what changed in plain words,
+    without the date: since_line_plain says the previous run's date once."""
     dl = report.get("delta") if isinstance(report.get("delta"), dict) else None
     if dl is None:
         if not isinstance(trend, dict) or not trend.get("label"):
@@ -3732,17 +4132,17 @@ def _changed(report, head, trend, new_identities=None):
                 else ("failure counts not compared (%s)" % why.replace("failure counts are not compared: ", "")
                       if why else "this run carries no comparison of failures, findings or records"))
         label = since or str(trend["label"])
-        return {"text": "Since %s: %s." % (label, body), "plain": "since %s: %s" % (label, body), "since": since,
+        return {"text": "Since %s: %s." % (label, body), "plain": body, "since": since,
                 "worse": [], "better": [], "fixed": [], "new": [], "records": [], "withheld": None}
     since = _day(dl.get("previous_generated_utc"))
-    rich, data = _delta_parts(report, head, True, new_identities)
-    flat, _ = _delta_parts(report, head, False, new_identities)
+    rich, data = _delta_parts(report, head, True, new_identities, short)
+    flat, _ = _delta_parts(report, head, False, new_identities, short)
     label = since or "the previous run"
     if not rich:
         text = "Since %s: no change in failures, findings or records." % label
-        return dict(data, text=text, plain="since %s: no change in failures, findings or records" % label, since=since)
+        return dict(data, text=text, plain="no change in failures, findings or records", since=since)
     return dict(data, text="Since %s: %s." % (label, "; ".join(t for _, t in rich)),
-                plain="since %s: %s" % (label, "; ".join(t for _, t in flat)), since=since)
+                plain="; ".join(t for _, t in flat), since=since)
 
 
 def build_top(report, plan, parts, new_identities=None, call_tail=""):
@@ -3812,7 +4212,7 @@ def build_top(report, plan, parts, new_identities=None, call_tail=""):
         no_rows = not any(_rows_of(bd, d) for d in members)
         mode = None
         rua_enf = rua_open = 0
-        if no_rows and rua:
+        if rua:  # what outside receivers saw failing that looks like ours: the tier's count when the log has no rows
             for fs in rua.get("failing_streams") if isinstance(rua.get("failing_streams"), list) else []:
                 if not isinstance(fs, dict) or _likely(fs.get("likely")) == SPOOF or \
                         str(fs.get("source_ip")) in excepted_ips:
@@ -3842,7 +4242,7 @@ def build_top(report, plan, parts, new_identities=None, call_tail=""):
                                               lambda s: s["own"] + s["unclear"], head)), None)
             top_name = sorted(enf, key=lambda d: (-own_enf_by[d], audit.domain_key(d, head)))[0]
             verb = policy_of(top_name)
-        elif rua_enf > 0:
+        elif no_rows and rua_enf > 0:
             tier, count, mode = 2, rua_enf, "rua_enf"
             verb = next((policy_of(d) for d in enf), "quarantine")
         elif small_n >= HEADLINE_MIN:
@@ -3858,7 +4258,7 @@ def build_top(report, plan, parts, new_identities=None, call_tail=""):
                     s["home"] in opn or status[s["home"]][0] in ("quarantine", "partial"))], lambda s: s["spoof"], head)
                 sender = next(iter(weak or _merge_senders([s for s in mine if s["home"] in opn],
                                                           lambda s: s["unclear"], head)), None)
-        elif rua_open >= HEADLINE_MIN:
+        elif no_rows and rua_open >= HEADLINE_MIN:
             tier, count, mode = 3, rua_open, "rua_open"
         elif strong_n > 0 and st not in ENFORCING:
             tier, count, mode = 4, strong_n, "strong"
@@ -3885,20 +4285,26 @@ def build_top(report, plan, parts, new_identities=None, call_tail=""):
         carried = any(org_domain(_dom(h)) == org for h in carried_froms)
         out_n = [_n(audit._dict(flows.get(d)).get("outbound")) for d in members if isinstance(flows.get(d), dict)]
         off_tenant = bool(out_n) and not any(out_n) and not quiet
-        o = {"org": org, "lead": lead, "names": list(members), "status": st, "tier": tier, "count": count,
-             "mode": mode, "sender": sender, "verb": verb, "urgent": urgent, "own_open": own_open,
+        o = {"org": org, "lead": lead, "names": list(members), "status": st, "detail": status[lead][1], "tier": tier,
+             "count": count, "mode": mode, "sender": sender, "verb": verb, "urgent": urgent, "own_open": own_open,
              "vendor_n": unclear_open + weak_open + weak_q, "strong_n": strong_n, "weak_end": weak_end,
              "stopped": strong_enf + weak_end, "small_n": small_n if 0 < small_n < HEADLINE_MIN and tier >= 4 else 0,
-             "floor": cut.get("reason") == "row budget" and bool(cut.get("kept_hours")) and tier <= 4,
-             "no_rows": no_rows, "off_tenant": off_tenant, "below": below}
+             # any cut but a pull that failed leaves the rows kept a floor: the row budget, an hour at the API cap
+             "floor": bool(cut) and cut.get("reason") != "not pulled" and tier <= 4,
+             # with rows of its own in the log, the mail log speaks for the tier; what outside receivers saw
+             # failing that looks like ours is said beside it, never left out
+             "rua_seen": 0 if no_rows else rua_enf + rua_open,
+             "no_rows": no_rows, "off_tenant": off_tenant, "below": below, "quiet": quiet, "carried": carried}
         if mode in ("rua_enf", "rua_open"):
             o["floor"] = False
-        fp, f_plain, label, ap, a_plain, ids, flags = _org_line(
-            o, plan, recorded, owner_of, head, policy_of, quiet, carried, checked, days, report)
         badge = URGENT_BADGE if tier == 1 else BADGES.get(st, BADGES["unread"])
-        orgs.append(dict(o, badge=badge[0], pill=badge[1], finding_parts=fp, finding_plain=f_plain,
-                         action_label=label, action_parts=ap, action_plain=a_plain, ids=ids, flags=flags))
-    orgs.sort(key=lambda o: (o["tier"], -o["count"], audit.domain_key(o["org"], head), o["org"]))
+        orgs.append(dict(o, badge=badge[0], pill=badge[1]))
+    # worst first: the tier, the count, and within the unprotected tier the weakest status first (so the headline's
+    # worst and the first line agree), then the one domain order
+    orgs.sort(key=lambda o: (o["tier"], -o["count"], -STATUS_RANK.get(o["status"], 0) if o["tier"] == 6 else 0,
+                             audit.domain_key(o["org"], head), o["org"]))
+    for rank, o in enumerate(orgs, 1):
+        o["rank"] = rank
     shown, rest = orgs[:TOP_SHOW], orgs[TOP_SHOW:]
     more = None
     if rest:
@@ -3910,10 +4316,18 @@ def build_top(report, plan, parts, new_identities=None, call_tail=""):
                 "text": "+%d more %s (%s) - Per domain lists them" % (
                     len(rest), _plural(len(rest), "organization"), ", ".join("%d %s" % (n, w) for w, n in by_tier.items()))}
     pp = plan_parts(plan)
-    call = _call(plan, pp, report, call_tail)
     stand = audit._dict(parts.get("stand"))
     trend = dict(stand["trend"], now=stand.get("genuine_failures")) if isinstance(stand.get("trend"), dict) else None
     changed = _changed(report, head, trend, new_identities)
+
+    def lines_of(o, level):
+        fp, f_plain, label, ap, a_plain, ids, flags = _org_line(
+            o, plan, recorded, owner_of, head, policy_of, o["quiet"], o["carried"], checked, days, report, level)
+        o.update(finding_parts=fp, finding_plain=f_plain, action_label=label, action_parts=ap, action_plain=a_plain,
+                 ids=ids, flags=flags)
+    for o in shown:
+        lines_of(o, 0)
+    call = _call(plan, pp, report, call_tail)
     gaps = top_gaps(report, head)
     # the headline (spec 3.10): the verdict word, how many names block spoofed mail, the worst line, the call
     n_names, p_names = len(names), counts.get("reject", 0) + counts.get("quarantine", 0)
@@ -3937,16 +4351,17 @@ def build_top(report, plan, parts, new_identities=None, call_tail=""):
         worst = "Worst: our own mail is being %s on %s" % ("refused" if first["verb"] == "reject" else "junked",
                                                            first["org"])
     elif first is not None and first["tier"] == 3:
-        worst = "Worst: %s - %s" % (first["org"], first["finding_plain"].split(";")[0])
+        # the finding without the envelope the plain line names: the headline stays the count and what it is
+        worst = "Worst: %s - %s" % (first["org"], re.sub(r" \(via [^)]*\)", "", first["finding_plain"].split(";")[0]))
     elif first is not None and first["tier"] == 4:
         worst = "Worst: spoofing as %s goes unblocked" % first["org"]
     elif first is not None and first["tier"] == 5:
         worst = "Worst: %s's mail log was not read" % first["org"]
     elif first is not None and first["tier"] == 6:
-        weak = Counter(status[d][0] for d in names if status[d][0] not in ENFORCING)
-        order = ("absent", "none", "invalid", "error", "unread")
-        kind = sorted(weak, key=lambda k: (-weak[k], order.index(k) if k in order else len(order)))[0]
-        k = weak[kind]
+        # the first line's status (the weakest of the unprotected), counted over every name that has it: the
+        # headline's worst is the strip's first line
+        kind = first["status"]
+        k = sum(1 for d in names if status[d][0] == kind)
         said = {"absent": ("has no DMARC record", "have no DMARC record"), "none": ("only reports", "only report"),
                 "invalid": ("has an invalid record", "have an invalid record"),
                 "error": ("failed its lookup", "failed their lookup"), "unread": ("was not read", "were not read")}
@@ -3958,22 +4373,66 @@ def build_top(report, plan, parts, new_identities=None, call_tail=""):
                                                                             call["words"])
     if len(headline.split()) > HEADLINE_WORDS and first is not None and first["tier"] == 1:
         headline = "%s: %s. Urgent: spoofed mail reached inboxes. Your call: %s." % (vword, lead_words, call["words"])
-    domains = []
-    for rank, o in enumerate(shown, 1):
-        domains.append({"rank": rank, "org": o["org"], "lead": o["lead"], "names": o["names"], "status": o["status"],
-                        "badge": o["badge"], "pill": o["pill"], "tier": o["tier"], "count": o["count"],
-                        "below": o["below"], "finding_parts": o["finding_parts"], "action_label": o["action_label"],
-                        "action_parts": o["action_parts"], "finding_plain": o["finding_plain"],
-                        "action_plain": o["action_plain"], "ids": o["ids"], "flags": o["flags"]})
-    top = {"version": TOP_VERSION, "headline": headline, "orgs": len(groups),
-           "evidence_through": gaps["evidence_through"], "stale": gaps["stale"],
-           "protected": {"word": word, "text": ptext, "total": len(names), "protected": p_names,
-                         "counts": {k: counts[k] for k in STATUS_RANK if counts.get(k)}, "source": source},
-           "domains": domains, "more": more, "call": call, "changed": changed, "gaps": gaps["gaps"],
-           "data_gaps": gaps["data_gaps"]}
-    top["lines_md"] = top_lines_md(top)
-    top["lines_plain"] = top_lines_plain(top)
+
+    def assemble(call, gaps, changed, more):
+        domains = []
+        for rank, o in enumerate(shown, 1):
+            domains.append({"rank": rank, "org": o["org"], "lead": o["lead"], "names": o["names"],
+                            "status": o["status"], "badge": o["badge"], "pill": o["pill"], "tier": o["tier"],
+                            "count": o["count"], "below": o["below"], "finding_parts": o["finding_parts"],
+                            "action_label": o["action_label"], "action_parts": o["action_parts"],
+                            "finding_plain": o["finding_plain"], "action_plain": o["action_plain"], "ids": o["ids"],
+                            "flags": o["flags"]})
+        top = {"version": TOP_VERSION, "headline": headline, "orgs": len(groups),
+               "evidence_through": gaps["evidence_through"], "stale": gaps["stale"],
+               "protected": {"word": word, "text": ptext, "total": len(names), "protected": p_names,
+                             "counts": {k: counts[k] for k in STATUS_RANK if counts.get(k)}, "source": source},
+               "domains": domains, "more": more, "call": call, "changed": changed, "gaps": gaps["gaps"],
+               "data_gaps": gaps["data_gaps"], "gaps_plain": gaps["gaps_plain"]}
+        top["lines_md"] = top_lines_md(top)
+        top["lines_plain"] = top_lines_plain(top)
+        return top
+    top = assemble(call, gaps, changed, more)
+    top["level"] = 0
+    # past the band's word budget, the detail goes in a fixed order, least needed first (SHED, BAND_LEVELS)
+    for level in range(1, BAND_LEVELS + 1):
+        if band_words(top) <= BAND_WORDS:
+            break
+        for o in shown:
+            lines_of(o, level)
+        brevity = (3 if level >= SHED["terse"] else 2 if level >= SHED["cut_names"] else
+                   1 if level >= SHED["cause"] else 0)
+        if level >= SHED["terse"]:  # the names below a line counted, never qualified
+            for o in shown:
+                if o["below"]:
+                    o["below"] = dict(o["below"], words=o["below"]["words"].split(" that ")[0])
+        top = assemble(_call(plan, pp, report, call_tail, level),
+                       top_gaps(report, head, 3 if level >= SHED["terse"] else 2 if level >= SHED["full"] else
+                                1 if level >= SHED["hours"] else 0),
+                       _changed(report, head, trend, new_identities, brevity) if brevity else changed,
+                       dict(more, text=more["text"].split(" - ")[0]) if more and level >= SHED["rollup"] else more)
+        top["level"] = level
     return top
+
+
+BAND_WORDS = 300  # the band's words at most past its headline (lines_md): a 75-second read at four words a second
+BAND_LEVELS = 9  # how many times the band sheds detail to stay within BAND_WORDS (build_top, _call, _org_line)
+# what the band sheds past BAND_WORDS, and at which level, least needed first: the owner and keep-the-override
+# clauses of the lines after the second and the hours of the cut clause; the ids of the rows that are not for this
+# week; the ids of the steps past monitoring and of the rows whose DNS host is unknown; the "before the policy
+# moves" of the lines after the second and the cause of a comparison a cut withheld (Not in this data says it);
+# all but three ids of the rows after their own checks and what the one plan hold decides; the rows that wait
+# longest, counted together; the owner of the first two lines, the cut organizations' names in Since (Not in
+# this data names them), the roll-up's pointer to Per domain and the cut clause's full-window figure (Where we
+# stand gives it); then the host names of the rows ready now; and last, past even that, the words that qualify
+# the names below a line, a failed pull's clause beyond the fact and "new (or missed ...)" as "maybe new"
+SHED = {"keep": 1, "hours": 1, "later_ids": 2, "far_ids": 3, "tails": 4, "cause": 4, "own_ids": 5, "hold_why": 5,
+        "merge": 6, "owner": 7, "cut_names": 7, "rollup": 7, "full": 7, "hosts": 8, "terse": 9}
+
+
+def band_words(top):
+    """The band's length past its headline: the words of next_steps.md's This week lines."""
+    return sum(len(str(line).split()) for line in top.get("lines_md") or [])
 
 
 def strip_line_md(e):
@@ -4000,18 +4459,33 @@ def top_lines_md(top):
     return L
 
 
+def call_line_plain(call):
+    """'Your call: approve P-08, P-10 (ready now, no mail impact); ...' - the call in plain words, one line."""
+    text = str(audit._dict(call).get("plain") or "").strip().rstrip(".")
+    return "Your call: %s." % (text or "not in this run")
+
+
+def since_line_plain(changed):
+    """'Since last run (2026-10-21): worse - ...' - what changed in plain words, the previous run's date once."""
+    changed = audit._dict(changed)
+    body = str(changed.get("plain") or "").strip().rstrip(".") or "not in this run"
+    since = _day(changed.get("since"))
+    return ("Since last run (%s): %s." % (since, body)) if since else "Since last run: %s." % body
+
+
 def top_lines_plain(top):
     """The band in plain words, for the terminal: the headline, one line per organization (no address, no subject),
-    the roll-up, what changed, what is not in this data."""
+    the roll-up, the call, what changed, what is not in this data."""
     L = [top["headline"]]
     for e in top.get("domains") or []:
         L.append("  %d. %s - %s: %s" % (e["rank"], e["org"], e["badge"], e["finding_plain"]))
     if top.get("more"):
         L.append("  (+%d more %s: Per domain lists them)" % (top["more"]["count"],
                                                             _plural(top["more"]["count"], "organization")))
-    L.append("Since last run: %s." % top["changed"]["plain"])
-    first = (top.get("data_gaps") or [])[:1]
-    L.append("Not in this data: %s" % "; ".join(first + [SCOPE_GAP_PLAIN]))
+    L.append(call_line_plain(top.get("call")))
+    L.append(since_line_plain(top.get("changed")))
+    L.append("Not in this data: %s" % "; ".join(top.get("gaps_plain") or ((top.get("data_gaps") or [])[:1]
+                                                                          + [SCOPE_GAP_PLAIN])))
     return L
 
 
@@ -4355,7 +4829,32 @@ def gate_words(report, domain, verdict, step="", first=()):
     shared = audit._dict(report.get("gate")).get("shared_blockers")
     shared = {str(b) for b in shared} if isinstance(shared, list) else set()
     own = [str(b) for b in first or () if b] or [b for b in blockers if b not in shared] or blockers
-    return ("%s - held by: %s" % (word, cut_subject(plain(own[0]), HELD_BY_CUT))) if own else word
+    return ("%s - held by: %s" % (word, cut_subject(held_words(report, domain, own[0]), HELD_BY_CUT))) if own else word
+
+
+# a DNS finding that holds a gate, in the words a Gate cell names it by (its title is a shout, or only its id)
+FINDING_WORDS = {"DMARC-001": "no DMARC record", "DMARC-003": "no rua on the DMARC record",
+                 "DMARC-005": "two DMARC records", "DMARC-006": "the DMARC lookup failed",
+                 "SPF-002": "the SPF lookup failed"}
+
+
+def held_words(report, domain, blocker):
+    """A gate blocker as a Gate cell names it: a DNS finding (its bare id,
+    or its title) as what it is, then its id - 'no DMARC record
+    (DMARC-001)', never a bare '(DMARC-001)' with no cause a reader can act
+    on; any other blocker in plain words."""
+    text = re.sub(r"^%s: " % re.escape(domain), "", str(blocker or "").strip()) if domain else str(blocker or "")
+    doc = audit._dict(audit._dict(report.get("dns")).get(domain))
+    found = [f for f in (doc.get("findings") if isinstance(doc.get("findings"), list) else []) if isinstance(f, dict)]
+    fid = text if re.fullmatch(r"[A-Z]+-\d{3}", text) else next(
+        (str(f.get("id")) for f in found if f.get("id") and str(f.get("title") or "").strip() == text), "")
+    if not fid:
+        return plain(text)
+    title = next((str(f.get("title") or "").strip() for f in found if str(f.get("id")) == fid), "")
+    words = title.split(" - ", 1)[0].strip() if title and title != fid else ""
+    if not words or words.isupper():  # a shout ('NO DMARC RECORD') or no title: the fixed words for it
+        words = FINDING_WORDS.get(fid, words.lower())
+    return "%s (%s)" % (words, fid) if words else fid
 
 
 def plan_step(plan, domain, note=None):
@@ -5127,6 +5626,9 @@ def ask_parts(plan, settings=None):
     rows = [c for c in plan_changes(plan) if c.get("id")]
     status = {c["id"]: row_status(c) for c in rows}
     p1 = [c for c in rows if _n(c.get("priority")) == 1]
+    # the steps past monitoring that wait on their checks (a policy step the gate allows, a DKIM task): asked for as
+    # a group of their own, so the ask counts every row the band's call counts
+    steps = [c for c in rows if (_n(c.get("priority")) or 0) >= 2 and status[c["id"]][0] == "check"]
     groups = OrderedDict()
     for c in p1:
         if status[c["id"]][0] == "check" and c.get("kind") != "no_mail":
@@ -5147,6 +5649,7 @@ def ask_parts(plan, settings=None):
                                  and not any(str(p).startswith("verified unused") for p in prereqs_of(c))],
                         "lookups": [c["id"] for c in groups[k] if looks_first(c)]} for k in ranked],
             "quiet": [c["id"] for c in p1 if status[c["id"]][0] in ("check", "now") and c.get("kind") == "no_mail"],
+            "steps": [c["id"] for c in steps], "steps_words": step_words(steps) if steps else "",
             "host": [c["id"] for c in p1 if status[c["id"]][0] == "host"],
             "later": [{"words": w, "ids": ids} for w, ids in later.items()],
             "holds": [{"domain": _dom(h.get("domain")), "text": _hold_summary(h.get("reason"))}
@@ -5203,7 +5706,7 @@ def _step_clause(ap, nxt, org, listed, level):
     which = "the step after that" if listed else "the next step"
     if _needs_data(nxt):  # the gate cannot judge the step yet: the ask is the evidence, never a go-ahead
         return "more data before %s on %s (%s): %s" % (which, org, nxt["label"], nxt["data"][0])
-    asked = set(ap["address"]) | set(ap["now"]) | set(ap["quiet"]) | set(ap["host"]) | {
+    asked = set(ap["address"]) | set(ap["now"]) | set(ap["quiet"]) | set(ap["host"]) | set(ap.get("steps") or ()) | {
         i for g in ap["groups"] for i in g["ids"]}
     if nxt.get("ref") in asked:
         return None  # a park, monitoring or quarantine-now row of the org's own: asked with its rows above
@@ -5241,10 +5744,11 @@ def ask_text(ap, org, nxt, level=0):
                         " in the next DNS change window" if level < 4 else ""))
     groups = ap["groups"]
     quiet = ap["quiet"]
+    steps = list(ap.get("steps") or [])
     if level >= 5:  # the last level: every row after a check beside the largest group counted, the quiet ones too
-        rest = [i for g in groups[1:] for i in g["ids"]] + list(quiet)
+        rest = [i for g in groups[1:] for i in g["ids"]] + list(quiet) + steps
         groups = groups[:1] + ([{"key": "rest", "at": "", "ids": rest, "park": [], "lookups": []}] if rest else [])
-        quiet = []
+        quiet, steps = [], []
     elif level >= 2 and len(groups) > 2:
         rest = [i for g in groups[1:] for i in g["ids"]]
         groups = groups[:1] + [{"key": "other" if groups[0]["key"] == "own" else "own", "at": "", "ids": rest,
@@ -5270,6 +5774,11 @@ def ask_text(ap, org, nxt, level=0):
                 n, "domain that sends" if n == 1 else "domains that send", _plan_ids(quiet, level),
                 ("the checks listed with %s are confirmed" % ("it" if n == 1 else "each")) if level < 2
                 else "%s checks are confirmed" % ("its" if n == 1 else "their")))
+    if steps:  # the steps past monitoring that wait on their checks: counted as the band's call counts them
+        n = len(steps)
+        parts.append("%d %s once %s checks are confirmed%s" % (
+            n, ap.get("steps_words") or _plural(n, "step"), "its" if n == 1 else "their",
+            (" (%s)" % _plan_ids(steps, level)) if level < 2 else ""))
     if ap["host"]:
         n = len(ap["host"])
         if level == 0:

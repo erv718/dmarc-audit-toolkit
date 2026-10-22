@@ -853,10 +853,12 @@ def test_g3_the_readers_put_the_full_window_beside_the_floor(tmp_path):
     assert doc["stand"]["window_totals"] == {"orgs": ["corp.example"], "hours": 720.0, "span": "30 days",
                                              "genuine_failures": 160, "delivered_despite_fail": 15, "floor": gf}
     lines = {l.split("`")[1]: l for l in notify.summarize(rep).splitlines() if l.startswith("- `")}
-    assert lines["corp.example"].endswith(
-        " - 3 genuine failures of its own in the rows kept (newest 41 hours kept; a floor: the gate, the census and the "
-        "labels count these); over the full 30 days, counted in Advanced Hunting: 150 genuine failures, 15 delivered "
-        "despite failing")
+    # round 13 review: a cut organization is one line under the band, its floor over its names' rows kept and the
+    # whole organization's full window beside it; its names with failures keep their own lines
+    assert lines["corp.example"] == (
+        "- `corp.example` and its 1 name below it: 4 genuine failures in the rows kept (newest 41 hours kept; a floor: "
+        "the gate, the census and the labels count these); over the full 30 days, counted in Advanced Hunting: 160 "
+        "genuine failures, 15 delivered despite failing")
     assert lines["hr.corp.example"].endswith("; over the full 30 days, counted in Advanced Hunting: 10 genuine failures, "
                                              "0 delivered despite failing")
     # round 13, T-04: shop.example, not cut, leads its own line of the status band's strip and has no line below it
@@ -1097,7 +1099,8 @@ def test_collect_measures_mail_flow_once_per_run_and_counts_a_cut_orgs_whole_win
     assert ("(the gate, the census and the labels still rest on the rows kept; the plan reads these totals for its "
             "quarantine-now and sp= decisions)") in text["next_steps.md"]
     corp = next(l for l in text["summary.txt"].splitlines() if l.startswith("- `corp.example`"))
-    assert corp.endswith("; over the full 30 days, counted in Advanced Hunting: 150 genuine failures, 15 delivered "
+    # round 13 review: the cut organization's one line, the whole organization's full window
+    assert corp.endswith("; over the full 30 days, counted in Advanced Hunting: 160 genuine failures, 15 delivered "
                          "despite failing")
     # G1 end to end: the pulled rows carry the override columns, and the run names the rule
     assert report["maillog"]["counters"]["delivered_despite_fail_by"] == {

@@ -2359,6 +2359,7 @@ def build_delta(report, previous):
     now_s = _dict(now_ml.get("census")).get("by_sender")
     prev_s = _dict(prev_ml.get("census")).get("by_sender")
     new_senders, gone_senders = [], []
+    held_senders = {"new": [], "gone": []}  # the ones a cut log may only have missed: listed apart, never dropped
     if not isinstance(now_s, list) or not isinstance(prev_s, list):
         if now_c or prev_c:
             notes.append("sender census missing on one side (older report, or no mail log): "
@@ -2379,6 +2380,7 @@ def build_delta(report, previous):
             held = [s for s in senders if _sender_org(s) in families]
             if held:
                 senders[:] = [s for s in senders if s not in held]
+                held_senders[word] = held
                 notes.append("%d sender%s under %s not listed as %s: %s cut mail log may simply have missed %s"
                              % (len(held), "" if len(held) == 1 else "s",
                                 _names(order_domains({_sender_org(s) for s in held}, headline)),
@@ -2413,6 +2415,9 @@ def build_delta(report, previous):
             "domains_added": [d for d in now_g if d not in prev_g],
             "domains_removed": [d for d in prev_g if d not in now_g],
             "new_senders": new_senders, "gone_senders": gone_senders,
+            # first seen, or no longer seen, under an organization a cut log covered: maybe new or gone, maybe
+            # only outside the hours a cut kept (the notes say which organizations)
+            "new_senders_held": held_senders["new"], "gone_senders_held": held_senders["gone"],
             "by_domain": by_domain,
             "maillog_window": {"now": now_w or None, "previous": prev_w or None, "comparable": comparable,
                                "log_comparable": log_comparable, "domains_not_comparable": sorted(withheld),

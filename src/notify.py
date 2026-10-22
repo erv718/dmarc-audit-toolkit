@@ -500,8 +500,9 @@ def band_of(report, plan=None, previous=None, history=None):
 
 def band_lines(top, date="", where=None):
     """The message's first lines from the band: '*DMARC <date>* - <headline>', one numbered line per organization
-    of the strip ('`<org>` <badge> - <finding>', plain: no address, no subject), how many more, what changed and
-    what this data cannot show, then where the full brief is and the details' header."""
+    of the strip ('`<org>` <badge> - <finding>', plain: no address, no subject), how many more, the call in plain
+    words (the plan ids ready now, how many wait and on what), what changed and what this data cannot show (old
+    evidence always among it), then where the full brief is and the details' header."""
     L = ["*DMARC%s* - %s" % ((" " + date) if date else "", top.get("headline") or "")]
     for e in top.get("domains") or []:
         if isinstance(e, dict):
@@ -511,11 +512,14 @@ def band_lines(top, date="", where=None):
         words = ", ".join("%s %s" % (n, w) for w, n in _d(more.get("by_tier")).items())
         L.append("+%d more organization%s (%s): Per domain lists them" % (
             more["count"], "" if more["count"] == 1 else "s", words))
+    if isinstance(top.get("call"), dict) and top["call"].get("plain"):
+        L.append(next_steps.call_line_plain(top["call"]))
     changed = _d(top.get("changed"))
     if changed.get("plain"):
-        L.append("Since last run: %s." % changed["plain"])
-    gaps = [g for g in (top.get("data_gaps") or [])[:1] if isinstance(g, str)]
-    L.append("Not in this data: %s" % "; ".join(gaps + [next_steps.SCOPE_GAP_PLAIN]))
+        L.append(next_steps.since_line_plain(changed))
+    gaps = [g for g in (top.get("gaps_plain") or []) if isinstance(g, str)] or \
+        [g for g in (top.get("data_gaps") or [])[:1] if isinstance(g, str)] + [next_steps.SCOPE_GAP_PLAIN]
+    L.append("Not in this data: %s" % "; ".join(gaps))
     L.append(SLACK_BRIEF % (where or "audit-out/latest"))
     L.append(DETAILS)
     return L
@@ -529,11 +533,12 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     top: the status band (next_steps.json top) the run's document carries;
     collect.py passes it, and without it the band is built here as the
     document builds it (band_of), so both give the same message. The
-    message leads with it (band_lines); the per-domain lines that follow
-    keep only the domains the strip does not lead with that have genuine
-    failures, a change since the last run or a cut organization, and count
-    the rest on one line. where: the folder the brief is in, as the message
-    names it (default audit-out/latest).
+    message leads with it (band_lines); under it a cut organization gets one
+    line (cut_org_line: its floor and its full window), and the per-domain
+    lines keep only the domains the strip does not lead with that have
+    genuine failures or a change since the last run, the rest counted on one
+    line. where: the folder the brief is in, as the message names it
+    (default audit-out/latest).
 
     known_senders: every sender key seen in earlier runs (collect.py keeps
     them); with it, "newly identified" means never seen before, not merely
@@ -568,15 +573,21 @@ def summarize(report, previous=None, plan=None, known_senders=None, history=None
     headline = next_steps.headline_org(report)
     per = _d(_d(report.get("gate")).get("domains"))
     rest = 0
-    for e in domain_lines(report, plan, dl):
+    entries = domain_lines(report, plan, dl)
+    said_orgs = set()
+    for e in entries:
         if not band:
             lines.append(e["line"])
             continue
-        # under the band: a domain of a cut organization keeps its line (its floor and its full-window totals); one
-        # the strip leads with is said there; any other is kept when it has failures of its own or a change since the
-        # last run, and counted with the rest otherwise
+        # under the band: a cut organization gets one line, its floor and its full-window totals; a domain the strip
+        # leads with is said there; any other is kept when it has failures of its own or a change since the last run,
+        # and counted with the rest otherwise - a cut organization's quiet names too
         here = e["domain"].lower() in strip
-        if e["cut"] or (not here and (e["failing"] or e["changed"])):
+        org = e.get("cut_org")
+        if org and org not in said_orgs:
+            said_orgs.add(org)
+            lines.append(cut_org_line(report, org, [x["domain"] for x in entries if x.get("cut_org") == org]))
+        if not here and (e["failing"] or e["changed"]):
             lines.append(e["line"])
         elif not here:
             rest += 1
@@ -804,12 +815,44 @@ def domain_lines(report, plan=None, dl=None):
             if isinstance(d, dict) and _number(d.get("genuine_failures")) is not None:
                 line += " (%+d vs last run)" % d["genuine_failures"]
         delta = dl_dom.get(dom) if isinstance(dl_dom.get(dom), dict) else {}
+        wt_org = next((o for o in sorted(_d(_d(maillog.get("window_totals")).get("orgs")), key=len, reverse=True)
+                       if isinstance(o, str) and (dom == o or str(dom).endswith("." + o))), None) if full else None
         out.append({"domain": str(dom), "line": line + full,
                     "failing": isinstance(own, dict) and _whole(own.get("genuine_failures")) > 0 and not unmeasured,
                     "changed": bool(_number(delta.get("genuine_failures")))
                     or dom in _d(_d(dl).get("policy_changes")),
-                    "cut": bool(cut or full)})
+                    "cut": bool(cut or full), "cut_org": cut or wt_org})
     return out
+
+
+def cut_org_line(report, org, names):
+    """A cut organization's one line under the details: how many genuine
+    failures its names' rows kept (a floor, and what cut them), and what
+    collect.py counted over the full window for the whole organization
+    (maillog.window_totals), when it did."""
+    maillog = _d(report.get("maillog"))
+    by_dom = _d(maillog.get("by_domain"))
+    floor = sum(_whole(_d(by_dom.get(d)).get("genuine_failures")) for d in names)
+    info = audit.maillog_cuts(report).get(org)
+    kept = audit._cut_kept(info) if info else ""
+    cause = (kept or "cut by %s" % (audit._cut_cause(info) or "an unrecorded cause")) if info else "counted apart"
+    others = len([d for d in names if d != org])
+    below = (" and its %d %s below it" % (others, "name" if others == 1 else "names")) if others else ""
+    if _d(info).get("reason") == "not pulled":
+        line = "- `%s`%s: mail log not read this run (its pull failed): its senders are not checked" % (org, below)
+    else:
+        line = "- `%s`%s: %d genuine failure%s in the rows kept (%s; a floor: the gate, the census and the labels " \
+               "count these)" % (org, below, floor, "" if floor == 1 else "s", cause)
+    wt = _d(maillog.get("window_totals"))
+    by = _d(_d(_d(wt.get("orgs")).get(org)).get("by_domain"))
+    if by:
+        hours = _whole(wt.get("hours"))
+        span = ("%d days" % (hours // 24)) if hours and hours % 24 == 0 else ("%d hours" % hours if hours else "window")
+        gf = sum(_whole(_d(c).get("genuine_failures")) for c in by.values())
+        ddf = sum(_whole(_d(c).get("delivered_despite_fail")) for c in by.values())
+        line += ("; over the full %s, counted in Advanced Hunting: %d genuine failure%s, %d delivered despite "
+                 "failing" % (span, gf, "" if gf == 1 else "s", ddf))
+    return line
 
 
 NO_PLAN_LINE = "- plan: not in this run (offline: no DNS read)"
@@ -913,7 +956,7 @@ def main():
     ap = argparse.ArgumentParser(description="Post a short DMARC audit status to a Slack or Teams webhook.")
     ap.add_argument("--report", required=True, help="this run's report.json")
     ap.add_argument("--previous", help="the previous run's report.json, for deltas (report.delta wins when present)")
-    ap.add_argument("--plan", help="this run's plan.json")
+    ap.add_argument("--plan", help="this run's plan.json (default: the plan.json beside --report, when there is one)")
     ap.add_argument("--senders", help="collect.py's senders.json: 'newly identified' then means new to the whole history")
     ap.add_argument("--metrics", help="collect.py's metrics.json, for the trend over the last runs")
     ap.add_argument("--webhook", help="webhook URL (default: SLACK_WEBHOOK_URL or TEAMS_WEBHOOK_URL from .env)")
@@ -925,6 +968,13 @@ def main():
     report = audit.load_census(load(args.report), args.report)  # a split census is read whole again
     previous = audit.load_census(load(args.previous), args.previous) if args.previous else None
     plan = load(args.plan) if args.plan else None
+    if not args.plan:  # the run's own plan, as collect.py passes it: never "no plan this run" for a run that has one
+        beside = Path(args.report).resolve().parent / "plan.json"
+        try:
+            found = json.loads(beside.read_text(encoding="utf-8-sig")) if beside.is_file() else None
+        except (OSError, ValueError):  # a plan.json that cannot be read is no plan, never a stop
+            found = None
+        plan = found if isinstance(found, dict) else None
     for what, doc, given in (("--report", report, True), ("--previous", previous, bool(args.previous)),
                              ("--plan", plan, bool(args.plan))):
         if given and not isinstance(doc, dict):

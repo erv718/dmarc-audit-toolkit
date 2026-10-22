@@ -100,11 +100,14 @@ def test_the_run_ends_with_what_to_read_first(monkeypatch, capsys, tmp_path):
     summary = (latest / "summary.txt").read_text(encoding="utf-8")
     assert summary.splitlines()[0] == "*DMARC %s* - %s" % (doc["date"], top["headline"])
     assert "@" not in summary
-    # the cut organization keeps its per-domain lines under the details: its floor, and the full window beside it
+    # the cut organization keeps one line under the details (review round 13): its floor, and the whole
+    # organization's full window beside it
     details = summary.split("\nDetails:\n", 1)[1]
     corp = next(line for line in details.splitlines() if line.startswith("- `corp.example`"))
-    assert "in the rows kept (" in corp and corp.endswith(
-        "; over the full 30 days, counted in Advanced Hunting: 150 genuine failures, 15 delivered despite failing")
+    assert corp.startswith("- `corp.example` and its 1 name below it: ") and "in the rows kept (" in corp
+    assert corp.endswith(
+        "; over the full 30 days, counted in Advanced Hunting: 160 genuine failures, 15 delivered despite failing")
+    assert last[-5] == next_steps.call_line_plain(top["call"]) and last[-5].startswith("Your call: ")
 
 
 def test_a_dry_run_prints_the_summary_under_its_header_and_no_notify_says_nothing(monkeypatch, capsys, tmp_path):
@@ -159,14 +162,17 @@ def test_summary_txt_leads_with_the_band_and_counts_the_quiet_domains(estate):
     rep, plan, doc = estate["report"], estate["plan"], estate["doc"]
     text = notify.summarize(rep, plan=plan, top=doc["top"])
     lines = text.splitlines()
-    assert lines[:9] == [
+    # the call in plain words on a line of its own, its ids when rows are ready (review round 13)
+    assert lines[:10] == [
         "*DMARC 2026-10-09* - Partly: 2 of 9 domains block spoofed mail. Urgent: spoofed mail reached inboxes on "
-        "example.com and brand.example. Your call: 9 DNS records wait on a check.",
+        "example.com and brand.example. Your call: nothing to approve yet - 9 DNS records wait on checks.",
         "1. `example.com` urgent - spoofed mail reached inboxes - 7 messages",
         "2. `brand.example` urgent - spoofed mail reached inboxes - 4 messages",
-        "3. `example.net` reports only - small failures only (6, under 10)",
-        "4. `example.org` no record - anyone can send as it; nothing sent or received in 30 days",
-        "5. `parked.example` no record - anyone can send as it; nothing sent or received in 30 days",
+        "3. `example.org` no record - anyone can send as it; nothing sent or received in 30 days",
+        "4. `parked.example` no record - anyone can send as it; nothing sent or received in 30 days",
+        "5. `example.net` reports only - small failures only (6, under 10)",
+        "Your call: nothing to approve yet; 9 wait on checks; 2 need their DNS host found first; 3 not this week; "
+        "decide 1 plan hold (example.com).",
         "Since last run: first run - this is the baseline.",
         "Not in this data: bounces and lost mail - use message trace",
         "Full brief: brief.html in audit-out/latest (inside the company only)"]

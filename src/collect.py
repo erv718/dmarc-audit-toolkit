@@ -120,8 +120,9 @@ RUN_JSON_SENDERS = 200  # new sender identities listed in run.json; senders.json
 RUN_FILES = ("report.md", "report.json", audit.CENSUS_FILE, "plan.md", "plan.json", "next_steps.md", "next_steps.json",
              "brief.html", "todo.md", "inventory.json", "domains.txt", "summary.txt", "run.json", "setup.json",
              "maillog.csv", "verify.md")
-PRIORITY_WORD = {1: "now, zero delivery risk", 2: "before enforcement", 3: "enforcement step, gated",
-                 4: "subdomain policy, gated", 5: "final hardening, gated"}
+# what a plan row's priority holds, in todo.md's words - never when it can go out: each row's status says that
+PRIORITY_WORD = {1: "monitoring and hygiene", 2: "before enforcement", 3: "enforcement step", 4: "subdomain policy",
+                 5: "final hardening"}
 
 
 def die(msg):
@@ -1117,12 +1118,15 @@ def render_todo(report, plan, caveats=()):
     L += items or ["- none, or no export was supplied (report.md says which)"]
     L.append("")
 
-    L.append("## 5. Gated enforcement steps (apply only when every prerequisite holds)")
+    L.append("## 5. Enforcement steps (each with its status; apply only when every prerequisite holds)")
     L.append("")
     rows = [c for c in changes if c.get("priority", 0) >= 3]
     for c in rows:
-        L.append("- %s %s (%s): `%s` = `%s` - %s" % (c["id"], c["domain"], PRIORITY_WORD.get(c["priority"], "gated"),
+        # the row's own status (plan.row_status): a step whose gate says go waits on its checks, never "gated"
+        L.append("- %s %s (%s): `%s` = `%s` - %s" % (c["id"], c["domain"], PRIORITY_WORD.get(c["priority"], "step"),
                                                       c["hostname"], c["value"], c["why"]))
+        _, text, reason = plan_mod.status_of(c)
+        L.append("  - status: %s%s" % (text, (" - " + reason) if reason else ""))
         for pre in c.get("prerequisites") or []:
             L.append("  - before applying: %s" % pre)
     if not rows:
@@ -1165,7 +1169,8 @@ OPEN_ALSO = (("detail", "next_steps.md"), ("records", "plan.md"), ("how to check
 def last_lines(report, top, code, strict_reasons, stamp, run_dir, latest, paint=None):
     """The last lines a run prints (plain words: domains and counts, never an address or a subject): the done line
     with the exit code and what it means, the status band's plain lines (next_steps.json top.lines_plain: the
-    headline, the most critical organizations, what changed, what this data cannot show), the run folder, and the
+    headline, the most critical organizations, the call with the plan ids ready now, what changed, what this data
+    cannot show), the run folder, and the
     file to open first with the others beside it. Without a band, the done line and the paths."""
     paint = paint or console.painter()
     gate = (report.get("gate") or {}) if isinstance(report, dict) else {}

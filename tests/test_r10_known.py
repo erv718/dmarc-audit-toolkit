@@ -563,8 +563,10 @@ def test_k2_a_record_that_reports_elsewhere_gets_the_report_address_appended(mon
                 "record's rua: " % (c["id"], c["domain"], c["hostname"], c["value"], c["current"])) in now
     assert "  - before applying: " + THIRD % 2 in now
     assert "  - before applying: " + OUTSIDE % ("brand.example", "brand.example") in now
-    gated = todo.split("## 5. Gated", 1)[1].split("\n## ", 1)[0]
-    assert "- %s shop.example (enforcement step, gated): `_dmarc.shop.example` = `%s`" % (s["id"], s["value"]) in gated
+    # section 5 says each step's own status, never "gated" for all of them (review round 13)
+    gated = todo.split("## 5. Enforcement steps", 1)[1].split("\n## ", 1)[0]
+    assert "- %s shop.example (enforcement step): `_dmarc.shop.example` = `%s`" % (s["id"], s["value"]) in gated
+    assert "  - status: %s" % plan_mod.status_of(s)[1] in gated
     # plan.md's advice on priority 1 says such a check comes first
     assert ("a row that lists a check before applying (a lookup first, an external-destination record, the order of "
             "the rua addresses) waits on it") in files["plan.md"]

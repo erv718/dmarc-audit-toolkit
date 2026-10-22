@@ -36,7 +36,9 @@ def incident(tmp_path_factory):
 
 def test_the_incident_says_its_relayed_copies_need_message_trace(incident):
     gaps = next_steps.top_gaps(incident["report"])
-    assert "36 messages passed but went only to an on-premises or external hop: check message trace" in gaps["gaps"]
+    # whose mail they are (review round 13): the From domain everywhere, the sender in the rich words only
+    assert ("36 example.com messages, all from hr@example.com, passed but went only to an on-premises or external hop: "
+            "check message trace") in gaps["gaps"]
     assert gaps["gaps"][-1] == SCOPE == next_steps.SCOPE_GAP
     assert gaps["evidence_through"] == "2026-10-07" and gaps["stale"] is None
     md = next_steps.render_md(incident["doc"])
@@ -114,7 +116,8 @@ def test_each_kind_of_relayed_message_is_said_as_what_it_is(tmp_path):
                          "trace")
     assert "not broken senders" not in line
     gaps = next_steps.top_gaps(rep)["gaps"]
-    assert "10 messages passed but went only to an on-premises or external hop: check message trace" in gaps
+    assert ("10 example.com messages, most from relay@example.com, passed but went only to an on-premises or external "
+            "hop: check message trace") in gaps
     # an older report counts them without saying which passed: how many went that way, never that they passed
     for key in ("relayed_only_passed", "relayed_only_echo"):
         del c[key]
@@ -183,13 +186,17 @@ def test_the_gaps_run_in_their_order_two_shown_and_the_scope_line_last():
         "offline run: DNS not read, so policies come from the aggregate reports or are unknown",
         "no mail log: our own senders are not checked",
         "the newest evidence is from 2026-09-02, 48 days before this run"]
-    assert g["gaps"] == g["data_gaps"][:2] + ["(+1 more under Where we stand)", SCOPE]
+    # the gap past the first two is named, never a count that points at a section that may not say it (review)
+    assert g["gaps"] == g["data_gaps"][:2] + ["(+1 more: evidence 48 days old)", SCOPE]
     assert (g["evidence_through"], g["stale"]) == ("2026-09-02", 48)
+    # the plain lines keep the first gap and the old evidence, whatever else there is
+    assert g["gaps_plain"] == [g["data_gaps"][0], g["data_gaps"][2], next_steps.SCOPE_GAP_PLAIN]
     # exactly seven days old is not stale yet; a report with no dates says nothing about age
     rep["rua"]["totals"]["end_date"] = "2026-10-13"
     assert next_steps.top_gaps(rep)["stale"] is None
     assert next_steps.top_gaps({"dns": {"example.com": {}}, "maillog": {}, "rua": {}}) == {
-        "gaps": [SCOPE], "evidence_through": None, "stale": None, "data_gaps": []}
+        "gaps": [SCOPE], "evidence_through": None, "stale": None, "data_gaps": [],
+        "gaps_plain": [next_steps.SCOPE_GAP_PLAIN]}
 
 
 def test_cut_organizations_are_one_clause_and_a_failed_pull_its_own():
@@ -238,15 +245,18 @@ def strip(top):
 
 def test_t01_the_estate_names_its_organizations_worst_first(estate):
     top = estate["doc"]["top"]
-    assert strip(top) == [("example.com", 1), ("brand.example", 1), ("example.net", 6), ("example.org", 6),
-                          ("parked.example", 6)]
+    # within the unprotected tier the weakest status first (review round 13): no record before reports only
+    assert strip(top) == [("example.com", 1), ("brand.example", 1), ("example.org", 6), ("parked.example", 6),
+                          ("example.net", 6)]
+    # nothing can be approved yet: the call words say so first, never reading as an ask (review round 13)
     assert top["headline"] == ("Partly: 2 of 9 domains block spoofed mail. Urgent: spoofed mail reached inboxes on "
-                               "example.com and brand.example. Your call: 9 DNS records wait on a check.")
+                               "example.com and brand.example. Your call: nothing to approve yet - 9 DNS records wait "
+                               "on checks.")
     assert top["protected"] == {"word": "partly", "total": 9, "protected": 2, "source": "dns",
                                 "counts": {"reject": 1, "quarantine": 1, "none": 5, "absent": 2},
                                 "text": "Partly: 2 of 9 domains refuse or junk spoofed mail; 5 only report (p=none), 2 "
                                         "have no DMARC record."}
-    com, brand, net, org, parked = top["domains"]
+    com, brand, org, parked, net = top["domains"]
     # a delivered lure: the address, its subject quoted as the sender's, and what the run cannot say
     assert next_steps.strip_line_md(com) == (
         "**URGENT - example.com** (+4 names below it that only report): Spoofed mail reached inboxes - 7 as "
@@ -263,10 +273,16 @@ def test_t01_the_estate_names_its_organizations_worst_first(estate):
     assert next_steps.strip_line_md(parked) == (
         "**No record - parked.example**: Anyone can send as it; nothing sent or received in 30 days. Next: park it "
         "(P-10, P-11) - find its DNS host first.")
-    assert org["action_plain"] == "quarantine now (P-01) - after 3 checks"
+    # a quarantine-now row's short step never says "now" beside a check (review round 13)
+    assert org["action_plain"] == "go straight to quarantine (P-01) - after 3 checks"
+    # every waiting group names its ids, runs as ranges; the one plan hold says what it decides (review round 13)
     assert top["call"]["text"] == (
-        "Nothing can go out unchecked; 6 after one report-authorization record at corp.example (P-03, P-04, P-05 and 3 "
-        "more); 3 after their own checks; 2 need their DNS host found first; 3 not this week; decide 1 plan hold.")
+        "Nothing can go out unchecked; 6 after one report-authorization record at corp.example (P-03 to P-07, P-09); 3 "
+        "after their own checks (P-01, P-02, P-08); 2 need their DNS host found first (P-10, P-11); 3 not this week "
+        "(P-12 to P-14); decide 1 plan hold (example.com: sending subdomains need records of their own before sp= "
+        "moves).")
+    assert top["call"]["plain"] == ("nothing to approve yet; 9 wait on checks; 2 need their DNS host found first; 3 not "
+                                    "this week; decide 1 plan hold (example.com)")
     assert top["call"]["groups"][0] == {"words": "one report-authorization record at corp.example",
                                         "ids": ["P-03", "P-04", "P-05", "P-06", "P-07", "P-09"]}
     assert (top["call"]["host"], top["call"]["later"], top["call"]["holds"]) == (2, 3, 1)
@@ -326,7 +342,9 @@ def test_t01_a_cut_organization_counts_at_least_and_one_not_pulled_is_a_data_gap
     assert next_steps.strip_line_md(e).startswith(
         "**Junks spoofs - example.com**: At least 65 of our own messages fail DMARC and receivers junk them. Do first: "
         "DKIM-sign hr@example.com (owner: no owner yet); keep the transport rule that lets 27 in until it passes.")
-    assert e["finding_plain"] == "at least 65 of our own messages fail DMARC and receivers junk them"
+    # the plain words name the way the failing mail came in (review round 13): the terminal and Slack say which sender
+    assert e["finding_plain"] == ("at least 65 of our own messages fail DMARC (via hrmail.example.com) and receivers "
+                                  "junk them")
     assert "example.com: the row budget kept only the newest 41 hours, so its counts are floors" in top["gaps"]
     rep["maillog"]["cuts"]["example.net"] = {"reason": "not pulled", "error": "HTTP 500"}
     e = {x["org"]: x for x in next_steps.build(rep, plan=incident["plan"])["top"]["domains"]}["example.net"]
@@ -449,15 +467,18 @@ def test_t01_since_last_run_names_what_changed(estate):
         "maillog_window": {"comparable": False, "cut_orgs": {"example.com": {
             "now": {"reason": "row budget", "kept_hours": 41}, "previous": {"reason": "row budget", "kept_hours": 60}}}}}
     changed = next_steps.build(rep, plan=estate["plan"], org_name="example.com")["top"]["changed"]
+    # a resolved finding by its domain, its title quoted and its id, never read as a live problem (review round 13)
     assert changed["text"] == (
         "Since 2026-10-06: worse - example.net +4; better - brand.example -2; fixed - old@example.com no longer fails; "
-        "new - payslips@example.net x14; records - brand.example p=quarantine -> p=reject; resolved - DMARC p=none - "
-        "monitoring only; failure counts for example.com not compared (the row budget cut both runs).")
+        "new - payslips@example.net x14; records - brand.example p=quarantine -> p=reject; resolved - brand.example: "
+        "\"DMARC p=none\" (DMARC-002); failure counts for example.com not compared (the row budget cut both runs).")
+    # the plain words without the date (the line says it once) and a sender by its From domain and envelope
     assert changed["plain"] == (
-        "since 2026-10-06: worse - example.net +4; better - brand.example -2; fixed - an example.com sender no longer "
-        "fails; new - example.net via mail.vendor.example x14; records - brand.example p=quarantine -> p=reject; "
-        "resolved - DMARC p=none - monitoring only; failure counts for example.com not compared (the row budget cut both "
+        "worse - example.net +4; better - brand.example -2; fixed - an example.com sender no longer fails; new - an "
+        "example.net sender via mail.vendor.example x14; records - brand.example p=quarantine -> p=reject; resolved - "
+        "brand.example: DMARC p=none (DMARC-002); failure counts for example.com not compared (the row budget cut both "
         "runs)")
+    assert next_steps.since_line_plain(changed).startswith("Since last run (2026-10-06): worse - example.net +4; ")
     assert changed["since"] == "2026-10-06" and "@" not in changed["plain"]
     rep["delta"] = {"previous_generated_utc": "2026-10-06T06:00:00Z", "by_domain": {}, "new_senders": [],
                     "gone_senders": []}
@@ -495,12 +516,14 @@ def test_t01_your_call_groups_the_rows_after_a_check_by_what_they_wait_on():
     plan = {"changes": [row("P-01", "no_mail", own), row("P-02", "no_mail", own), row("P-03", "new", [auth]),
                         row("P-04", "park", ["verify unused first: no passing volume"])], "holds": []}
     call = next_steps.build_top({"gate": {"domains": {}}, "dns": {"example.com": {}}}, plan, {})["call"]
-    # the largest group is the rows' own checks: the others are said by what they wait on, never 'own' twice
-    assert call["text"] == "Nothing can go out unchecked; 2 after their own checks (P-01, P-02); 2 after other checks."
+    # the groups one check clears first, whatever their sizes, each with its ids; the rows' own checks last, never
+    # "other checks" (review round 13)
+    assert call["text"] == ("Nothing can go out unchecked; 1 after one report-authorization record at corp.example "
+                            "(P-03); 1 after the domain's unused check (P-04); 2 after their own checks (P-01, P-02).")
     plan["changes"] = plan["changes"][:3]
     call = next_steps.build_top({"gate": {"domains": {}}, "dns": {"example.com": {}}}, plan, {})["call"]
-    assert call["text"] == ("Nothing can go out unchecked; 2 after their own checks (P-01, P-02); 1 after one "
-                            "report-authorization record at corp.example.")
+    assert call["text"] == ("Nothing can go out unchecked; 1 after one report-authorization record at corp.example "
+                            "(P-03); 2 after their own checks (P-01, P-02).")
     # a sentence never capitalizes a name
     assert next_steps.cap_sentence("corp.example and corp.co.uk: the row budget") == \
         "corp.example and corp.co.uk: the row budget"

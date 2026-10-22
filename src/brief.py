@@ -75,8 +75,8 @@ OLD_SECTION_IDS = ("top", "contents", "summary") + tuple(sid for sid, _ in SECTI
 # the band's rows, in reading order: (key, label); every label is fixed text
 BAND_ROWS = (("protected", "Protected?"), ("critical", "Most critical"), ("call", "Your call"),
              ("changed", "Since last run"), ("gaps", "Not in this data"))
-READING_LINE = ("Read the block below in 45 seconds; the sections after it are for the people who fix each item. "
-                "Sources and how to check are at the end.")
+READING_LINE = ("Read the first lines in 45 seconds; the sections after the block are for the people who fix each "
+                "item. Sources and how to check are at the end.")
 ONE_PARAGRAPH = "The status in one paragraph"  # the one-liner's summary line, under The next step
 # the ask's lists as the page lays them out (next_steps.ASK_LINES: key, label, the statuses each holds)
 ASK_LINES = tuple((key, label) for key, label, _ in next_steps.ASK_LINES)
@@ -189,6 +189,7 @@ strong { font-weight: 650; }
 .strip li > .pill { justify-self: start; }
 .strip li.more { display: block; color: var(--muted); font-size: 0.875rem; }
 .now .tag { padding: 0 0.25rem; }
+.now .answer .mono { font-size: 0.875em; }
 .strip .what { min-width: 0; }
 .strip .who { font-family: var(--font-mono); font-weight: 600; }
 .strip .below { color: var(--muted); font-size: 0.875rem; }
@@ -199,6 +200,8 @@ strong { font-weight: 650; }
 details.para { font-size: 0.875rem; }
 details.para summary { cursor: pointer; color: var(--muted); }
 details.para p { margin-top: 0.4rem; max-width: 70ch; }
+.para-print { display: none; }
+.nb { white-space: nowrap; }
 .section { display: flex; flex-direction: column; gap: 1rem; border-top: 1px solid var(--line); padding-top: 1.5rem; }
 .section-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 1rem; }
 .meta { font-family: var(--font-mono); font-size: 0.78rem; color: var(--muted); }
@@ -354,6 +357,8 @@ pre.value { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.875rem;
   a { color: inherit; text-decoration: none; }
   .tile, .card, .ask, tr, .checklist li, .zone, .now { break-inside: avoid; }
   .zone, tr.org, .org-head, .pre > .k { break-after: avoid; }
+  details.para { display: none; }
+  .para-print { display: block; font-size: 0.875rem; max-width: 70ch; }
 }
 """
 
@@ -725,7 +730,8 @@ def policy_class(text):
         return "ok"
     if t.startswith("p=quarantine"):
         return "warn"
-    if t.startswith("p=none") or t.startswith("no dmarc record"):
+    # an invalid record applies no policy, as no record does: the band's badge for it is bad too (one language)
+    if t.startswith("p=none") or t.startswith("no dmarc record") or t.startswith("invalid record"):
         return "bad"
     return "info"
 
@@ -929,23 +935,50 @@ def id_link(rid, places, hosts):
     return '<span class="tag"%s>%s</span>' % (title, esc(rid))
 
 
+CLOSING_RX = re.compile(r"^[)\],;:.]+")  # the punctuation that closes a list of ids: it stays on its last tag's line
+
+
 def band_parts(parts, places=None, hosts=None):
-    """A band line's parts as HTML: the generator's words through prose, a domain or an address through text_name
-    (one piece, isolated), a sender's subject inside its fixed frame through iso(marks()), a plan id as a tag
-    linked to its card. A part of any other shape is left out."""
-    out = []
+    """A band line's parts as HTML: the generator's words through prose, a
+    domain or an address through text_name (one piece, isolated), a host name
+    the same in mono, a sender's subject inside its fixed frame through
+    iso(marks()), a plan id as a tag linked to its card. The '(' before a tag
+    and the ')' or ',' after it are glued to it (class nb), so a line never
+    starts with a lone ')'. A part of any other shape is left out."""
+    pieces = []
     for p in _list(parts):
         if not (isinstance(p, list) and len(p) == 2 and isinstance(p[1], str)):
             continue
         kind, value = p
-        if kind in ("name", "addr", "host"):
-            out.append(text_name(value))
+        if kind in ("name", "addr"):
+            pieces.append(["html", text_name(value)])
+        elif kind == "host":
+            pieces.append(["html", '<span class="mono">%s</span>' % text_name(value)])
         elif kind == "subject":
-            out.append(esc("(the sender's subject: \"") + iso(marks(value)) + esc("\")"))
+            pieces.append(["html", esc("(the sender's subject: \"") + iso(marks(value)) + esc("\")")])
         elif kind == "id":
-            out.append(id_link(value, places, hosts))
-        else:  # each piece in its own isolate: a mark at its end moves nothing of the page's after it
-            out.append(iso(prose(value)))
+            pieces.append(["id", id_link(value, places, hosts), "", ""])
+        else:
+            pieces.append(["text", value])
+    for k, piece in enumerate(pieces):
+        if piece[0] != "id":
+            continue
+        before = pieces[k - 1] if k else None
+        after = pieces[k + 1] if k + 1 < len(pieces) else None
+        if before is not None and before[0] == "text" and before[1].endswith("("):
+            before[1], piece[2] = before[1][:-1], "("
+        m = CLOSING_RX.match(after[1]) if after is not None and after[0] == "text" else None
+        if m:
+            piece[3], after[1] = m.group(0), after[1][m.end():]
+    out = []
+    for piece in pieces:
+        if piece[0] == "text":  # each piece in its own isolate: a mark at its end moves nothing of the page's after it
+            if piece[1]:
+                out.append(iso(prose(piece[1])))
+        elif piece[0] == "id" and (piece[2] or piece[3]):
+            out.append('<span class="nb">%s%s%s</span>' % (esc(piece[2]), piece[1], esc(piece[3])))
+        else:
+            out.append(piece[1])
     return "".join(out)
 
 
@@ -1143,11 +1176,13 @@ def stand_section(doc):
 
 def one_paragraph(doc):
     """The one-liner, under The next step it ends with, folded: the status in one paragraph for whoever wants it
-    after the band."""
+    after the band. A closed <details> prints nothing of its content, so paper gets a copy of its own (shown only
+    in print, the folded one hidden there)."""
     text = _text(doc.get("one_liner"))
     if not text:
         return ""
-    return '<details class="para"><summary>%s</summary><p>%s</p></details>' % (esc(ONE_PARAGRAPH), prose(text))
+    return ('<details class="para"><summary>%s</summary><p>%s</p></details><p class="para-print">%s</p>'
+            % (esc(ONE_PARAGRAPH), prose(text), prose(text)))
 
 
 def next_step_section(doc, folded=False):
@@ -1770,8 +1805,10 @@ def dns_section(plan, head):
             "<li>%s: %s</li>" % (name_html(h.get("domain")), prose(_text(h.get("reason")))) for _, h in ordered)))
     place = {id(c): n for n, c in enumerate(rows, 1)}
     for prio, in_prio in itertools.groupby(rows, key=_priority):
+        in_prio = list(in_prio)
         title = "Priority %s" % prio if prio is not None else "Priority not stated"
-        words = plan_mod.PRIORITY_LABEL.get(prio, "")
+        # what the priority holds, then its rows counted by status: a heading never says when its rows can go out
+        words = " - ".join(w for w in (plan_mod.PRIORITY_LABEL.get(prio, ""), plan_mod.status_summary(in_prio)) if w)
         inner = []
         for host, in_host in itertools.groupby(in_prio, key=lambda c: _text(c.get("zone_host")) or "unknown"):
             zones = []

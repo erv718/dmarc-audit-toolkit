@@ -2283,10 +2283,23 @@ def build_plan(report, inventory=None, rua=None, ttl=DEFAULT_TTL):
 
 KIND_LABEL = {"new": "publish", "modify": "change", "park": "park", "todo": "task", "ratchet": "enforcement step",
               "no_mail": "no mail measured"}
-PRIORITY_LABEL = {1: "now - monitoring and hygiene (zero delivery risk), and quarantine where no mail is measured "
-                     "(after its checks)",
+# what each priority holds - never when it can go out: a heading sits over rows of every status, so each row's own
+# status says that (status_summary counts them under the heading)
+PRIORITY_LABEL = {1: "monitoring, hygiene and parking; quarantine where no mail is measured",
                   2: "before enforcement - DKIM",
-                  3: "enforcement - gated", 4: "subdomain policy - gated", 5: "final hardening - gated"}
+                  3: "enforcement", 4: "subdomain policy", 5: "final hardening"}
+# a status as a heading counts its rows (status_summary), plural-proof words in the plan's order of statuses
+STATUS_COUNTED = collections.OrderedDict([
+    ("now", "ready now"), ("address", "waiting for the report address"), ("host", "waiting for their DNS host"),
+    ("check", "after a check"), ("held", "held"), ("gated", "held by the gate"), ("later", "after another row")])
+
+
+def status_summary(rows):
+    """'5 ready now, 16 after a check': how many of these rows have each
+    status (status_of), in STATUS_COUNTED's order, only the ones that do -
+    what a priority's heading says of its rows instead of a promise."""
+    counts = collections.Counter(status_of(c)[0] for c in rows)
+    return ", ".join("%d %s" % (counts[s], words) for s, words in STATUS_COUNTED.items() if counts.get(s))
 
 
 def render_md(plan):
@@ -2327,6 +2340,9 @@ def render_md(plan):
     for prio in sorted({c["priority"] for c in plan["changes"]}):
         L.append("## Priority %d - %s" % (prio, PRIORITY_LABEL.get(prio, "")))
         L.append("")
+        # what the heading's rows are waiting on, counted: the heading never says when they can go out
+        L.append("Status: %s." % status_summary([c for c in plan["changes"] if c["priority"] == prio]))
+        L.append("")
         hosts = collections.OrderedDict()
         for c in plan["changes"]:
             if c["priority"] == prio:
@@ -2355,6 +2371,8 @@ def render_md(plan):
                         L.append("  - before applying: %s" % p)
                     if c.get("human_summary"):
                         L.append("  - *in plain words:* %s" % c["human_summary"])
+                    status, text, reason = status_of(c)
+                    L.append("  - status: %s%s" % (text, (" - " + reason) if reason and status != "check" else ""))
                 L.append("")
     L.append("## How to use this")
     L.append("")

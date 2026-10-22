@@ -146,7 +146,9 @@ def test_the_gate_cell_says_what_holds_each_domain(run):
         table_row(doc, "example.net")
     # a quarantine-now row: the gate's hold is the weekly ramp's, and the cell says so
     assert "| needs more data (for the weekly ramp this skips) |" in table_row(doc, "shop.example.com")
-    assert "| not yet - held by: (DMARC-001) (for the weekly ramp this skips) |" in table_row(doc, "example.org")
+    # a DNS finding that holds it by what it is, then its id - never a bare id (review round 13)
+    assert "| not yet - held by: no DMARC record (DMARC-001) (for the weekly ramp this skips) |" in \
+        table_row(doc, "example.org")
     # not yet on every row no longer: the words differ where the holds differ
     gates = {g["gate_text"] for g in doc["per_domain"]}
     assert len(gates) >= 6 and "not yet" not in gates

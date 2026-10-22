@@ -548,8 +548,9 @@ def test_n22_a_cut_organizations_count_is_a_floor_even_without_totals():
            "maillog": {"counters": {"genuine_failures": 231}, "by_domain": {"corp.example": {"genuine_failures": 231}},
                        "cuts": {"corp.example": {"reason": "row budget", "kept_hours": 162, "kept_from": "2026-10-06T12:00:00Z"}}}}
     line = next(l for l in notify.summarize(rep).splitlines() if l.startswith("- `corp.example`"))
-    assert line.endswith(" - 231 genuine failures of its own in the rows kept (newest 162 hours kept; a floor: the gate, the "
-                         "census and the labels count these)")
+    # round 13 review: the cut organization's one line under the band
+    assert line == ("- `corp.example`: 231 genuine failures in the rows kept (newest 162 hours kept; a floor: the gate, "
+                    "the census and the labels count these)")
     rep["maillog"]["cuts"] = {}
     assert "rows kept" not in notify.summarize(rep)
 
@@ -681,9 +682,10 @@ def test_n30_the_ramp_suffix_only_when_the_quarantine_now_row_clears_the_blocker
     plan = {"changes": [{"id": "P-01", "domain": "brand.example", "kind": "no_mail", "priority": 1, "record": "TXT",
                          "hostname": "_dmarc.brand.example", "value": "v=DMARC1; p=quarantine; sp=none; rua=%s;" % RUA,
                          "current": "none", "why": "no mail measured", "prerequisites": []}], "holds": []}
-    # the cell names what holds the gate (round 13, T-10): its first blocker, the one the row answers
-    assert ("| not yet - held by: NO DMARC RECORD - no policy, no reporting, invisible to you (for the weekly ramp "
-            "this skips) |") in table_rows(next_steps.build(rep, plan))[0]
+    # the cell names what holds the gate (round 13, T-10): its first blocker, the one the row answers - a DNS finding
+    # by what it is and its id (round 13 review)
+    assert "| not yet - held by: no DMARC record (DMARC-001) (for the weekly ramp this skips) |" in table_rows(
+        next_steps.build(rep, plan))[0]
     assert "the gate's no_go is for the weekly ramp this skips" in collect.render_todo(rep, plan)
     # round 13, T-04: the per-domain line (the Slack message keeps it under its details when it has failures)
     assert "the gate's *no_go* is for the weekly ramp this skips" in notify.domain_lines(rep, plan)[0]["line"]

@@ -429,18 +429,20 @@ def test_r2_the_plan_md_row_the_table_and_todo_say_it_in_plain_words(tmp_path):
             "nothing came in with it as the From domain; no aggregate report in this run covers it (see the checks), "
             "so a weekly ramp would protect nobody; reject follows once a week of reports still shows nothing "
             "passing" % brand["id"]) in md
-    # priority 1 is zero-risk only for monitoring and hygiene; a quarantine-now row waits on its checks
-    assert ("## Priority 1 - now - monitoring and hygiene (zero delivery risk), and quarantine where no mail is "
-            "measured (after its checks)") in md
+    # priority 1 is zero-risk only for monitoring and hygiene; a quarantine-now row waits on its checks. Round 13
+    # review: the heading says what the priority holds, never when its rows go out - its rows counted by status do
+    assert "## Priority 1 - monitoring, hygiene and parking; quarantine where no mail is measured\n\nStatus: " in md
+    assert "zero delivery risk" not in md
     assert "none of it touches mail anyone legitimately sends" not in md
     assert "A no-mail-measured row is different: it quarantines a domain the run measured sending nothing" in md
     doc = next_steps.build(rep, p)
     row = next(g for g in doc["per_domain"] if g["domains"] == ["brand.example"])
     assert row["next_step"] == "no mail measured: quarantine now"
     # the gate's verdict is the weekly ramp's, which the row skips: no cell reads as both at once; the cell names
-    # what holds the gate (round 13, T-10: the fixture's finding titles are their ids)
-    assert ("| `brand.example` | no DMARC record | not yet - held by: (DMARC-001) (for the weekly ramp this skips) | "
-            "no mail measured: quarantine now (plan %s) | nothing sent or received in 30 days (tenant) |"
+    # what holds the gate (round 13, T-10: the fixture's finding titles are their ids; the round 13 review names the
+    # finding by what it is, never a bare id)
+    assert ("| `brand.example` | no DMARC record | not yet - held by: no DMARC record (DMARC-001) (for the weekly ramp "
+            "this skips) | no mail measured: quarantine now (plan %s) | nothing sent or received in 30 days (tenant) |"
             % brand["id"]) in next_steps.render_md(doc)
     # the ask counts the quarantine-now rows apart from the zero-risk records, and only the rows ready now are
     # zero-risk: the park rows that need their unused check are asked once it is confirmed (round 13, T-05)
@@ -448,12 +450,19 @@ def test_r2_the_plan_md_row_the_table_and_todo_say_it_in_plain_words(tmp_path):
     checked = [i for i in zero_risk if i not in ready]
     assert len(ready) == 6 and len(checked) == 2
     # round 13, T-11: under 60 words - the zero-risk ones with their first ids, the park rows by what they wait on,
-    # the quarantine-now rows apart (they change delivery); every id in the ask's lists (ask_parts)
+    # the quarantine-now rows apart (they change delivery) while the ask has room; every id in the ask's lists
+    # (ask_parts). Round 13 review: the policy step that waits on its checks counts too, as the band's call counts
+    # it, so here, past 60 words, it and the quarantine-now rows are counted together
+    steps = [c["id"] for c in p["changes"] if c["priority"] >= 2 and c["status"] == "check"]
     assert ("approval to publish the %d zero-risk records (%s, %s, %s and 3 more); approval to publish 2 more "
-            "records (%s) once the domain's unused check is done; 3 domains that send no mail moved to quarantine "
-            "once their checks are confirmed"
-            % (len(ready), ready[0], ready[1], ready[2], next_steps.id_range(checked))) in doc["ask"]
+            "records (%s) once the domain's unused check is done; %d more after their checks"
+            % (len(ready), ready[0], ready[1], ready[2], next_steps.id_range(checked), len(quiet) + len(steps))
+            ) in doc["ask"]
+    parts = next_steps.ask_text(doc["ask_parts"], doc["org_domain"], doc["next_step"], 4)[0]
+    assert "3 domains that send no mail moved to quarantine once their checks are confirmed" in parts
+    assert "1 policy step once its checks are confirmed" in parts
     assert doc["ask_parts"]["now"] == ready and doc["ask_parts"]["quiet"] == quiet
+    assert doc["ask_parts"]["steps"] == steps == ["P-13"]
     todo = collect.render_todo(rep, p)
     assert ("## 2. Do now (plan priority 1, ready now: monitoring and hygiene with no mail impact and nothing to check "
             "first)") in todo

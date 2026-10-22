@@ -66,8 +66,8 @@ def test_the_band_comes_first_and_the_masthead_is_slim(estate):
                                                     "Not in this data"]
     # the strip: one line per organization, its badge a pill of the fixed set, a delivered lure marked
     items = re.findall(r"<li( class=\"t1\")?><span class=\"pill (\w+)\">([^<]+)</span>", band)
-    assert items == [(' class="t1"', "bad", "urgent"), (' class="t1"', "bad", "urgent"), ("", "bad", "reports only"),
-                     ("", "bad", "no record"), ("", "bad", "no record")]
+    assert items == [(' class="t1"', "bad", "urgent"), (' class="t1"', "bad", "urgent"), ("", "bad", "no record"),
+                     ("", "bad", "no record"), ("", "bad", "reports only")]
     assert '<span class="below">(<bdi>+4 names below it that only report</bdi>)</span>' in band
     # Your call: each id a tag linked to its card, its host name in the title
     places = brief.card_places(plan, "example.com")
